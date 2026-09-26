@@ -58,6 +58,12 @@ if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(SITE_SLUG)) {
   console.error(`FATAL: invalid EXPOLINE_SITE "${SITE_SLUG}" (must match ^[a-z0-9][a-z0-9-]{0,63}$).`);
   process.exit(1);
 }
+
+/* LAN BRAIN (phase 2) — master switch. Off by default: with EXPOLINE_LAN
+ * unset, the lan/ module is never loaded and single-server behavior is
+ * byte-for-byte identical. Set EXPOLINE_LAN=1 to enable mDNS discovery,
+ * heartbeat election, /api/sync/*, gossip and the WAN queue. */
+const LAN_ENABLED = process.env.EXPOLINE_LAN === '1';
 const DB_PATH = process.env.EXPOLINE_DB
   || path.join(SITES_DIR, `${SITE_SLUG}.db`);
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -320,6 +326,10 @@ function getConfig() {
     payout_lag_days: parseInt(m.payout_lag_days ?? '2', 10),
     site_tz: SITE_TZ,
     site_date: todaySite(),
+    site_slug: SITE_SLUG, // LAN BRAIN (phase 2): op envelopes carry this
+    /* LAN BRAIN (phase 2): tells the PWA whether to flush its outbox through
+       POST /api/sync/batch (envelopes) or the legacy per-endpoint path. */
+    lan_sync: LAN_ENABLED,
   };
 }
 
@@ -879,6 +889,29 @@ app.use((req, res, next) => {
 
 app.use('/api', authMiddleware);
 
+/* ----------------- LAN site brain (phase 2) integration -----------------
+ * Modular: all LAN logic lives in ./lan/; this block is the only wiring.
+ * With EXPOLINE_LAN unset, init() returns a no-op stub and nothing else
+ * here runs (routes, discovery, election, gossip all stay off). */
+const lanRuntime = (() => {
+  if (!LAN_ENABLED) return { stop() {}, isBrain: () => false, status: () => ({ lan_enabled: false }) };
+  const ctx = {
+    db,
+    siteSlug: SITE_SLUG,
+    helpers: {
+      persistTotals, checkResponse, ticketView,
+      broadcastTicket, broadcastCheckUpdated, broadcastMenuUpdated,
+      auditApproval, auditMenu,
+      verifyManagerPin, verifyOfflineApproval, consumeOfflineApproval,
+      parseJson, crypto,
+    },
+    // NOTE: cross-node gossip authenticates by logging in to the brain
+    // with EXPOLINE_LAN_GOSSIP_PIN (see lan/lan.js) — Bearer <redacted> are
+    // node-local and cannot be reused across nodes.
+  };
+  return require('./lan/lan').init(app, ctx);
+})();
+
 /* Kiosk: registered AFTER the auth wall. The customer flows
    (/kiosk/menu, POST /kiosk/order, POST /kiosk/call-staff, /menuboards) stay
    token-free via the wall's public-path early return; the staff-facing
@@ -904,6 +937,9 @@ app.get('/api/health', (req, res) => {
  * the WAN upload queue. See offline-ladder/DESIGN.md §4 for the full design.
  */
 app.get('/api/brain/status', (req, res) => {
+  /* LAN BRAIN (phase 2): when enabled, report live election state so
+     devices and diagnostics can see who the brain is right now. */
+  const lan = LAN_ENABLED ? lanRuntime.status() : { lan_enabled: false };
   res.json({
     brain: true,
     site_slug: SITE_SLUG,
@@ -914,6 +950,9 @@ app.get('/api/brain/status', (req, res) => {
     priority: parseInt(process.env.EXPOLINE_BRAIN_PRIORITY || '0', 10),
     uptime_s: Math.floor(process.uptime()),
     db_path: DB_PATH,
+    lan,
+    is_brain: lan.lan_enabled ? lan.is_brain : undefined,
+    brain_device_id: lan.lan_enabled && lan.brain ? lan.brain.device_id : undefined,
   });
 });
 
@@ -1274,6 +1313,13 @@ app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
       b.image_url === undefined ? it.image_url : cleanOpt(b.image_url),
       b.daypart === undefined ? it.daypart : cleanOpt(b.daypart), it.id);
   if (b.modifiers !== undefined) saveModifiers(it.id, b.modifiers);
+  /* LAN BRAIN (phase 2): version-guard for menu_update ops. Bumped on
+     name/price edits so a stale LAN editor's write is rejected with the
+     current version instead of silently clobbering. Unread in
+     single-server mode. */
+  if (LAN_ENABLED && (name !== it.name || price_cents !== it.price_cents)) {
+    db.prepare('UPDATE menu_items SET version = COALESCE(version, 1) + 1 WHERE id = ?').run(it.id);
+  }
   auditMenu(req, 'item.update', { item_id: it.id, category_id }, { name, price_cents, station, course });
   broadcastMenuUpdated();
   res.json(itemAdminView(menuItemById(it.id)));
@@ -4013,6 +4059,7 @@ function broadcastMenuUpdated() {
 function shutdown(signal) {
   console.log(`[expoline] received ${signal} — shutting down…`);
   clearInterval(heartbeat);
+  try { lanRuntime.stop(); } catch { /* ignore */ } // LAN BRAIN (phase 2)
   server.close(() => {
     wss.close(() => {
       try { db.close(); } catch { /* ignore */ }

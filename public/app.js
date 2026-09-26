@@ -149,7 +149,12 @@ const Outbox = {
   },
 
   enqueue(op, payload) {
-    const entry = { ts: Date.now(), op, payload };
+    /* LAN SYNC (phase 2): op envelope identity (DESIGN.md §2). The brain
+       uses op_id for idempotency and (lamport, seq) for causal order across
+       devices. Harmless extra fields on the legacy flush path. */
+    const entry = { ts: Date.now(), op, payload,
+      op_id: (crypto.randomUUID ? crypto.randomUUID() : 'op-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)),
+      device_id: lanDeviceId(), seq: lanNextSeq(), lamport: lanNextLamport() };
     const done = () => { updateOfflineBanner(); return entry; };
     if (Outbox.useMem) { entry.key = 'm' + Outbox.mem.length + '-' + Date.now(); Outbox.mem.push(entry); return Promise.resolve(done()); }
     return new Promise((resolve, reject) => {
@@ -205,6 +210,161 @@ const Outbox = {
   count() { return Outbox.all().then((ops) => ops.length); },
 };
 
+/* ============================================================
+   LAN SYNC (phase 2) — device identity + logical clock for op envelopes.
+   device_id is stable per browser profile (localStorage); seq is a
+   per-device monotonic counter; lamport is a Lamport clock ticked on every
+   local mutation. The brain merges remote clocks on receipt, so ops sort
+   causally across devices with no wall-clock dependence (DESIGN.md §4).
+   ============================================================ */
+function lanDeviceId() {
+  try {
+    let id = localStorage.getItem('expoline.device_id');
+    if (!id) {
+      id = 'web-' + (crypto.randomUUID ? crypto.randomUUID().slice(0, 8) : Date.now().toString(36));
+      localStorage.setItem('expoline.device_id', id);
+    }
+    return id;
+  } catch (e) { return 'web-unknown'; }
+}
+function lanNextSeq() {
+  try {
+    const n = (parseInt(localStorage.getItem('expoline.sync.seq') || '0', 10) || 0) + 1;
+    localStorage.setItem('expoline.sync.seq', String(n));
+    return n;
+  } catch (e) { return Date.now(); }
+}
+function lanNextLamport() {
+  try {
+    const n = (parseInt(localStorage.getItem('expoline.sync.lamport') || '0', 10) || 0) + 1;
+    localStorage.setItem('expoline.sync.lamport', String(n));
+    return n;
+  } catch (e) { return Date.now(); }
+}
+/* Merge a remote clock reading (e.g. from a sync-batch response). */
+function lanMergeClock(remote) {
+  try {
+    const cur = parseInt(localStorage.getItem('expoline.sync.lamport') || '0', 10) || 0;
+    if ((remote | 0) > cur) localStorage.setItem('expoline.sync.lamport', String(remote | 0));
+  } catch (e) { /* ignore */ }
+}
+
+/* Build the wire envelope for one queued op (DESIGN.md §2). Temp ids are
+   sent as-is: the client's temp id BECOMES the permanent uuid on the brain
+   (DESIGN.md §7), so the op is referenceable before it ever reaches a server. */
+function lanEnvelope(o, siteSlug) {
+  const p = Object.assign({}, o.payload);
+  const checkUuid = String(p.check_id != null ? p.check_id : (p.temp_id != null ? p.temp_id : ''));
+  const payload = {};
+  switch (o.op) {
+    case 'open_check':
+      payload.check_uuid = String(p.temp_id || p.check_id || '');
+      payload.table_id = p.table_id; payload.guest_count = p.guest_count; payload.tab_name = p.tab_name;
+      break;
+    case 'add_items':
+      payload.check_uuid = checkUuid;
+      payload.items = (p.items || []).map((it) => ({
+        item_uuid: String(it.temp_id || ''), menu_item_id: it.menu_item_id,
+        seat: it.seat, qty: it.qty, modifiers: it.modifiers || [],
+      }));
+      break;
+    case 'void_item':
+      payload.check_uuid = checkUuid;
+      payload.item_uuid = String(p.item_id);
+      payload.reason = p.reason;
+      if (p.approval_nonce) { payload.approval_nonce = p.approval_nonce; payload.manager_pin_hash = p.manager_pin_hash; }
+      else payload.manager_pin = p.manager_pin;
+      break;
+    case 'send':
+      payload.check_uuid = checkUuid;
+      break;
+    case 'payment':
+      payload.check_uuid = checkUuid;
+      payload.payment_uuid = p.payment_uuid || ('pay-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)));
+      payload.method = p.method; payload.amount_cents = p.amount_cents;
+      payload.tip_cents = p.tip_cents || 0; payload.tendered_cents = p.tendered_cents;
+      payload.brand = p.brand; payload.last4 = p.last4;
+      break;
+    case 'close':
+      payload.check_uuid = checkUuid;
+      break;
+    default:
+      Object.assign(payload, p);
+  }
+  return {
+    op_id: o.op_id, site_slug: siteSlug, device_id: o.device_id,
+    actor_id: (typeof state !== 'undefined' && state.user) ? state.user.id : null,
+    seq: o.seq, lamport: o.lamport, op: o.op, payload,
+    created_at: new Date(o.ts || Date.now()).toISOString(),
+  };
+}
+
+/* Apply one sync-batch result: temp-id → real-id remaps and draft cleanup.
+   Mirrors what the legacy flush does per endpoint. */
+async function lanApplyResult(r, entry, idmap) {
+  const p = entry.payload || {};
+  if (r.op === 'open_check' || (entry.op === 'open_check')) {
+    const tempId = r.temp_id || p.temp_id || p.check_id;
+    if (tempId && r.check_id) idmap[tempId] = r.check_id;
+    localStorage.removeItem('expoline.draft:' + tempId);
+    localStorage.removeItem('expoline.staged:' + tempId);
+  } else if (entry.op === 'add_items') {
+    const uuids = r.item_uuids || [];
+    const ids = r.item_ids || [];
+    for (let i = 0; i < uuids.length; i++) if (uuids[i] && ids[i]) idmap[uuids[i]] = ids[i];
+  }
+  saveIdMap(idmap);
+}
+
+/* Flush the outbox through POST /api/sync/batch (idempotent, causal order).
+   Chunked (200 ops) to stay under server batch limits. Stops at the first
+   failed op so order is preserved; the rest retry on the next reconnect. */
+async function flushOutboxBatch(ops) {
+  const cfg = await getConfig().catch(() => ({}));
+  const siteSlug = cfg.site_slug || 'bali-hai';
+  const idmap = loadIdMap();
+  let done = 0, failed = false;
+  const CHUNK = 200;
+  for (let i = 0; i < ops.length && !failed; i += CHUNK) {
+    const chunk = ops.slice(i, i + CHUNK);
+    let res;
+    try {
+      res = await rawApi('/api/sync/batch', 'POST', { ops: chunk.map((o) => lanEnvelope(o, siteSlug)) });
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) handleApiError(e);
+      failed = true; // transport/auth failure: keep everything queued
+      break;
+    }
+    if (!res || res.ok === false) { failed = true; break; } // e.g. site_mismatch: keep queued, surface loudly
+    if (res.lamport) lanMergeClock(res.lamport);
+    for (const r of (res.results || [])) {
+      const entry = chunk.find((o) => o.op_id === r.op_id);
+      if (!entry) continue;
+      if (r.ok) {
+        await lanApplyResult(r, entry, idmap);
+        await Outbox.remove(entry.key);
+        done++;
+      } else {
+        failed = true; // stop at first failure to preserve causal order
+        if (r.error && r.error !== 'check_not_open') toast('Sync: ' + r.error, 'err');
+        break;
+      }
+    }
+  }
+  saveIdMap(idmap);
+  if (done > 0 && !failed) {
+    showSyncedBanner(done);
+    const m = location.hash.match(/^#\/order\/(tmp-[^/]+)/);
+    if (m && idmap[m[1]]) location.hash = '#/order/' + idmap[m[1]];
+    else if (state.route && state.route.view === 'order') renderRoute(true);
+    else if (state.route && state.route.view === 'floor') renderRoute(true);
+  } else if (done > 0) {
+    toast('Synced ' + done + ' — ' + (ops.length - done) + ' still queued', 'ok');
+  }
+  updateOfflineBanner();
+  return done;
+}
+
 /* temp-id -> real-id map, persisted so a flush can resume across reloads */
 function loadIdMap() { try { return JSON.parse(localStorage.getItem('expoline.idmap') || '{}'); } catch (e) { return {}; } }
 function saveIdMap(m) { try { localStorage.setItem('expoline.idmap', JSON.stringify(m)); } catch (e) { /* ignore */ } }
@@ -225,16 +385,28 @@ function randomNonce() {
 }
 
 /* Flush the outbox oldest-first. Stops at the first failure so order is
-   preserved; remaining ops retry on the next reconnect. */
+   preserved; remaining ops retry on the next reconnect.
+   LAN SYNC (phase 2): when the server advertises lan_sync in /api/config,
+   the outbox flushes as op envelopes through POST /api/sync/batch
+   (idempotent, causal order, temp-ids become uuids). Otherwise the legacy
+   per-endpoint flush runs untouched. */
 let flushing = false;
 async function flushOutbox() {
   if (flushing || isOffline()) return 0;
   const ops = await Outbox.all();
   if (!ops.length) return 0;
   flushing = true;
+  try {
+    const cfg = await getConfig().catch(() => ({}));
+    if (cfg.lan_sync) return await flushOutboxBatch(ops);
+    return await flushOutboxLegacy(ops);
+  } finally { flushing = false; }
+}
+
+async function flushOutboxLegacy(ops) {
   const idmap = loadIdMap();
   let done = 0, failed = false;
-  try {
+  {
     for (const o of ops) {
       const p = Object.assign({}, o.payload);
       try {
@@ -305,7 +477,7 @@ async function flushOutbox() {
         break;
       }
     }
-  } finally { flushing = false; }
+  }
 
   if (done > 0 && !failed) {
     showSyncedBanner(done);
@@ -724,7 +896,10 @@ async function renderFloor(app) {
     $('[data-x="go"]', bd).onclick = async () => {
       tabName = $('#tab-name', bd).value.trim();
       closeModal();
-      const tempId = 'tmp-' + Date.now().toString(36);
+      /* LAN SYNC (phase 2): the temp id is a uuid — it BECOMES the permanent
+         cross-engine check uuid on the brain (DESIGN.md §7). The tmp- prefix
+         is kept so routing/draft code keeps working. */
+      const tempId = 'tmp-' + (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
       try {
         if (isOffline()) {
           const draft = { id: tempId, table_id: t.id, table_label: t.label, guest_count: guests, tab_name: tabName, items: [], payments: [], status: 'open', totals: { subtotal: 0, surcharge: 0, service_charge: 0, tax: 0, total: 0, paid: 0, balance: 0 } };
