@@ -272,6 +272,7 @@ require('./routes/giftcards').migrate(db);
 require('./routes/loyalty').migrate(db);
 require('./routes/kiosk').migrate(db);
 require('./routes/online').migrate(db);
+require('./routes/parity_kds_pay').migrate(db);
 
 /* Seed employees from existing users once SITE_ID is known (see below,
    after the config section — migrations above run before SITE_ID exists). */
@@ -763,7 +764,50 @@ function canonStation(s) {
  * would be the first financial figure on KDS and could be misread as an
  * item or a tip — so it is deliberately absent. Financial breakdowns live
  * on the pay/check summary, the printed receipt, and Finance reports. */
+/* kds_tickets.refire — marks re-fired/reprinted tickets (see POST
+ * /api/checks/:id/items/:itemId/refire). Guarded: runs on every boot. */
+(() => {
+  const cols = new Set(db.prepare('PRAGMA table_info(kds_tickets)').all().map((c) => c.name));
+  if (!cols.has('refire')) db.exec('ALTER TABLE kds_tickets ADD COLUMN refire INTEGER DEFAULT 0');
+})();
+
+const KDS_COURSE_ORDER = ['drink', 'appetizer', 'entree', 'dessert'];
+/* Per-course rollup for a check: held (not yet fired), fired (on a KDS
+ * ticket), bumped (on a bumped/fulfilled ticket). Rides on EVERY ticket view
+ * so the line never has to ask about previous-course state. */
+function courseStatusFor(checkId) {
+  const out = KDS_COURSE_ORDER.map((c) => ({ course: c, held: 0, fired: 0, bumped: 0, total: 0 }));
+  const by = Object.fromEntries(out.map((o) => [o.course, o]));
+  for (const r of db.prepare(
+    "SELECT course, COUNT(*) AS n FROM check_items WHERE check_id = ? AND state = 'held' GROUP BY course"
+  ).all(checkId)) {
+    if (by[r.course]) by[r.course].held += r.n;
+  }
+  for (const t of db.prepare('SELECT status, items_json FROM kds_tickets WHERE check_id = ?').all(checkId)) {
+    const done = t.status === 'fulfilled';
+    for (const it of parseJson(t.items_json, [])) {
+      if (!by[it.course]) continue;
+      const q = Number.isInteger(it.qty) && it.qty > 0 ? it.qty : 1;
+      by[it.course].fired += q;
+      if (done) by[it.course].bumped += q;
+    }
+  }
+  for (const o of out) o.total = o.held + o.fired;
+  return out.filter((o) => o.total > 0);
+}
+function ticketCourses(itemsJson) {
+  const seen = [];
+  for (const it of parseJson(itemsJson, [])) {
+    if (KDS_COURSE_ORDER.includes(it.course) && !seen.includes(it.course)) seen.push(it.course);
+  }
+  return seen.sort((a, b) => KDS_COURSE_ORDER.indexOf(a) - KDS_COURSE_ORDER.indexOf(b));
+}
+
 function ticketView(row) {
+  const chk = row.check_id
+    ? db.prepare('SELECT channel, source FROM checks WHERE id = ?').get(row.check_id)
+    : null;
+  const items = parseJson(row.items_json, []);
   return {
     id: row.id,
     uuid: row.uuid,
@@ -771,11 +815,21 @@ function ticketView(row) {
     station: row.station,
     table_label: row.table_label,
     server_name: row.server_name,
-    items: parseJson(row.items_json, []),
+    items,
     status: row.status,
     created_at: row.created_at,
     bumped_at: row.bumped_at,
     bumped_by: row.bumped_by,
+    /* refire: this ticket is a re-fire/reprint of an already-fired item —
+     * the kitchen sees a ↻ RE-FIRE banner, never a silent duplicate make. */
+    refire: !!row.refire,
+    /* has_allergy: any line carries an allergy flag — the ticket gets a
+     * high-visibility allergy banner on KDS. */
+    has_allergy: items.some((i) => !!i.allergy),
+    channel: (chk && chk.channel) || 'dine_in',
+    source: (chk && chk.source) || null,
+    ticket_courses: ticketCourses(row.items_json),
+    course_status: courseStatusFor(row.check_id),
   };
 }
 
@@ -791,6 +845,7 @@ function paymentView(p) {
     brand: p.brand,
     last4: p.last4,
     auth_code: p.auth_code,
+    memo: p.memo || null,
     status: p.status,
     refunded_cents: p.refunded_cents,
     created_at: p.created_at,
@@ -1038,6 +1093,14 @@ app.use((req, res, next) => {
     console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - t0}ms`);
   });
   next();
+});
+
+/* Phase 3B public routes: guest QR order/pay/split + /g/:token page.
+   Registered before the auth wall like kiosk (customer phones carry no staff
+   token); hardened by rate limiting + full server-side validation. */
+require('./routes/parity_kds_pay').registerPublic(app, {
+  db, SITE_ID, nowIso, crypto, persistTotals, checkResponse,
+  broadcastTicket, ticketView, broadcastCheckUpdated,
 });
 
 app.use('/api', authMiddleware);
@@ -1856,7 +1919,14 @@ app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
         name: it.name,
         seat: it.seat,
         qty: it.qty,
+        course: it.course,
         modifiers: parseJson(it.modifiers_json, []),
+        /* Allergy + special-request note ride the ticket to KDS (schema:
+         * check_items.note / .allergy / .allergy_detail — shared contract
+         * with order-entry; KDS only renders, never edits). */
+        note: it.note || null,
+        allergy: it.allergy ? 1 : 0,
+        allergy_detail: it.allergy_detail || null,
       });
     }
     depleteInventoryForItems(held); // phase 3C: ingredient-level depletion from real sales
@@ -1880,6 +1950,58 @@ app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
   res.json({ sent: held.length, tickets });
+});
+
+/* Item re-fire / reprint kitchen ticket (Toast overflow parity:
+ * "Reprint kitchen tickets: re-sends items to the kitchen for firing").
+ * Today the only path is void + re-add; this fires ONE already-fired item
+ * again as a NEW ticket flagged refire:true so the kitchen sees a ↻ RE-FIRE
+ * banner instead of a silent duplicate. The original ticket is untouched.
+ * Server role (the floor owns re-fires); audit-logged with before/after. */
+app.post('/api/checks/:id/items/:itemId/refire', serverPlus(), (req, res) => {
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot re-fire on a ${check.status} check` });
+  const itemId = Number(req.params.itemId);
+  if (!Number.isFinite(itemId)) return res.status(400).json({ error: 'itemId is required' });
+  const item = db.prepare(
+    `SELECT ci.*, mi.name, mi.station FROM check_items ci
+     JOIN menu_items mi ON mi.id = ci.menu_item_id
+     WHERE ci.id = ? AND ci.check_id = ?`
+  ).get(itemId, check.id);
+  if (!item) return res.status(404).json({ error: 'Item not found on this check' });
+  if (!['sent', 'fulfilled'].includes(item.state)) {
+    return res.status(400).json({ error: `Only fired items can be re-fired (this one is ${item.state}) — send it first` });
+  }
+
+  const at = nowIso();
+  const table = check.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(check.table_id) : null;
+  const serverUser = check.server_id ? db.prepare('SELECT name FROM users WHERE id = ?').get(check.server_id) : null;
+  const snap = {
+    item_id: item.id,
+    name: item.name,
+    seat: item.seat,
+    qty: item.qty,
+    course: item.course,
+    modifiers: parseJson(item.modifiers_json, []),
+    note: item.note || null,
+    allergy: item.allergy ? 1 : 0,
+    allergy_detail: item.allergy_detail || null,
+  };
+  const r = db.prepare(
+    `INSERT INTO kds_tickets (uuid, check_id, site_id, station, table_label, server_name, items_json, refire, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'new', ?)`
+  ).run(crypto.randomUUID(), check.id, SITE_ID, item.station || 'expediter',
+    table ? table.label : null, serverUser ? serverUser.name : null,
+    JSON.stringify([snap]), at);
+  const ticket = ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid));
+  auditApproval(req, 'refire', { check_id: check.id, item_id: item.id }, {
+    approver: req.user ? req.user.name : '?',
+    before: { state: item.state },
+    after: { refire_ticket_id: ticket.id, station: ticket.station },
+  });
+  broadcastTicket(ticket);
+  res.status(201).json({ ticket });
 });
 
 /* --------------------------------- split ----------------------------------- */
@@ -1991,9 +2113,19 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot take payment on a ${check.status} check` });
 
-  const { method, amount_cents, tip_cents = 0, tendered_cents, brand, last4 } = req.body || {};
-  if (!['cash', 'card_demo'].includes(method)) {
-    return res.status(400).json({ error: "method must be 'cash' or 'card_demo'" });
+  const { method, amount_cents, tip_cents = 0, tendered_cents, brand, last4, memo } = req.body || {};
+  const TENDER_METHODS = ['cash', 'card_demo', 'house_account'];
+  if (!TENDER_METHODS.includes(method)) {
+    return res.status(400).json({ error: "method must be one of 'cash', 'card_demo', 'house_account'" });
+  }
+  /* House account is a real charge-to-account tender: the named account owes
+   * the house; the payment row (with memo = account name) is the ledger
+   * entry and shows up in finance reporting. */
+  let memoVal = null;
+  if (method === 'house_account') {
+    memoVal = String(memo || '').trim();
+    if (!memoVal) return res.status(400).json({ error: 'memo (account name) is required for house account payments' });
+    if (memoVal.length > 80) return res.status(400).json({ error: 'memo must be 80 characters or fewer' });
   }
   if (!isInt(amount_cents) || amount_cents <= 0) {
     return res.status(400).json({ error: 'amount_cents must be a positive integer' });
@@ -2052,9 +2184,9 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
     }
 
     const r = db.prepare(
-      "INSERT INTO payments (uuid, check_id, site_id, method, amount_cents, tip_cents, tendered_cents, brand, last4, auth_code, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)"
+      "INSERT INTO payments (uuid, check_id, site_id, method, amount_cents, tip_cents, tendered_cents, brand, last4, auth_code, memo, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)"
     ).run(crypto.randomUUID(), check.id, SITE_ID, method, appliedCents, tip_cents, tenderedCents,
-      brand || (method === 'card_demo' ? 'DEMO' : null), last4 || null, authCode, nowIso());
+      brand || (method === 'card_demo' ? 'DEMO' : null), last4 || null, authCode, memoVal, nowIso());
     const payment = paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(r.lastInsertRowid));
 
     const after = persistTotals(check.id);
@@ -2064,7 +2196,7 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
 
     broadcastCheckUpdated(check.id);
     const out = { payment, check: checkResponse(check.id) };
-    if (method === 'cash' && tenderedCents != null) out.change_cents = tenderedCents - appliedCents;
+    if (method === 'cash' && tenderedCents != null) out.change_cents = tenderedCents - appliedCents - (tip_cents || 0);
     if (demo) out.demo = demo;
     if (idem) idemStore('payments', idem, 201, out);
     return res.status(201).json(out);
@@ -2218,7 +2350,7 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
   const payments = db.prepare('SELECT * FROM payments WHERE site_id = ? ORDER BY created_at, id').all(SITE_ID)
     .filter((p) => tzDate(p.created_at) === date);
 
-  let cardVolume = 0, refunds = 0, fees = 0, cashSales = 0, tips = 0;
+  let cardVolume = 0, refunds = 0, fees = 0, cashSales = 0, houseAccountSales = 0, tips = 0;
   const cardPayments = [];
   for (const p of payments) {
     tips += p.tip_cents || 0;
@@ -2237,6 +2369,8 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
       });
     } else if (p.method === 'cash' || p.method === 'gift_card') {
       cashSales += p.amount_cents;
+    } else if (p.method === 'house_account') {
+      houseAccountSales += p.amount_cents;
     }
   }
   const expectedPayout = cardVolume - refunds - fees;
@@ -2261,6 +2395,7 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
     service_charge_cents: serviceCharge,
     service_charge_note: 'Informational only — the mandatory service charge is restaurant revenue already included in card volume above. It is never paid out as a tip or wage. Confirm tax treatment with your accountant.',
     cash_sales_cents: cashSales,
+    house_account_sales_cents: houseAccountSales,
     tips_cents: tips,
     card_payments: cardPayments,
     labor_cents: labor.total_cents,
@@ -2362,7 +2497,7 @@ function payoutDay(date) {
   const cfg = getConfig();
   const payments = db.prepare('SELECT * FROM payments WHERE site_id = ? ORDER BY created_at, id').all(SITE_ID)
     .filter((p) => tzDate(p.created_at) === date);
-  let cardVolume = 0, refunds = 0, fees = 0, cashSales = 0, tips = 0;
+  let cardVolume = 0, refunds = 0, fees = 0, cashSales = 0, houseAccountSales = 0, tips = 0;
   for (const p of payments) {
     tips += p.tip_cents || 0;
     const refunded = p.refunded_cents || 0;
@@ -5102,6 +5237,13 @@ require('./routes/loyalty').register(app, {
 require('./routes/online').register(app, {
   db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
   persistTotals, checkResponse, broadcastCheckUpdated,
+});
+
+/* Phase 3B staff routes: KDS aging settings/alerts, tip-out rules + report,
+   delivery aggregation, cash-collect requests, guest-split reverse, table QR. */
+require('./routes/parity_kds_pay').registerStaff(app, {
+  db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
+  persistTotals, checkResponse, broadcastCheckUpdated, broadcastTicket, ticketView,
 });
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));

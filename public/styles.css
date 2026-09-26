@@ -315,12 +315,46 @@ button, input, select, textarea { font-family: var(--sans); font-size: 1rem; col
 .ticket .t-timer.late { color: var(--red); }
 .ticket.overdue { border-left-color: var(--red); }
 .ticket.aging { border-left-color: var(--amber); }
+/* Aging owns the ticket header: band color washes the whole header bar. */
+.ticket .t-head { border-radius: 6px; padding: 6px 10px; margin: -6px -8px 8px; }
+.ticket .t-head.band-fresh { background: rgba(62,213,152,.07); }
+.ticket .t-head.band-aging_soon { background: rgba(232,176,80,.13); }
+.ticket .t-head.band-aging { background: rgba(232,176,80,.22); border-bottom: 2px solid var(--amber); }
+.ticket .t-head.band-overdue { background: rgba(236,111,111,.20); border-bottom: 2px solid var(--red); }
+.ticket.band-aging_soon { border-left-color: var(--amber); }
+.ticket.band-aging { border-left-color: var(--amber); }
+.ticket.band-overdue { border-left-color: var(--red); animation: ticket-pulse 1.6s ease-in-out infinite; }
+/* Course-status header: previous-course state rides on every ticket. */
+.t-courses { font-size: .78rem; color: var(--text-dim); background: var(--ink-3); border: 1px solid var(--line-soft);
+  border-radius: 6px; padding: 5px 10px; margin-bottom: 8px; }
+/* Channel badge: delivery/QR orders share the same queue, flagged at a glance. */
+.t-chan { font-size: .68rem; font-weight: 800; letter-spacing: .06em; border-radius: 4px; padding: 3px 8px; white-space: nowrap; }
+.t-chan.ch-delivery { background: rgba(236,111,111,.18); color: var(--red); border: 1px solid var(--red); }
+.t-chan.ch-qr_guest { background: rgba(90,169,255,.15); color: var(--sky); border: 1px solid var(--sky); }
+.t-chan.ch-takeout, .t-chan.ch-online, .t-chan.ch-kiosk { background: var(--ink-3); color: var(--brass-hi); border: 1px solid var(--brass-dim); }
+/* Aging alerts strip: warnings BEFORE the breach. */
+.kds-alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.kds-alert { font-size: .82rem; font-weight: 700; border-radius: 8px; padding: 8px 12px; border: 1px solid; }
+.kds-alert.al-soon { color: var(--amber); border-color: var(--amber); background: rgba(232,176,80,.08); }
+.kds-alert.al-age { color: var(--amber); border-color: var(--amber); background: rgba(232,176,80,.16); }
+.kds-alert.al-over { color: var(--red); border-color: var(--red); background: rgba(236,111,111,.12); }
 .t-item { padding: 8px 0; border-top: 1px dashed var(--line-soft); }
 .t-item .row1 { display: flex; gap: 8px; align-items: center; }
 .t-item .qty { font-weight: 800; color: var(--brass-hi); min-width: 2.5ch; }
 .t-item .inm { font-weight: 600; flex: 1; }
 .t-item .seat { font-size: .72rem; font-weight: 800; letter-spacing: .05em; color: var(--text-dim); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px; }
 .t-item .tmods { font-size: .82rem; color: var(--text-dim); margin: 2px 0 0 3.2ch; }
+/* Allergy: high-visibility badge — never a low-priority note. */
+.t-item .t-allergy { display: inline-block; margin: 4px 0 0 3.2ch; padding: 3px 10px; border-radius: 6px;
+  background: #c81e1e; color: #fff; font-weight: 800; font-size: .8rem; letter-spacing: .04em; }
+/* Special-request note: conspicuous amber callout on the ticket line. */
+.t-item .t-note { margin: 4px 0 0 3.2ch; padding: 4px 10px; border-radius: 6px; font-size: .85rem; font-weight: 600;
+  color: var(--amber); background: rgba(232,176,80,.12); border: 1px dashed var(--amber); }
+/* Ticket-level banners: allergy alert + re-fire/reprint. */
+.t-banner { margin: 8px 0 0; padding: 8px 12px; border-radius: 8px; font-weight: 800; font-size: .85rem;
+  letter-spacing: .04em; text-align: center; }
+.t-banner-allergy { background: #c81e1e; color: #fff; }
+.t-banner-refire { background: rgba(232,176,80,.16); color: var(--amber); border: 1px solid var(--amber); }
 .t-status { font-size: .75rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .t-status.new { color: var(--sky); background: var(--sky-dim); border: 1px solid var(--sky); border-radius: 999px; padding: 3px 10px; }
 .t-status.new::before { content: "● "; }
@@ -550,6 +584,24 @@ button, input, select, textarea { font-family: var(--sans); font-size: 1rem; col
 .stepper { display: flex; align-items: center; gap: 12px; }
 .stepper button { width: 44px; height: 44px; border-radius: 10px; border: 1px solid var(--line); background: var(--ink-2); color: var(--text); font-size: 1.3rem; }
 .stepper .val { min-width: 64px; text-align: center; font-size: 1.1rem; font-weight: 700; }
+
+/* ---- receipt printing (NG-F): print CSS only, real data from the check ---- */
+#print-area { display: none; }
+.receipt { font-family: ui-monospace, Menlo, Consolas, monospace; color: #000; max-width: 320px; margin: 0 auto; }
+.receipt h2 { text-align: center; margin: 0 0 4px; font-size: 1.2rem; }
+.receipt p { margin: 4px 0; font-size: .85rem; text-align: center; }
+.receipt hr { border: none; border-top: 1px dashed #000; margin: 8px 0; }
+.receipt table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+.receipt td { padding: 2px 0; vertical-align: top; }
+.receipt td.r { text-align: right; white-space: nowrap; }
+.receipt tr.t td { font-weight: 700; font-size: 1rem; }
+.receipt .demo-note { font-weight: 700; }
+.receipt .thanks { margin-top: 12px; font-weight: 700; }
+@media print {
+  body.printing-receipt #app,
+  body.printing-receipt #modal-root { display: none !important; }
+  body.printing-receipt #print-area { display: block !important; }
+}
 
 /* Phase 3C — back-office views */
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }

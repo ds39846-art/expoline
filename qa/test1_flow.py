@@ -166,10 +166,12 @@ expect_status("POST", f"/api/checks/{c8['id']}/split", ST, {"mode":"by_seat","gr
 api("POST", f"/api/checks/{c8['id']}/send", ST)
 
 print("== Test 1f: payments — CASH change, card_demo approval, close ==")
-# cash on even-split g0: total 7128, tip 1000, tendered 9000 -> change 1872
+# cash on even-split g0: total 7128, tip 1000, tendered 9000 -> change 872
+# (change nets the tip: 9000-7128-1000. The old 1872 expectation returned the
+# tip as change, contradicting the cash modal's own "tendered - due" display.)
 p = api("POST", f"/api/checks/{g0['id']}/payments", ST,
         {"method":"cash","amount_cents":7128,"tip_cents":1000,"tendered_cents":9000})
-ok(p["change_cents"]==1872, "cash change = tendered-amount", f"got {p['change_cents']} want 1872")
+ok(p["change_cents"]==872, "cash change = tendered-amount-tip", f"got {p['change_cents']} want 872")
 ok(p["check"]["totals"]["balance"]==0, "balance 0 after cash pay")
 cl = api("POST", f"/api/checks/{g0['id']}/close", ST)
 ok(cl["status"]=="closed" and cl["totals"]["balance"]==0, "cash check closed, balance 0")
@@ -181,10 +183,10 @@ ok(str(p["demo"]["auth_code"]).startswith("DEMO"), "card_demo auth_code DEMO*", 
 ok(p["check"]["status"]=="paid" and p["check"]["totals"]["balance"]==0, "paid, balance 0")
 cl = api("POST", f"/api/checks/{g1['id']}/close", ST)
 ok(cl["status"]=="closed", "card check closed")
-# by-seat g0 cash: 5204, tip 500, tendered 6000 -> change 796
+# by-seat g0 cash: 5204, tip 500, tendered 6000 -> change 296 (6000-5204-500)
 p = api("POST", f"/api/checks/{s0['id']}/payments", ST,
         {"method":"cash","amount_cents":5204,"tip_cents":500,"tendered_cents":6000})
-ok(p["change_cents"]==796, "by-seat cash change 796")
+ok(p["change_cents"]==296, "by-seat cash change 296")
 api("POST", f"/api/checks/{s0['id']}/close", ST)
 # by-seat g1 card: 3960, tip 700
 p = api("POST", f"/api/checks/{s1['id']}/payments", ST,

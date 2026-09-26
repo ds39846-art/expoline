@@ -1340,9 +1340,14 @@ async function renderOrder(app, checkId) {
           : (ref.state === 'sent'
             ? '<button class="icon-btn mgr-void" data-voidmgr="' + esc(String(ref.id)) + '" data-nm="' + esc(ref.name) + '" aria-label="Void sent item — manager approval required" title="Void (manager approval)">✕</button>'
             : '');
+        /* Re-fire: one tap re-sends an already-fired line as a ↻ RE-FIRE
+         * ticket (no more void + re-add dance). */
+        const refireBtn = (kind === 'held' && (ref.state === 'sent' || ref.state === 'fulfilled'))
+          ? '<button class="icon-btn" data-refire="' + esc(String(ref.id)) + '" data-nm="' + esc(ref.name) + '" aria-label="Re-fire item to kitchen" title="Re-fire to kitchen">↻</button>'
+          : '';
         return '<div class="cart-line"><div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
           (mods ? '<span class="mods">' + mods + '</span>' : '') + '</div>' + pill +
-          '<span class="pr">' + fmt(lineTotal) + '</span>' + voidBtn + '</div>';
+          '<span class="pr">' + fmt(lineTotal) + '</span>' + refireBtn + voidBtn + '</div>';
       }).join('') + '</div>').join('');
     $$('[data-void]', cartBody).forEach((b) => b.onclick = () => {
       const id = b.dataset.void, kind = b.dataset.kind;
@@ -1358,6 +1363,18 @@ async function renderOrder(app, checkId) {
     });
     /* Sent items: same manager-approval modal. */
     $$('[data-voidmgr]', cartBody).forEach((b) => b.onclick = () => openVoidApproval(b.dataset.voidmgr, b.dataset.nm));
+    /* Re-fire: confirm, then POST — the kitchen gets a flagged RE-FIRE ticket. */
+    $$('[data-refire]', cartBody).forEach((b) => b.onclick = () => {
+      confirmDialog('Re-fire item',
+        'Send <b>' + esc(b.dataset.nm || 'item') + '</b> to the kitchen again? It arrives as a <b>↻ RE-FIRE</b> ticket — flagged as a reprint, not a new make.',
+        'Re-fire', async () => {
+          try {
+            if (isOffline()) { toast('Re-fire needs a connection — reconnect first', 'err'); return; }
+            const r = await api('/api/checks/' + realId(checkId) + '/items/' + b.dataset.refire + '/refire', 'POST');
+            toast('Re-fired ↻ ' + esc((r.ticket && r.ticket.station) || 'kitchen'), 'ok');
+          } catch (e) { handleApiError(e); }
+        });
+    });
   }
 
   /* Manager-approved void (held or sent): the manager enters their PIN at
@@ -1514,10 +1531,30 @@ function kdsLabel(slug) {
   return s ? s.label : slug;
 }
 
-function closeKdsSocket() {
-  if (state.kds.ws) { try { state.kds.ws.close(); } catch (e) {} state.kds.ws = null; }
+/* Socket-only close: used when (re)subscribing so the 1s timer and 20s
+ * alert intervals survive. Full cleanup (socket + timers) stays in
+ * closeKdsSocket() for route exit / logout.
+ * Reconnect audit: closing an old socket fires its onclose asynchronously,
+ * and that stale handler used to schedule ANOTHER kdsSubscribe() after the
+ * new socket was already live (duplicate subscribe churn). closeKdsWs now
+ * detaches the old socket's handlers BEFORE closing and bumps a generation
+ * counter; the down() retry only resubscribes when its generation is still
+ * current. */
+function closeKdsWs() {
+  state.kds.gen = (state.kds.gen || 0) + 1;
+  if (state.kds.ws) {
+    try {
+      state.kds.ws.onopen = state.kds.ws.onmessage = state.kds.ws.onerror = state.kds.ws.onclose = null;
+      state.kds.ws.close();
+    } catch (e) {}
+    state.kds.ws = null;
+  }
   state.kds.wsUp = false;
+}
+function closeKdsSocket() {
+  closeKdsWs();
   if (state.timers.kds) { clearInterval(state.timers.kds); state.timers.kds = null; }
+  if (state.timers.kdsAlerts) { clearInterval(state.timers.kdsAlerts); state.timers.kdsAlerts = null; }
 }
 
 function kdsElapsed(ts) {
@@ -1525,27 +1562,49 @@ function kdsElapsed(ts) {
   return { s, mmss: pad2(Math.floor(s / 60)) + ':' + pad2(s % 60) };
 }
 
+/* Aging band for a ticket: thresholds come from /api/kds/settings (manager-
+ * configurable, site_config data). 'aging_soon' is the BEFORE-breach alert
+ * window — the line sees the warning while there's still time to act. */
+function kdsBand(elapsedS) {
+  const th = state.kds.thresholds || { warn_secs: 600, late_secs: 1200, alert_lead_secs: 240 };
+  if (elapsedS >= th.late_secs) return 'overdue';
+  if (elapsedS >= th.warn_secs) return 'aging';
+  if (elapsedS >= th.warn_secs - th.alert_lead_secs) return 'aging_soon';
+  return 'fresh';
+}
+function kdsWarnIn(elapsedS) {
+  const th = state.kds.thresholds || { warn_secs: 600, late_secs: 1200, alert_lead_secs: 240 };
+  return Math.max(0, th.warn_secs - elapsedS);
+}
+
 async function renderKds(app) {
   if (state.user.role === 'server') { app.innerHTML = notAuthorized('The kitchen display is for kitchen and manager roles.'); return; }
   closeKdsSocket();
   state.kds.recall = false;
   state.kds.tickets = [];
+  state.kds.thresholds = null;
+  try {
+    const s = await api('/api/kds/settings');
+    state.kds.thresholds = (s && s.thresholds) || null;
+  } catch (e) { /* defaults */ }
 
   app.innerHTML =
     '<div class="view-head"><h1>Kitchen Display</h1><span class="spacer"></span>' +
     '<span class="kds-ws" id="kds-ws"><span class="dot-dead"></span>connecting…</span> ' +
     '<button class="btn btn-ghost" id="kds-recall-btn">Recall</button></div>' +
+    '<div id="kds-alerts"></div>' +
     '<div class="tabs" id="kds-tabs">' +
     KDS_STATIONS.map((s) => '<button class="tab' + (s.slug === state.kds.station ? ' active' : '') + '" data-st="' + esc(s.slug) + '">' + esc(s.label) + '</button>').join('') +
     '</div><div class="kds-grid" id="kds-grid"></div>';
 
   const grid = $('#kds-grid'), wsBadge = $('#kds-ws'), recallBtn = $('#kds-recall-btn');
+  const alertsEl = $('#kds-alerts');
 
   $$('#kds-tabs .tab').forEach((b) => b.onclick = () => {
     state.kds.station = b.dataset.st;
     state.kds.recall = false; recallBtn.textContent = 'Recall';
     $$('#kds-tabs .tab').forEach((x) => x.classList.toggle('active', x === b));
-    loadTickets(); kdsSubscribe();
+    loadTickets(); kdsSubscribe(); loadAlerts();
   });
   recallBtn.onclick = async () => {
     state.kds.recall = !state.kds.recall;
@@ -1559,25 +1618,64 @@ async function renderKds(app) {
     drawTickets();
   };
 
+  function chanBadge(t) {
+    const ch = t.channel || 'dine_in';
+    if (ch === 'dine_in') return '';
+    const label = ch === 'delivery' ? 'DLV' + (t.source ? ' · ' + t.source : '')
+      : ch === 'qr_guest' ? 'QR GUEST'
+      : ch === 'takeout' ? 'TAKEOUT'
+      : ch === 'online' ? 'ONLINE'
+      : ch === 'kiosk' ? 'KIOSK' : ch.toUpperCase();
+    return '<span class="t-chan ch-' + esc(ch) + '">' + esc(label) + '</span>';
+  }
+
+  function courseLine(t) {
+    const cs = t.course_status || [];
+    if (!cs.length) return '';
+    const bits = cs.map((c) => {
+      const name = String(c.course || '').toUpperCase();
+      if (c.total > 0 && c.bumped >= c.total) return name + ' ✓';
+      let s = name + ' ' + c.bumped + '/' + c.total + ' bumped';
+      if (c.held > 0) s += ' · ' + c.held + ' held';
+      return s;
+    });
+    return '<div class="t-courses" title="Course status — the line never has to ask">🍽 ' + esc(bits.join(' · ')) + '</div>';
+  }
+
   function ticketCard(t) {
     const ts = t.fired_at || t.created_at || t.updated_at || Date.now();
     const el = kdsElapsed(ts);
-    const timerCls = el.s > 20 * 60 ? 'late' : el.s > 10 * 60 ? 'warn' : '';
+    const band = kdsBand(el.s);
+    const timerCls = band === 'overdue' ? 'late' : (band === 'aging' || band === 'aging_soon') ? 'warn' : '';
     const items = (t.items || []).map((i) => {
       const mods = (i.modifiers || []).map((m) => '<div class="tmods">+ ' + esc(m.name || m) + '</div>').join('');
+      /* Allergy renders as a high-visibility badge — never a low-priority note. */
+      const allergy = i.allergy
+        ? '<div class="t-allergy">⚠ ALLERGY' + (i.allergy_detail ? ' — ' + esc(i.allergy_detail) : '') + '</div>'
+        : '';
+      const note = (i.note || i.notes)
+        ? '<div class="t-note">✎ ' + esc(i.note || i.notes) + '</div>'
+        : '';
       return '<div class="t-item"><div class="row1"><span class="qty">' + (i.qty || 1) + '×</span>' +
         '<span class="inm">' + esc(i.name || 'Item') + '</span>' +
-        (i.seat ? '<span class="seat">SEAT ' + i.seat + '</span>' : '') + '</div>' + mods +
-        (i.notes ? '<div class="tmods">✎ ' + esc(i.notes) + '</div>' : '') + '</div>';
+        (i.seat ? '<span class="seat">SEAT ' + i.seat + '</span>' : '') + '</div>' + mods + allergy + note + '</div>';
     }).join('');
     const status = (t.status || 'new').toLowerCase().replace(/ /g, '_');
     const next = status === 'new' ? 'in_progress' : status === 'in_progress' ? 'fulfilled' : null;
     const bumpLabel = status === 'new' ? 'Start' : status === 'in_progress' ? 'Bump ✓' : null;
-    return '<div class="ticket' + (el.s > 20 * 60 ? ' overdue' : el.s > 10 * 60 ? ' aging' : '') + '" data-tid="' + esc(String(t.id)) + '">' +
-      '<div class="t-head"><span class="t-table">' + esc(t.table_label || t.table || '—') + '</span>' +
+    /* Ticket-level banners: allergy alert (verify before firing) and
+     * re-fire (reprint — not a new make, don't double-fire). */
+    const banners =
+      (t.has_allergy ? '<div class="t-banner t-banner-allergy">⚠ ALLERGY ALERT — check flagged items before firing</div>' : '') +
+      (t.refire ? '<div class="t-banner t-banner-refire">↻ RE-FIRE — reprint, already fired once</div>' : '');
+    return '<div class="ticket band-' + band + '" data-tid="' + esc(String(t.id)) + '">' +
+      '<div class="t-head band-' + band + '"><span class="t-table">' + esc(t.table_label || t.table || '—') + '</span>' +
+      chanBadge(t) +
       '<span class="t-server">' + esc(t.server_name || t.server || '') + '</span>' +
       '<span class="t-status ' + esc(status) + '">' + esc(status.replace('_', ' ')) + '</span>' +
       '<span class="t-timer ' + timerCls + '" data-ts="' + esc(String(ts)) + '">' + el.mmss + '</span></div>' +
+      banners +
+      courseLine(t) +
       items +
       (bumpLabel && !state.kds.recall
         ? '<div class="bump-row"><button class="btn ' + (status === 'new' ? 'btn-amber' : 'btn-green') + '" data-bump="' + esc(String(t.id)) + '" data-next="' + next + '">' + bumpLabel + '</button></div>'
@@ -1607,11 +1705,12 @@ async function renderKds(app) {
       const r = await api('/api/kds/tickets?station=' + encodeURIComponent(state.kds.station) + '&status=open');
       state.kds.tickets = r.tickets || (Array.isArray(r) ? r : []);
       drawTickets();
+      loadAlerts();
     } catch (e) { handleApiError(e); }
   }
 
   function kdsSubscribe() {
-    closeKdsSocket();
+    closeKdsWs();
     if (isOffline()) { wsBadge.innerHTML = '<span class="dot-dead"></span>offline'; return; }
     const tok = sessionStorage.getItem('expoline.token');
     if (!tok) return;
@@ -1620,6 +1719,7 @@ async function renderKds(app) {
     try { ws = new WebSocket(proto + location.host + '/ws?token=' + encodeURIComponent(tok)); }
     catch (e) { wsBadge.innerHTML = '<span class="dot-dead"></span>unavailable'; return; }
     state.kds.ws = ws;
+    const gen = state.kds.gen || 0;
     ws.onopen = () => {
       state.kds.wsUp = true; state.kds.retryMs = 1000;
       wsBadge.innerHTML = '<span class="dot-live"></span>live';
@@ -1644,30 +1744,59 @@ async function renderKds(app) {
       wsBadge.innerHTML = '<span class="dot-dead"></span>reconnecting…';
       const ms = state.kds.retryMs;
       state.kds.retryMs = Math.min(30000, ms * 2);
-      setTimeout(() => { if (state.route && state.route.view === 'kds') kdsSubscribe(); }, ms);
+      // Only resubscribe if no newer generation superseded this socket
+      // (prevents the closed-old-socket retry from churning a live one).
+      setTimeout(() => {
+        if ((state.kds.gen || 0) === gen && state.route && state.route.view === 'kds') kdsSubscribe();
+      }, ms);
     };
     ws.onclose = down; ws.onerror = down;
   }
 
-  // 1-second timer updates (mm:ss, amber >10min, red >20min)
+  // Aging alerts strip — fires BEFORE the breach (aging_soon tickets show
+  // their warn-in countdown). Refreshed on load, on station switch, on WS
+  // ticket events, and every 20s.
+  function fmtDur(s) { s = Math.max(0, Math.floor(s)); return Math.floor(s / 60) + ':' + pad2(s % 60); }
+  async function loadAlerts() {
+    if (state.kds.recall || !alertsEl) return;
+    let r;
+    try { r = await api('/api/kds/alerts?station=' + encodeURIComponent(state.kds.station)); }
+    catch (e) { return; }
+    const list = (r && r.alerts) || [];
+    if (!list.length) { alertsEl.innerHTML = ''; return; }
+    const order = { overdue: 0, aging: 1, aging_soon: 2 };
+    list.sort((a, b) => (order[a.band] ?? 3) - (order[b.band] ?? 3));
+    alertsEl.innerHTML = '<div class="kds-alerts">' + list.map((a) => {
+      const cls = a.band === 'overdue' ? 'al-over' : a.band === 'aging' ? 'al-age' : 'al-soon';
+      const msg = a.band === 'aging_soon' ? 'warn in ' + fmtDur(a.warn_in_s)
+        : a.band === 'aging' ? 'aging ' + fmtDur(a.elapsed_s)
+        : 'OVERDUE ' + fmtDur(a.elapsed_s);
+      return '<span class="kds-alert ' + cls + '">' + (a.band === 'aging_soon' ? '⚠ ' : '⏱ ') +
+        esc(a.table_label || '—') + ' · ' + esc(kdsLabel(a.station)) + ' — ' + esc(msg) + '</span>';
+    }).join('') + '</div>';
+  }
+
+  // 1-second timer updates (mm:ss; band colors from /api/kds/settings thresholds)
   state.timers.kds = setInterval(() => {
     $$('#kds-grid .t-timer').forEach((el) => {
       const ts = el.dataset.ts;
       const e = kdsElapsed(ts);
+      const band = kdsBand(e.s);
       el.textContent = e.mmss;
-      el.classList.toggle('warn', e.s > 10 * 60 && e.s <= 20 * 60);
-      el.classList.toggle('late', e.s > 20 * 60);
+      el.classList.toggle('warn', band === 'aging' || band === 'aging_soon');
+      el.classList.toggle('late', band === 'overdue');
       const card = el.closest('.ticket');
-      if (card) {
-        card.classList.toggle('aging', e.s > 10 * 60 && e.s <= 20 * 60);
-        card.classList.toggle('overdue', e.s > 20 * 60);
-      }
+      if (card) card.className = 'ticket band-' + band;
+      const head = card ? card.querySelector('.t-head') : null;
+      if (head) head.className = 't-head band-' + band;
     });
   }, 1000);
+  state.timers.kdsAlerts = setInterval(loadAlerts, 20000);
 
   app._cleanup = () => { closeKdsSocket(); };
   await loadTickets();
   kdsSubscribe();
+  loadAlerts();
 }
 
 /* ============================================================
@@ -1722,6 +1851,25 @@ async function renderPay(app, checkId) {
     '<div class="field"><label for="comp-pin">Manager PIN</label><input type="password" id="comp-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px"></div>' +
     '<button class="btn btn-block" id="comp-apply">Apply comp</button></div>' +
 
+    (state.user.role === 'manager' && (check.payments || []).length
+      ? '<div class="card"><h2>Refunds</h2>' +
+        '<p class="muted small">Manager only — partial or full refunds, no hoops. A refund that returns a balance to a paid check reopens it.</p>' +
+        '<table class="money-table">' +
+        (check.payments || []).map((p) => {
+          const refunded = p.refunded_cents || 0;
+          const remaining = (p.amount_cents || 0) - refunded;
+          const st = p.status || 'completed';
+          const pill = st === 'refunded' ? ' <span class="pill sent">refunded</span>'
+            : st === 'partial_refund' ? ' <span class="pill held">partial refund</span>' : '';
+          return '<tr><td>' + paymentLabel(p) + pill +
+            (refunded ? '<div class="small muted">refunded ' + fmt(refunded) + '</div>' : '') + '</td>' +
+            '<td>' + fmt(p.amount_cents) + '</td>' +
+            '<td style="text-align:right;white-space:nowrap">' +
+            (remaining > 0 ? '<button class="btn btn-sm" data-refund="' + p.id + '">Refund</button>' : '<span class="muted small">—</span>') +
+            '</td></tr>';
+        }).join('') + '</table></div>'
+      : '') +
+
     '<div class="card"><h2>Split check</h2>' +
     (t.service_charge ? '<p class="small" style="color:var(--red)">Splitting is unavailable — a ' + pctLabel(sc.service_charge_pct) + ' service charge is applied to this check.</p>'
       : '<div class="split-row"><button class="btn" id="split-even">Split evenly</button>' +
@@ -1736,7 +1884,10 @@ async function renderPay(app, checkId) {
     '<div class="field" id="tip-custom-wrap" style="display:none"><label for="tip-custom">Custom tip ($)</label><input type="number" id="tip-custom" min="0" step="0.01" inputmode="decimal" placeholder="0.00"></div>' +
     '<p class="small muted" id="tip-line">Tip: $0.00</p></div>' +
     '<div class="pay-methods"><button class="btn btn-big" id="pay-cash">Cash</button>' +
-    '<button class="btn btn-big btn-primary" id="pay-card">Card</button></div></div>' +
+    '<button class="btn btn-big btn-primary" id="pay-card">Card</button></div>' +
+    '<div class="pay-methods" style="margin-top:8px"><button class="btn" id="pay-gift">Gift card</button>' +
+    '<button class="btn" id="pay-house">House account</button>' +
+    '<button class="btn" id="pay-compcard">Comp card</button></div></div>' +
 
     '<div class="card"><button class="btn btn-green btn-big btn-block" id="close-check"' + (t.balance > 0 ? ' disabled' : '') + '>' +
     (t.balance > 0 ? 'Balance remaining — cannot close' : 'Close check ✓') + '</button>' +
@@ -1746,6 +1897,8 @@ async function renderPay(app, checkId) {
   function paymentLabel(p) {
     if (p.method === 'cash') return 'Cash' + (p.tendered_cents ? ' (tendered ' + fmt(p.tendered_cents) + ')' : '');
     if (p.method === 'card_demo' || p.method === 'card') return 'Card' + (p.brand ? ' · ' + esc(p.brand) : '') + (p.last4 ? ' •••• ' + esc(p.last4) : '') + ' <span class="pill staged">DEMO</span>';
+    if (p.method === 'gift_card') return 'Gift card' + (p.last4 ? ' •••• ' + esc(p.last4) : '');
+    if (p.method === 'house_account') return 'House account' + (p.memo ? ' — ' + esc(p.memo) : '');
     return esc(p.method || 'Payment');
   }
 
@@ -1882,6 +2035,48 @@ async function renderPay(app, checkId) {
     } catch (e) { handleApiError(e); }
   };
 
+  /* ---- refunds (manager only; API is managerOnly) ---- */
+  $$('[data-refund]', app).forEach((b) => b.onclick = () => {
+    const p = (check.payments || []).find((x) => String(x.id) === b.dataset.refund);
+    if (!p) return;
+    const remaining = (p.amount_cents || 0) - (p.refunded_cents || 0);
+    if (remaining <= 0) { toast('Nothing left to refund on this payment', 'err'); return; }
+    const plainLabel = paymentLabel(p).replace(/<[^>]+>/g, '');
+    const billable = (check.items || []).filter((i) => i.state !== 'void');
+    const lineTotal = (i) => ((i.unit_price_cents != null ? i.unit_price_cents : i.price_cents) || 0) * (i.qty || 1);
+    const bd = openModal('<h2>Refund payment</h2>' +
+      '<p class="muted">' + esc(plainLabel) + ' — paid ' + fmt(p.amount_cents) + ', refundable <b>' + fmt(remaining) + '</b></p>' +
+      (billable.length ? '<p class="muted small">Tap items to refund them specifically — the amount fills in automatically.</p>' +
+      '<div class="checkbox-list" id="rf-items">' + billable.map((i) =>
+        '<label><input type="checkbox" data-rf-item="' + esc(String(i.id)) + '" data-rf-total="' + lineTotal(i) + '">' +
+        '<span style="flex:1">' + (i.qty > 1 ? i.qty + '× ' : '') + esc(i.name) + '</span><span>' + fmt(lineTotal(i)) + '</span></label>').join('') + '</div>' : '') +
+      '<div class="field"><label for="rf-amt">Refund amount ($)</label>' +
+      '<input type="number" id="rf-amt" min="0.01" step="0.01" inputmode="decimal" value="' + (remaining / 100).toFixed(2) + '"></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+      '<button class="btn btn-danger" data-x="go">Refund ' + fmt(remaining) + '</button></div>');
+    const rfUpd = () => {
+      const picked = $$('#rf-items [data-rf-item]:checked', bd).reduce((s, c) => s + Number(c.dataset.rfTotal || 0), 0);
+      if (picked > 0) $('#rf-amt', bd).value = (Math.min(picked, remaining) / 100).toFixed(2);
+      const cents = Math.round((parseFloat($('#rf-amt', bd).value) || 0) * 100);
+      $('[data-x="go"]', bd).textContent = 'Refund ' + fmt(Math.min(cents, remaining));
+    };
+    $$('#rf-items [data-rf-item]', bd).forEach((c) => c.addEventListener('change', rfUpd));
+    $('#rf-amt', bd).addEventListener('input', rfUpd);
+    $('[data-x="c"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = async () => {
+      const cents = Math.round((parseFloat($('#rf-amt', bd).value) || 0) * 100);
+      if (!(cents > 0) || cents > remaining) { toast('Enter $0.01 – ' + fmt(remaining), 'err'); return; }
+      closeModal();
+      try {
+        if (isOffline()) { toast('Refunds need a connection — reconnect first', 'err'); return; }
+        const r = await api('/api/payments/' + p.id + '/refund', 'POST', { amount_cents: cents });
+        const rp = (r && r.payment) || {};
+        toast(rp.status === 'refunded' ? 'Payment fully refunded' : 'Partial refund — ' + fmt(rp.refunded_cents || cents) + ' refunded', 'ok');
+        renderRoute(true);
+      } catch (e) { handleApiError(e); }
+    };
+  });
+
   /* ---- payments ---- */
   const recordPayment = async (payload) => {
     let resp = null;
@@ -1889,7 +2084,7 @@ async function renderPay(app, checkId) {
       if (isOffline()) {
         if (String(checkId).startsWith('tmp-')) {
           const d = JSON.parse(localStorage.getItem('expoline.draft:' + checkId));
-          d.payments.push({ method: payload.method, amount_cents: payload.amount_cents, tip_cents: payload.tip_cents || 0, tendered_cents: payload.tendered_cents, brand: payload.brand, last4: payload.last4 });
+          d.payments.push({ method: payload.method, amount_cents: payload.amount_cents, tip_cents: payload.tip_cents || 0, tendered_cents: payload.tendered_cents, brand: payload.brand, last4: payload.last4, memo: payload.memo });
           localStorage.setItem('expoline.draft:' + checkId, JSON.stringify(d));
         }
         await Outbox.enqueue('payment', Object.assign({ check_id: realId(checkId) }, payload));
@@ -1905,38 +2100,56 @@ async function renderPay(app, checkId) {
   };
 
   $('#pay-cash').onclick = () => {
-    const due = Math.max(0, (t.balance || 0) + tipCents);
+    const balance = Math.max(0, t.balance || 0);
+    const due = balance + tipCents;
     let tendered = due;
     const bd = openModal('<h2>Cash payment</h2><p class="muted">Due: <b style="color:var(--brass-hi)">' + fmt(due) + '</b>' + (tipCents ? ' (incl. ' + fmt(tipCents) + ' tip)' : '') + '</p>' +
+      splitTenderFields(due, tipCents) +
       '<div class="tip-row" id="cash-presets">' +
       '<button class="tip-chip" data-t="exact">Exact</button><button class="tip-chip" data-t="2000">$20</button><button class="tip-chip" data-t="5000">$50</button><button class="tip-chip" data-t="10000">$100</button></div>' +
       '<div class="field"><label for="cash-tendered">Tendered ($)</label><input type="number" id="cash-tendered" min="0" step="0.01" inputmode="decimal" value="' + (due / 100).toFixed(2) + '"></div>' +
       '<div class="change-due" id="cash-change">Change due: $0.00</div>' +
-      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Record cash payment</button></div>');
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go" id="cash-go">Record cash payment</button></div>');
+    const cur = () => readSplitTender(bd, balance);
     const upd = () => {
-      const ch = tendered - due;
+      const r = cur();
+      const go = $('[data-x="go"]', bd);
+      if (r.error) { go.disabled = true; go.textContent = 'Record cash payment'; return; }
+      const ch = tendered - r.payTotal;
       $('#cash-change', bd).textContent = 'Change due: ' + fmt(Math.max(0, ch));
-      $('[data-x="go"]', bd).disabled = tendered < due;
+      go.disabled = tendered < r.payTotal;
+      go.textContent = r.payTotal >= due ? 'Record cash payment'
+        : 'Record partial — ' + fmt(due - r.payTotal) + ' left';
     };
     $$('#cash-presets .tip-chip', bd).forEach((b) => b.onclick = () => {
-      tendered = b.dataset.t === 'exact' ? due : Number(b.dataset.t);
+      tendered = b.dataset.t === 'exact'
+        ? Math.round((parseFloat($('#st-amount', bd).value) || 0) * 100)
+        : Number(b.dataset.t);
       $('#cash-tendered', bd).value = (tendered / 100).toFixed(2);
       upd();
     });
     $('#cash-tendered', bd).addEventListener('input', (e) => { tendered = Math.round((parseFloat(e.target.value) || 0) * 100); upd(); });
+    $('#st-amount', bd).addEventListener('input', upd);
+    $('#st-tip', bd).addEventListener('input', upd);
     $('[data-x="c"]', bd).onclick = closeModal;
     $('[data-x="go"]', bd).onclick = async () => {
+      const r = cur();
+      if (r.error) { toast(r.error, 'err'); return; }
+      if (tendered < r.payTotal) { toast('Tendered is less than the payment amount', 'err'); return; }
+      const partial = r.payTotal < due;
       closeModal();
-      await recordPayment({ method: 'cash', amount_cents: t.balance, tip_cents: tipCents, tendered_cents: tendered });
+      const resp = await recordPayment({ method: 'cash', amount_cents: r.principal, tip_cents: r.tip, tendered_cents: tendered });
+      if (resp && partial) toast('Partial payment — ' + fmt(due - r.payTotal) + ' remaining', 'ok');
     };
     upd();
   };
 
   $('#pay-card').onclick = () => {
-    const due = Math.max(0, (t.balance || 0) + tipCents);
+    const balance = Math.max(0, t.balance || 0);
+    const due = balance + tipCents;
     const bd = openModal('<div class="demo-banner">DEMO TERMINAL — no real charge will be made</div>' +
       '<div class="term-screen" id="term-1"><h2>Card payment</h2><div class="term-amount">' + fmt(due) + '</div>' +
-      (tipCents ? '<p class="muted small">includes ' + fmt(tipCents) + ' tip</p>' : '') +
+      splitTenderFields(due, tipCents) +
       '<div class="term-btns"><button class="btn btn-big" data-tm="insert">Insert</button><button class="btn btn-big" data-tm="tap">Tap</button></div>' +
       '<div class="term-btns" style="margin-top:12px"><button class="btn btn-big" data-tm="swipe">Swipe</button><button class="btn btn-ghost" data-x="c">Cancel</button></div></div>' +
       '<div class="term-screen hidden" id="term-2"><h2>Processing…</h2><p class="muted">Contacting demo processor</p><p style="font-size:2rem">◌</p></div>' +
@@ -1945,16 +2158,18 @@ async function renderPay(app, checkId) {
       '<div class="demo-banner" style="margin-top:12px">DEMO — simulated approval, nothing charged</div>' +
       '<button class="btn btn-primary btn-block" data-x="done">Done</button></div>');
     $('[data-x="c"]', bd).onclick = closeModal;
-    let method = 'tap';
     $$('[data-tm]', bd).forEach((b) => b.onclick = async () => {
-      method = b.dataset.tm;
+      const r = readSplitTender(bd, balance);
+      if (r.error) { toast(r.error, 'err'); return; }
+      const partial = r.payTotal < due;
       $('#term-1', bd).classList.add('hidden');
       $('#term-2', bd).classList.remove('hidden');
-      const resp = await recordPayment({ method: 'card_demo', amount_cents: t.balance, tip_cents: tipCents, brand: 'Visa', last4: '4242' });
+      const resp = await recordPayment({ method: 'card_demo', amount_cents: r.principal, tip_cents: r.tip, brand: 'Visa', last4: '4242' });
       $('#term-2', bd).classList.add('hidden');
       if (resp && resp.demo && resp.demo.auth_code) {
         $('#term-3', bd).classList.remove('hidden');
         $('#term-auth', bd).textContent = resp.demo.auth_code;
+        if (partial) toast('Partial card payment — ' + fmt(due - r.payTotal) + ' remaining', 'ok');
       } else if (resp && resp.queued) {
         $('#term-3', bd).classList.remove('hidden');
         $('#term-3 h2', bd).textContent = 'Queued offline';
@@ -1964,6 +2179,94 @@ async function renderPay(app, checkId) {
       }
     });
     $('[data-x="done"]', bd).onclick = () => { closeModal(); };
+  };
+
+  /* ---- gift card tender (real redeem endpoint; tips can't go on a gift card) ---- */
+  $('#pay-gift').onclick = () => {
+    if (isOffline()) { toast('Gift cards need a connection — reconnect first', 'err'); return; }
+    const balance = Math.max(0, t.balance || 0);
+    let cardBal = null;
+    const bd = openModal('<h2>Gift card</h2><p class="muted">Balance due: <b style="color:var(--brass-hi)">' + fmt(balance) + '</b></p>' +
+      '<div class="field"><label for="gc-code">Card code</label><input type="text" id="gc-code" inputmode="text" placeholder="e.g. GC-XXXX" style="text-transform:uppercase"></div>' +
+      '<button class="btn" id="gc-lookup" style="margin-bottom:12px">Look up balance</button>' +
+      '<p class="small" id="gc-bal"></p><div id="gc-pay" style="display:none">' +
+      '<div class="field"><label for="gc-amount">Redeem amount ($) <span class="muted small">partial OK</span></label>' +
+      '<input type="number" id="gc-amount" min="0" step="0.01" inputmode="decimal"></div>' +
+      '<p class="small muted">Tips can\'t go on a gift card — take the tip on another tender.</p></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go" id="gc-go" disabled>Redeem</button></div>');
+    $('[data-x="c"]', bd).onclick = closeModal;
+    $('#gc-lookup', bd).onclick = async () => {
+      const code = $('#gc-code', bd).value.trim();
+      if (!code) { toast('Enter the card code', 'err'); return; }
+      try {
+        const r = await api('/api/gift-cards/balance/' + encodeURIComponent(code));
+        cardBal = (r.card && r.card.balance_cents) || 0;
+        $('#gc-bal', bd).textContent = 'Available: ' + fmt(cardBal);
+        $('#gc-amount', bd).value = (Math.min(cardBal, balance) / 100).toFixed(2);
+        $('#gc-pay', bd).style.display = 'block';
+        $('#gc-go', bd).disabled = false;
+      } catch (e) { handleApiError(e); }
+    };
+    $('[data-x="go"]', bd).onclick = async () => {
+      const code = $('#gc-code', bd).value.trim();
+      const amt = Math.round((parseFloat($('#gc-amount', bd).value) || 0) * 100);
+      if (!(amt > 0)) { toast('Enter an amount above $0.00', 'err'); return; }
+      if (amt > balance) { toast('Amount exceeds the balance due', 'err'); return; }
+      if (cardBal != null && amt > cardBal) { toast('Amount exceeds the card balance', 'err'); return; }
+      closeModal();
+      try {
+        await api('/api/gift-cards/redeem', 'POST', { check_id: realId(checkId), gift_card_code: code, amount_cents: amt });
+        toast(amt >= balance ? 'Gift card payment recorded' : 'Partial gift card payment — ' + fmt(balance - amt) + ' remaining', 'ok');
+        renderRoute(true);
+      } catch (e) { handleApiError(e); }
+    };
+  };
+
+  /* ---- house account tender (charge to a named account; the payment row is the ledger) ---- */
+  $('#pay-house').onclick = () => {
+    const balance = Math.max(0, t.balance || 0);
+    const due = balance + tipCents;
+    const bd = openModal('<h2>House account</h2><p class="muted">Charge <b style="color:var(--brass-hi)">' + fmt(due) + '</b> due to a house account.</p>' +
+      '<div class="field"><label for="ha-name">Account name (required)</label><input type="text" id="ha-name" maxlength="80" placeholder="e.g. Bali Hai — Daniel Silva"></div>' +
+      splitTenderFields(due, tipCents) +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Charge account</button></div>');
+    $('[data-x="c"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = async () => {
+      const name = $('#ha-name', bd).value.trim();
+      if (!name) { toast('Enter the account name', 'err'); return; }
+      const r = readSplitTender(bd, balance);
+      if (r.error) { toast(r.error, 'err'); return; }
+      const partial = r.payTotal < due;
+      closeModal();
+      const resp = await recordPayment({ method: 'house_account', amount_cents: r.principal, tip_cents: r.tip, memo: name });
+      if (resp && partial) toast('Partial house charge — ' + fmt(due - r.payTotal) + ' remaining', 'ok');
+    };
+  };
+
+  /* ---- comp card tender: same manager-gated, audit-logged comp flow, tender-button entry ---- */
+  $('#pay-compcard').onclick = () => {
+    if (isOffline()) { toast('Comps need a connection — reconnect first', 'err'); return; }
+    const balance = Math.max(0, t.balance || 0);
+    const bd = openModal('<h2>Comp card</h2><p class="muted">Manager approval required — applies a comp for the card amount. Audit-logged.</p>' +
+      '<div class="field"><label for="cc-amount">Comp amount ($)</label><input type="number" id="cc-amount" min="0" step="0.01" inputmode="decimal" value="' + (balance / 100).toFixed(2) + '"></div>' +
+      '<div class="field"><label for="cc-reason">Reason (required)</label><input type="text" id="cc-reason" maxlength="120" placeholder="e.g. comp card — birthday"></div>' +
+      '<div class="field"><label for="cc-pin">Manager PIN</label><input type="password" id="cc-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px"></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Apply comp card</button></div>');
+    $('[data-x="c"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = async () => {
+      const pin = $('#cc-pin', bd).value.trim();
+      if (!/^\d{4}$/.test(pin)) { toast('Enter the manager\'s 4-digit PIN', 'err'); return; }
+      const reason = $('#cc-reason', bd).value.trim();
+      if (!reason) { toast('A reason is required', 'err'); return; }
+      const amt = Math.round((parseFloat($('#cc-amount', bd).value) || 0) * 100);
+      if (!(amt > 0) || amt > balance) { toast('Enter an amount between $0.01 and ' + fmt(balance), 'err'); return; }
+      closeModal();
+      try {
+        const r = await api('/api/checks/' + realId(checkId) + '/comp', 'POST', { manager_pin: pin, reason: 'Comp card: ' + reason, amount_cents: amt });
+        toast('Comp card applied — ' + fmt(r.comp_cents) + ' (approved by ' + (r.approved_by || 'manager') + ')', 'ok');
+        renderRoute(true);
+      } catch (e) { handleApiError(e); }
+    };
   };
 
   const closeBtn = $('#close-check');
@@ -2870,14 +3173,17 @@ async function renderShift(app) {
     body.innerHTML = '<p class="muted">Loading shift report…</p>';
     try {
       const r = await api('/api/finance/shift?date=' + encodeURIComponent(d));
-      body.innerHTML = shiftHtml(r, d);
+      let tp = null;
+      try { tp = await api('/api/tipout/report?date=' + encodeURIComponent(d)); } catch (e2) { /* tip-outs optional */ }
+      body.innerHTML = shiftHtml(r, d, tp);
+      wireTipout(body, d, load);
     } catch (e) { if (handleApiError(e) !== 'bounced') body.innerHTML = '<div class="empty">Could not load shift report.</div>'; }
   };
   $('#sh-date').addEventListener('change', load);
   await load();
 }
 
-function shiftHtml(r, date) {
+function shiftHtml(r, date, tp) {
   const s = r.shift || r;
   const closed = s.checks_closed ?? s.closed_checks ?? 0;
   const sub = s.subtotal_cents ?? 0;
@@ -2903,7 +3209,70 @@ function shiftHtml(r, date) {
     '<div class="card"><h2>Cash reconciliation</h2><table class="fin-table">' +
     '<tr><td>Cash sales</td><td class="num">' + fmt(cashSales) + '</td></tr>' +
     '<tr><td>Card tips owed to server <span class="lbl-note">paid out at checkout</span></td><td class="num">' + fmt(cardTipsOwed) + '</td></tr>' +
-    '</table></div></div>';
+    '</table></div></div>' + tipoutHtml(tp);
+}
+
+/* ============================================================
+   TIP-OUTS / TIP POOLING — pooling rules as data, auto-computed
+   at shift review. No spreadsheet.
+   ============================================================ */
+function tipoutHtml(tp) {
+  if (!tp) return '';
+  const basisLabel = (b) => ({ food_sales: 'food sales', gross_sales: 'gross sales', tips: 'tips' }[b] || b);
+  const rulesRows = (tp.rules || []).map((r) =>
+    '<tr><td>' + esc(r.name) + '<div class="muted small">' + esc(r.role) + ' · ' + r.pct + '% of ' + esc(basisLabel(r.basis)) + '</div></td>' +
+    '<td class="num"><button class="btn btn-ghost btn-sm" data-tipout-del="' + r.id + '">Remove</button></td></tr>'
+  ).join('');
+  const serverRows = (tp.servers || []).map((s) => {
+    const detail = (s.tipouts || []).map((t) =>
+      '<div class="muted small">' + esc(t.name) + ': ' + fmt(t.owed_cents) + ' <span class="lbl-note">(' + t.pct_bps / 100 + '% of ' + fmt(t.basis_cents) + ' ' + esc(basisLabel(t.basis)) + ')</span></div>'
+    ).join('');
+    return '<tr><td><b>' + esc(s.server_name) + '</b><div class="muted small">tips ' + fmt(s.tips_cents) + ' · food ' + fmt(s.food_sales_cents) + '</div>' + detail + '</td>' +
+      '<td class="num">' + fmt(s.total_tipout_cents) + '<div class="muted small">net ' + fmt(s.net_tips_cents) + '</div></td></tr>';
+  }).join('');
+  const roleRows = (tp.by_role || []).map((x) =>
+    '<tr><td>' + esc(x.role) + '</td><td class="num">' + fmt(x.total_owed_cents) + '</td></tr>'
+  ).join('');
+  return '<div class="card" style="margin-top:12px"><h2>Tip-outs &amp; pooling</h2>' +
+    '<p class="muted small">Pooling rules are data — computed from today\'s sales at shift review. ' +
+    'Food sales exclude bar drinks; all math in whole cents.</p>' +
+    '<div class="report-grid">' +
+    '<div><h3>Per server</h3>' + (serverRows ? '<table class="fin-table">' + serverRows + '</table>' : '<p class="muted">No server sales for this date.</p>') + '</div>' +
+    '<div><h3>Owed by role</h3>' + (roleRows ? '<table class="fin-table">' + roleRows + '</table>' : '<p class="muted">No rules active.</p>') +
+    '<h3 style="margin-top:12px">Rules</h3>' +
+    (rulesRows ? '<table class="fin-table">' + rulesRows + '</table>' : '<p class="muted">No pooling rules yet — add one below.</p>') +
+    '<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px">' +
+    '<input id="tp-name" class="input" placeholder="Rule name (e.g. Busser tip-out)" style="flex:2;min-width:160px">' +
+    '<input id="tp-role" class="input" placeholder="Role (e.g. busser)" style="flex:1;min-width:100px">' +
+    '<select id="tp-basis" class="input" style="flex:1;min-width:110px"><option value="food_sales">% of food sales</option><option value="gross_sales">% of gross sales</option><option value="tips">% of tips</option></select>' +
+    '<input id="tp-pct" class="input" inputmode="decimal" placeholder="%" style="width:80px">' +
+    '<button class="btn btn-primary btn-sm" id="tp-add">Add rule</button></div>' +
+    '<p class="muted small" id="tp-msg" style="margin-top:6px"></p></div></div></div>';
+}
+
+function wireTipout(body, date, reload) {
+  const add = body.querySelector('#tp-add');
+  if (!add) return;
+  const msg = body.querySelector('#tp-msg');
+  add.onclick = async () => {
+    const pct = parseFloat((body.querySelector('#tp-pct').value || '').trim());
+    try {
+      await api('/api/tipout/rules', 'POST', {
+        name: body.querySelector('#tp-name').value,
+        role: body.querySelector('#tp-role').value,
+        basis: body.querySelector('#tp-basis').value,
+        pct_bps: Math.round(pct * 100),
+      });
+      reload();
+    } catch (e) { msg.textContent = (e && e.message) || 'Could not add rule'; }
+  };
+  body.querySelectorAll('[data-tipout-del]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('Remove this tip-out rule?')) return;
+      try { await api('/api/tipout/rules/' + b.dataset.tipoutDel, 'DELETE'); reload(); }
+      catch (e) { msg.textContent = (e && e.message) || 'Could not remove rule'; }
+    };
+  });
 }
 
 /* ============================================================

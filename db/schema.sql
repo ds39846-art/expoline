@@ -106,7 +106,10 @@ CREATE TABLE check_items (
   course TEXT,
   state TEXT DEFAULT 'held' CHECK(state IN ('held','sent','fulfilled','cancelled')),
   sent_at TEXT,
-  added_at TEXT
+  added_at TEXT,
+  note TEXT,
+  allergy INTEGER DEFAULT 0,
+  allergy_detail TEXT
 );
 
 CREATE TABLE payments (
@@ -114,13 +117,14 @@ CREATE TABLE payments (
   uuid TEXT,
   check_id INTEGER,
   site_id TEXT,
-  method TEXT CHECK(method IN ('cash','card_demo')),
+  method TEXT CHECK(method IN ('cash','card_demo','gift_card','house_account')),
   amount_cents INTEGER,
   tip_cents INTEGER DEFAULT 0,
   tendered_cents INTEGER,
   brand TEXT,
   last4 TEXT,
   auth_code TEXT,
+  memo TEXT,
   status TEXT DEFAULT 'completed' CHECK(status IN ('completed','refunded','partial_refund')),
   refunded_cents INTEGER DEFAULT 0,
   created_at TEXT
@@ -138,7 +142,8 @@ CREATE TABLE kds_tickets (
   status TEXT DEFAULT 'new' CHECK(status IN ('new','in_progress','fulfilled')),
   created_at TEXT,
   bumped_at TEXT,
-  bumped_by TEXT
+  bumped_by TEXT,
+  refire INTEGER DEFAULT 0
 );
 
 CREATE TABLE site_config (

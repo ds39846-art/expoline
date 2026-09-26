@@ -63,7 +63,10 @@ ok(q["refunds_cents"]==rf2, "refunds", f"{q['refunds_cents']} vs {rf2}")
 ok(q["stripe_fees_cents"]==f2, "stripe_fees", f"{q['stripe_fees_cents']} vs {f2}")
 ok(q["expected_payout_cents"]==exp2, "expected_payout EXACT", f"{q['expected_payout_cents']} vs {cv2}-{rf2}-{f2}={exp2}")
 ok(q["tips_cents"]==3300, "tips (card 1800 + cash 1500)", f"{q['tips_cents']} vs 3300")
-ok(q["cash_sales_cents"]==15613, "cash sales", f"{q['cash_sales_cents']} vs 15613")
+# soda's 453 was a CARD payment (fully refunded): it belongs in card_volume/refunds,
+# never in cash_sales. 15613 was a hand-computation slip (453 double-counted).
+ok(q["cash_sales_cents"]==15160, "cash sales (cash only; refunded card excluded)",
+   f"{q['cash_sales_cents']} vs 15160")
 ok(q["sales_date"]==TODAY and q["payout_date"]==TPAY, "payout lag 2 days", f"{q['sales_date']} -> {q['payout_date']}")
 
 print("-- manager partial refund of 471 on move-target payment --")
@@ -106,7 +109,9 @@ ok(t["subtotal_cents"]==25700, "subtotal", f"{t['subtotal_cents']} vs 25700")
 ok(t["tips_cents"]==3300, "tips", f"{t['tips_cents']} vs 3300")
 ok(t["card_brand_breakdown"]=={"Visa":4865+3960+3711+1471}, "brand breakdown (partial_refund included; full-refund soda excluded)",
    str(t["card_brand_breakdown"]))
-ok(t["cash_sales_cents"]==7128+5204+2828+453, "cash sales", f"{t['cash_sales_cents']} vs 15613")
+# fully-refunded card payments are excluded from cash_sales (net $0 takings, not cash).
+ok(t["cash_sales_cents"]==7128+5204+2828, "cash sales (refunded card excluded)",
+   f"{t['cash_sales_cents']} vs 15160")
 ok(t["cash_owed_to_server_cents"]==800+700+300, "card tips owed to server", f"{t['cash_owed_to_server_cents']} vs 1800")
 
 print(f"\nTest 3: {checks} assertions, {len(fails)} failures")
