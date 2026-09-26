@@ -638,3 +638,8 @@ ul.clean li { padding: 6px 0; border-bottom: 1px solid var(--line); }
 .pill.low { background: #fde8e8; color: #a33; }
 .pill.high { background: #e8f5e9; color: #2a7a2a; }
 .pill.normal { background: #eef; color: #446; }
+
+/* Product mix analytics */
+.pm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 12px; }
+.pm-grid h3 { margin: 0 0 8px; font-size: 15px; }
+@media (max-width: 900px) { .pm-grid { grid-template-columns: 1fr; } }

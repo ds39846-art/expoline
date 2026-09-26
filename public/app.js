@@ -3531,8 +3531,9 @@ async function renderFinance(app) {
     body.innerHTML = '<p class="muted">Loading reconciliation…</p>';
     try {
       const r = await api('/api/finance/payouts?date=' + encodeURIComponent(d));
-      body.innerHTML = financeHtml(r, d);
+      body.innerHTML = financeHtml(r, d) + '<div id="pm-section"></div>';
       wireReportExports(d);
+      wireProductMix(d);
     } catch (e) { if (handleApiError(e) !== 'bounced') body.innerHTML = '<div class="empty">Could not load payouts.</div>'; }
   };
   $('#fin-date').addEventListener('change', load);
@@ -3622,6 +3623,71 @@ function repQuery() {
   }
   return { kind, q, period };
 }
+
+/* ============================================================
+   PRODUCT MIX ANALYTICS — best/worst sellers from honest sales data.
+   API: GET /api/finance/product-mix?from=YYYY-MM-DD&to=YYYY-MM-DD
+   (manager only). No separate analytics SKU — same data as finance.
+   ============================================================ */
+function wireProductMix(anchorDate) {
+  const sec = document.getElementById('pm-section');
+  if (!sec) return;
+  // Default: last 7 days ending on the finance date.
+  const to = anchorDate;
+  const from = (() => { const d = new Date(to + 'T12:00:00'); d.setDate(d.getDate() - 6); return d.toISOString().slice(0, 10); })();
+  sec.innerHTML =
+    '<div class="card" style="margin-top:18px"><h2>Product mix <span class="muted small">best &amp; worst sellers</span></h2>' +
+    '<div class="row" style="gap:8px;align-items:center;margin-bottom:12px">' +
+    '<label class="muted small">From <input type="date" id="pm-from" value="' + esc(from) + '" style="min-height:40px"></label>' +
+    '<label class="muted small">To <input type="date" id="pm-to" value="' + esc(to) + '" style="min-height:40px"></label>' +
+    '<button class="btn btn-primary btn-sm" id="pm-go">Load</button></div>' +
+    '<div id="pm-body"><p class="muted">Loading…</p></div></div>';
+  const load = async () => {
+    const f = document.getElementById('pm-from').value, t = document.getElementById('pm-to').value;
+    const body = document.getElementById('pm-body');
+    body.innerHTML = '<p class="muted">Loading…</p>';
+    try {
+      const r = await api('/api/finance/product-mix?from=' + encodeURIComponent(f) + '&to=' + encodeURIComponent(t));
+      body.innerHTML = productMixHtml(r);
+    } catch (e) { if (handleApiError(e) !== 'bounced') body.innerHTML = '<div class="empty">Could not load product mix.</div>'; }
+  };
+  document.getElementById('pm-go').onclick = load;
+  load();
+}
+
+function pmTable(title, rows, key) {
+  if (!rows || !rows.length) return '<h3>' + esc(title) + '</h3><p class="muted small">No data in range.</p>';
+  const body = rows.map((r, i) =>
+    '<tr><td>' + (i + 1) + '</td><td>' + esc(r.name || 'Item') +
+    (r.category ? ' <span class="lbl-note">' + esc(r.category) + '</span>' : '') + '</td>' +
+    '<td class="num">' + (r.qty_sold || 0) + '</td>' +
+    '<td class="num">' + fmt(r.gross_cents || 0) + '</td>' +
+    '<td class="num">' + (r.gross_share_pct != null ? r.gross_share_pct + '%' : '—') + '</td>' +
+    '<td class="num' + ((r.void_rate_pct || 0) > 5 ? ' neg' : '') + '">' + (r.void_rate_pct != null ? r.void_rate_pct + '%' : '—') + '</td></tr>'
+  ).join('');
+  return '<h3>' + esc(title) + '</h3><table class="fin-table"><thead><tr>' +
+    '<th>#</th><th>Item</th><th class="num">Qty</th><th class="num">Gross</th>' +
+    '<th class="num">Share</th><th class="num">Void %</th></tr></thead><tbody>' + body + '</tbody></table>';
+}
+
+function productMixHtml(r) {
+  const t = r.totals || {};
+  const head = '<div class="date-cols">' +
+    '<div class="date-col"><div class="k">Items sold</div><div class="v">' + (t.items || 0) + '</div></div>' +
+    '<div class="date-col"><div class="k">Quantity</div><div class="v">' + (t.qty_sold || 0) + '</div></div>' +
+    '<div class="date-col"><div class="k">Gross</div><div class="v">' + fmt(t.gross_cents || 0) + '</div></div>' +
+    '<div class="date-col"><div class="k">Voided qty</div><div class="v">' + (t.voided_qty || 0) + '</div></div></div>' +
+    '<p class="muted small">Range: ' + esc(r.from || '') + ' → ' + esc(r.to || '') +
+    '. Attribution: items on checks closed in range. Voids counted separately — a popular-but-voided item can’t hide.</p>';
+  return head +
+    '<div class="pm-grid">' +
+    '<div>' + pmTable('Top 10 by quantity', r.best_by_qty) + '</div>' +
+    '<div>' + pmTable('Top 10 by revenue', r.best_by_gross) + '</div>' +
+    '<div>' + pmTable('Bottom 10 by quantity', r.worst_by_qty) + '</div>' +
+    '<div>' + pmTable('Bottom 10 by revenue', r.worst_by_gross) + '</div>' +
+    '</div>';
+}
+
 
 async function downloadReportBlob(fmt) {
   const rq = repQuery();
