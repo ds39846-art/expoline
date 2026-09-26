@@ -1219,6 +1219,7 @@ async function renderPay(app, checkId) {
 
   /* ---- payments ---- */
   const recordPayment = async (payload) => {
+    let resp = null;
     try {
       if (isOffline()) {
         if (String(checkId).startsWith('tmp-')) {
@@ -1228,12 +1229,14 @@ async function renderPay(app, checkId) {
         }
         await Outbox.enqueue('payment', Object.assign({ check_id: realId(checkId) }, payload));
         toast('Payment queued — syncs on reconnect', 'ok');
+        resp = { queued: true };
       } else {
-        await api('/api/checks/' + realId(checkId) + '/payments', 'POST', payload);
+        resp = await api('/api/checks/' + realId(checkId) + '/payments', 'POST', payload);
         toast('Payment recorded', 'ok');
       }
-    } catch (e) { handleApiError(e); return; }
+    } catch (e) { handleApiError(e); return null; }
     renderRoute(true);
+    return resp;
   };
 
   $('#pay-cash').onclick = () => {
@@ -1278,20 +1281,24 @@ async function renderPay(app, checkId) {
       '<button class="btn btn-primary btn-block" data-x="done">Done</button></div>');
     $('[data-x="c"]', bd).onclick = closeModal;
     let method = 'tap';
-    $$('[data-tm]', bd).forEach((b) => b.onclick = () => {
+    $$('[data-tm]', bd).forEach((b) => b.onclick = async () => {
       method = b.dataset.tm;
       $('#term-1', bd).classList.add('hidden');
       $('#term-2', bd).classList.remove('hidden');
-      setTimeout(() => {
-        $('#term-2', bd).classList.add('hidden');
+      const resp = await recordPayment({ method: 'card_demo', amount_cents: t.balance, tip_cents: tipCents, brand: 'Visa', last4: '4242' });
+      $('#term-2', bd).classList.add('hidden');
+      if (resp && resp.demo && resp.demo.auth_code) {
         $('#term-3', bd).classList.remove('hidden');
-        $('#term-auth', bd).textContent = Array.from({ length: 6 }, () => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 31)]).join('');
-      }, 1500);
+        $('#term-auth', bd).textContent = resp.demo.auth_code;
+      } else if (resp && resp.queued) {
+        $('#term-3', bd).classList.remove('hidden');
+        $('#term-3 h2', bd).textContent = 'Queued offline';
+        $('#term-auth', bd).textContent = 'will sync on reconnect';
+      } else {
+        closeModal();
+      }
     });
-    $('[data-x="done"]', bd).onclick = async () => {
-      closeModal();
-      await recordPayment({ method: 'card_demo', amount_cents: t.balance, tip_cents: tipCents, brand: 'Visa', last4: '4242' });
-    };
+    $('[data-x="done"]', bd).onclick = () => { closeModal(); };
   };
 
   const closeBtn = $('#close-check');
