@@ -1277,7 +1277,8 @@ app.get('/api/brain/status', (req, res) => {
     // higher = fallback (handhelds/tablets). See sync-engine/brain.js.
     priority: parseInt(process.env.EXPOLINE_BRAIN_PRIORITY || '0', 10),
     uptime_s: Math.floor(process.uptime()),
-    db_path: DB_PATH,
+    /* Security: never expose the absolute server path. Basename only. */
+    db_file: String(DB_PATH || '').split('/').pop(),
     lan,
     is_brain: lan.lan_enabled ? lan.is_brain : undefined,
     brain_device_id: lan.lan_enabled && lan.brain ? lan.brain.device_id : undefined,
