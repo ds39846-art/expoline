@@ -183,3 +183,36 @@ CREATE TABLE clock_audit (
   created_at TEXT
 );
 CREATE INDEX idx_clock_shifts_user ON clock_shifts(site_id, user_id, clock_out);
+
+CREATE TABLE reservations (
+  id INTEGER PRIMARY KEY,
+  uuid TEXT UNIQUE,
+  site_id TEXT,
+  customer_name TEXT,
+  phone TEXT,
+  party_size INTEGER,
+  reserved_at TEXT,
+  duration_min INTEGER DEFAULT 90,
+  table_id INTEGER,
+  status TEXT CHECK(status IN ('booked','seated','cancelled','no_show','completed')),
+  notes TEXT,
+  created_by TEXT,
+  created_at TEXT
+);
+CREATE INDEX idx_reservations_site_time ON reservations(site_id, reserved_at);
+CREATE INDEX idx_reservations_table_time ON reservations(site_id, table_id, reserved_at);
+CREATE INDEX idx_reservations_phone ON reservations(site_id, phone);
+
+CREATE TABLE waitlist (
+  id INTEGER PRIMARY KEY,
+  uuid TEXT UNIQUE,
+  site_id TEXT,
+  customer_name TEXT,
+  phone TEXT,
+  party_size INTEGER,
+  quoted_wait_min INTEGER,
+  status TEXT CHECK(status IN ('waiting','notified','seated','left','cancelled')),
+  notified_at TEXT,
+  created_at TEXT
+);
+CREATE INDEX idx_waitlist_site_status ON waitlist(site_id, status, created_at);

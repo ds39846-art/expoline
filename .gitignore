@@ -3,3 +3,6 @@
 db/sites/
 *.db-wal
 *.db-shm
+node_modules/
+*.db
+!db/schema.sql
