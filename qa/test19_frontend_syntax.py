@@ -17,9 +17,35 @@ from pathlib import Path
 BUILD = Path.home() / "workspace/goals/expo-line-pos-beat-toast-spoton-pilot-at-bali-hai/build/expoline"
 JS_FILES = sorted((BUILD / "public").rglob("*.js"))
 
+def negative_control():
+    """Prove the checker actually catches the bug class that broke the demo.
+
+    Writes a temp file with the exact defect from the 2026-09-26 incident
+    (unclosed IIFE) and asserts node --check rejects it. If this control
+    ever passes, the audit is vacuous and must not be trusted.
+    """
+    import tempfile, os
+    broken = "(function(){\n  window.BrokenFixture = { ok: true };\n  // missing })(); — unclosed IIFE, the demo-killing defect\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                     dir=str(BUILD / "public")) as f:
+        f.write(broken)
+        tmp = f.name
+    try:
+        r = subprocess.run(["node", "--check", tmp],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            print("NEGATIVE CONTROL FAILED: broken fixture parsed clean — audit is vacuous!")
+            return False
+        print(f"ok:   negative control (broken fixture correctly rejected)")
+        return True
+    finally:
+        os.unlink(tmp)
+
 def main():
     failures = []
     checked = 0
+    if not negative_control():
+        return 1
     for f in JS_FILES:
         # Skip node_modules if any
         if "node_modules" in str(f):

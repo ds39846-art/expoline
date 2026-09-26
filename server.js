@@ -434,6 +434,10 @@ require('./routes/parity_kds_pay').migrate(db);
     fired_by TEXT
   )`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_course_fires ON course_fires(site_id, check_id, fired_at)`);
+  /* One fire per course per check — the 409 "already fired" path is only real
+     with this constraint. Dedup first so the index can't fail on boot. */
+  db.exec(`DELETE FROM course_fires WHERE id NOT IN (SELECT MIN(id) FROM course_fires GROUP BY site_id, check_id, course)`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_course_fires_unique ON course_fires(site_id, check_id, course)`);
 
   db.exec(`CREATE TABLE IF NOT EXISTS schedule_shifts (
     id INTEGER PRIMARY KEY,
@@ -1897,28 +1901,26 @@ app.put('/api/course-timing', serverPlus(), managerOnly(), (req, res) => {
   const up = db.prepare(`INSERT INTO course_timing (site_id, course, eat_minutes, prep_minutes, updated_at)
     VALUES (?, ?, ?, ?, ?) ON CONFLICT(site_id, course) DO UPDATE SET eat_minutes=excluded.eat_minutes, prep_minutes=excluded.prep_minutes, updated_at=excluded.updated_at`);
   const now = new Date().toISOString();
-  db.transaction(() => {
+  withTransaction(() => {
     for (const t of timing) {
       if (!t.course || typeof t.eat_minutes !== 'number' || typeof t.prep_minutes !== 'number') continue;
       up.run(SITE_ID, String(t.course), Math.max(1, Math.min(180, Math.round(t.eat_minutes))), Math.max(1, Math.min(120, Math.round(t.prep_minutes))), now);
     }
-  })();
+  });
   res.json({ ok: true });
 });
 app.get('/api/checks/:id/fire-schedule', serverPlus(), (req, res) => {
-  const checkId = req.params.id;
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  const checkId = check.id;
   const timing = Object.fromEntries(db.prepare(`SELECT course, eat_minutes, prep_minutes FROM course_timing WHERE site_id = ?`).all(SITE_ID).map((r) => [r.course, r]));
   const fires = db.prepare(`SELECT course, fired_at FROM course_fires WHERE site_id = ? AND check_id = ? ORDER BY fired_at DESC`).all(SITE_ID, checkId);
   const order = ['drink', 'appetizer', 'entree', 'dessert'];
-  /* Remaining = courses after the last fired course in sequence.
-     Courses before the fired one are done/skipped, not rescheduled. */
-  let startIdx = 0;
-  if (fires.length) {
-    const lastFired = fires[0].course;
-    const li = order.indexOf(lastFired);
-    if (li >= 0) startIdx = li + 1;
-  }
-  const remaining = order.slice(startIdx);
+  /* Remaining = courses that actually have held items waiting, in course order.
+     This handles re-fires (items added after a course fired) and out-of-order
+     flows — the card only offers to fire food that exists. */
+  const heldByCourse = new Set(courseStatusFor(checkId).filter((s) => s.held > 0).map((s) => s.course));
+  const remaining = order.filter((c) => heldByCourse.has(c));
   const schedule = [];
   let anchor = fires.length ? new Date(fires[0].fired_at).getTime() : Date.now();
   let anchorCourse = fires.length ? fires[0].course : null;
@@ -1939,15 +1941,31 @@ app.get('/api/checks/:id/fire-schedule', serverPlus(), (req, res) => {
   res.json({ check_id: checkId, fired: fires.map((f) => ({ course: f.course, fired_at: f.fired_at })), schedule });
 });
 app.post('/api/checks/:id/fire-course', serverPlus(), (req, res) => {
-  const checkId = req.params.id;
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot fire course on a ${check.status} check` });
   const { course } = req.body || {};
   if (!course || !['drink', 'appetizer', 'entree', 'dessert'].includes(course)) return res.status(400).json({ error: 'valid course required' });
-  const id = crypto.randomUUID();
+  /* Idempotency: one fire per course per check. Pre-check for the clean 409;
+     the unique index below is the race guard. */
+  const existing = db.prepare(`SELECT id FROM course_fires WHERE site_id = ? AND check_id = ? AND course = ?`).get(SITE_ID, check.id, course);
+  if (existing) return res.status(409).json({ error: 'course already fired' });
+  const firedAt = nowIso();
   try {
     db.prepare(`INSERT INTO course_fires (uuid, site_id, check_id, course, fired_at, fired_by) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(id, SITE_ID, checkId, course, new Date().toISOString(), req.user?.name || req.user?.pin || 'staff');
-  } catch (e) { return res.status(409).json({ error: 'course already fired' }); }
-  res.json({ ok: true, course, fired_at: new Date().toISOString() });
+      .run(crypto.randomUUID(), SITE_ID, check.id, course, firedAt, req.user?.name || req.user?.pin || 'staff');
+  } catch (e) {
+    if (String(e.message || '').includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'course already fired' });
+    throw e;
+  }
+  /* Actually fire the course: held items of this course go to KDS now via the
+     shared fire path (same tickets, inventory, broadcasts as /send). When
+     nothing is held the fire is still recorded for timing. */
+  const held = db.prepare(
+    "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? AND ci.state = 'held' AND LOWER(ci.course) = ? ORDER BY ci.added_at, ci.id"
+  ).all(check.id, course.toLowerCase());
+  const result = fireHeldItemsToKds(check, held);
+  res.json({ ok: true, course, fired_at: firedAt, sent: result.sent, tickets: result.tickets });
 });
 
 /* Phase 3A (P1): editable check metadata — guest count, tab name, coursing.
@@ -2552,44 +2570,10 @@ app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
 });
 
 /* ------------------------------ send + KDS --------------------------------- */
-app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
-  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
-  if (!check) return res.status(404).json({ error: 'Check not found' });
-  if (check.status !== 'open') return res.status(400).json({ error: `Cannot send items on a ${check.status} check` });
-  const b = req.body || {};
-
-  let held = db.prepare(
-    "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? AND ci.state = 'held' ORDER BY ci.added_at, ci.id"
-  ).all(check.id);
-  // Phase 3A: selective send — item_ids and/or courses filters
-  if (b.item_ids !== undefined) {
-    if (!Array.isArray(b.item_ids)) return res.status(400).json({ error: 'item_ids must be an array' });
-    const ids = new Set(b.item_ids);
-    held = held.filter((it) => ids.has(it.id));
-  }
-  if (b.courses !== undefined) {
-    if (!Array.isArray(b.courses)) return res.status(400).json({ error: 'courses must be an array' });
-    if (!b.courses.map((c) => String(c).toLowerCase()).includes('all')) {
-      const want = new Set(b.courses.map((c) => String(c).toLowerCase()));
-      held = held.filter((it) => want.has(String(it.course || '').toLowerCase()));
-    }
-  }
-  if (held.length === 0) return res.json({ sent: 0, tickets: [] });
-
-  /* Phase 3A (P0-7): coursing. When the check requires coursing and the send
-     doesn't name items/courses, held items spanning 2+ courses get a 409
-     course-selection prompt instead of firing everything. */
-  const coursing = check.coursing || 'off';
-  if ((coursing === 'required' || coursing === 'optional') && b.item_ids === undefined && b.courses === undefined) {
-    const courses = [...new Set(held.map((it) => it.course || 'other'))];
-    if (courses.length > 1) {
-      return res.status(409).json({
-        error: `This check fires by course — choose which course${coursing === 'optional' ? ' (or send all)' : ''} to fire`,
-        need_course_selection: true, optional: coursing === 'optional', courses,
-      });
-    }
-  }
-
+/* Core KDS fire: mark held items sent, create station tickets, deplete
+   inventory, broadcast. Shared by /send and /fire-course so a course fire
+   actually puts food on the KDS — not just a timestamp. Returns {sent, tickets}. */
+function fireHeldItemsToKds(check, held) {
   const sentAt = nowIso();
   const table = check.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(check.table_id) : null;
   const serverUser = check.server_id ? db.prepare('SELECT name FROM users WHERE id = ?').get(check.server_id) : null;
@@ -2636,7 +2620,49 @@ app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
   }
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
-  res.json({ sent: held.length, tickets });
+  return { sent: held.length, tickets };
+}
+
+app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot send items on a ${check.status} check` });
+  const b = req.body || {};
+
+  let held = db.prepare(
+    "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? AND ci.state = 'held' ORDER BY ci.added_at, ci.id"
+  ).all(check.id);
+  // Phase 3A: selective send — item_ids and/or courses filters
+  if (b.item_ids !== undefined) {
+    if (!Array.isArray(b.item_ids)) return res.status(400).json({ error: 'item_ids must be an array' });
+    const ids = new Set(b.item_ids);
+    held = held.filter((it) => ids.has(it.id));
+  }
+  if (b.courses !== undefined) {
+    if (!Array.isArray(b.courses)) return res.status(400).json({ error: 'courses must be an array' });
+    if (!b.courses.map((c) => String(c).toLowerCase()).includes('all')) {
+      const want = new Set(b.courses.map((c) => String(c).toLowerCase()));
+      held = held.filter((it) => want.has(String(it.course || '').toLowerCase()));
+    }
+  }
+  if (held.length === 0) return res.json({ sent: 0, tickets: [] });
+
+  /* Phase 3A (P0-7): coursing. When the check requires coursing and the send
+     doesn't name items/courses, held items spanning 2+ courses get a 409
+     course-selection prompt instead of firing everything. */
+  const coursing = check.coursing || 'off';
+  if ((coursing === 'required' || coursing === 'optional') && b.item_ids === undefined && b.courses === undefined) {
+    const courses = [...new Set(held.map((it) => it.course || 'other'))];
+    if (courses.length > 1) {
+      return res.status(409).json({
+        error: `This check fires by course — choose which course${coursing === 'optional' ? ' (or send all)' : ''} to fire`,
+        need_course_selection: true, optional: coursing === 'optional', courses,
+      });
+    }
+  }
+
+  /* Fire via the shared KDS path so /send and /fire-course behave identically. */
+  return res.json(fireHeldItemsToKds(check, held));
 });
 
 /* Phase 3A (P0 send-now): one-tap add+fire — items go on the check and straight to KDS. */
