@@ -1,0 +1,1 @@
+{"dependencies":{"express":"^5.1.0","ws":"^8.18.0"},"description":"Expoline MVP v0.1 backend — Express + node:sqlite (built-in) + ws. Demo POS API for the Bali Hai pilot.","engines":{"node":">=22.5"},"license":"UNLICENSED","main":"server.js","name":"expoline-backend","private":true,"scripts":{"start":"node server.js"},"version":"0.1.0"}
