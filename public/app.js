@@ -210,6 +210,20 @@ function loadIdMap() { try { return JSON.parse(localStorage.getItem('expoline.id
 function saveIdMap(m) { try { localStorage.setItem('expoline.idmap', JSON.stringify(m)); } catch (e) { /* ignore */ } }
 function realId(id) { const m = loadIdMap(); return m[id] || id; }
 
+/* sha256 hex via WebCrypto (available on localhost + https). Used for
+   offline manager approvals: the queued void stores sha256(PIN) + a random
+   one-time nonce — never the raw PIN — so a stolen queue can't be replayed
+   or forged. The server binds the nonce to (check, item) on first use. */
+async function sha256Hex(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(s)));
+  return Array.from(new Uint8Array(buf)).map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+function randomNonce() {
+  const a = new Uint8Array(16);
+  crypto.getRandomValues(a);
+  return Array.from(a).map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
 /* Flush the outbox oldest-first. Stops at the first failure so order is
    preserved; remaining ops retry on the next reconnect. */
 let flushing = false;
@@ -243,7 +257,22 @@ async function flushOutbox() {
             saveIdMap(idmap);
           } else if (o.op === 'void_item') {
             const iid = idmap[p.item_id] || p.item_id;
-            await rawApi('/api/checks/' + cid + '/items/' + iid, 'DELETE');
+            // Offline approvals travel as PIN hash + one-time nonce (never the
+            // raw PIN); ops queued before this change still carry manager_pin.
+            const vbody = { item_id: Number(iid) || iid, reason: p.reason };
+            if (p.approval_nonce) { vbody.manager_pin_hash = p.manager_pin_hash; vbody.approval_nonce = p.approval_nonce; }
+            else vbody.manager_pin = p.manager_pin;
+            try {
+              await rawApi('/api/checks/' + cid + '/void-item', 'POST', vbody);
+            } catch (ve) {
+              // Approval failure (bad/expired PIN) is not a session problem —
+              // keep the op queued and tell the user instead of bouncing to login.
+              if (ve instanceof ApiError && ve.status === 403) {
+                toast('A queued void needs a valid manager PIN — re-void it from the check', 'err');
+                failed = true; break;
+              }
+              throw ve;
+            }
           } else if (o.op === 'send') {
             await rawApi('/api/checks/' + cid + '/send', 'POST');
           } else if (o.op === 'payment') {
@@ -335,8 +364,12 @@ function renderHeader() {
   const role = state.user.role;
   const links = [];
   if (role === 'server' || role === 'manager') links.push(['#/floor', 'Floor']);
+  if (role === 'server' || role === 'manager') links.push(['#/reservations', 'Reservations']);
+  if (role === 'server' || role === 'manager') links.push(['#/giftcards', 'Gift Cards']);
+  if (role === 'server' || role === 'manager') links.push(['#/loyalty', 'Loyalty']);
   if (role === 'kitchen' || role === 'manager') links.push(['#/kds', 'KDS']);
   if (role === 'manager') links.push(['#/manager', 'Manager']);
+  links.push(['#/clock', 'Clock']);
   const cur = location.hash.split('?')[0];
   $('#main-nav').innerHTML = links.map(([href, label]) =>
     '<a href="' + href + '" class="' + (cur === href || (href !== '#/floor' && cur.startsWith(href + '/')) ? 'active' : '') + '">' + esc(label) + '</a>').join('');
@@ -521,8 +554,12 @@ async function renderRoute(soft) {
     if (r.view === 'login') { renderLogin(app); return; }
     if (!state.user) { location.hash = '#/login'; return; }
     if (r.view === 'floor') return renderFloor(app);
+    if (r.view === 'reservations') return renderReservations(app);
+    if (r.view === 'giftcards') return renderGiftCards(app, api);
+    if (r.view === 'loyalty') return renderLoyalty(app, api);
     if (r.view === 'order') return renderOrder(app, r.param);
     if (r.view === 'kds') return renderKds(app);
+    if (r.view === 'clock') return renderClock(app);
     if (r.view === 'pay') return renderPay(app, r.param);
     if (r.view === 'manager') {
       if (state.user.role !== 'manager') { app.innerHTML = notAuthorized('Manager area — please log in as a manager.'); return; }
@@ -530,6 +567,9 @@ async function renderRoute(soft) {
       if (sub === 'finance') return renderFinance(app);
       if (sub === 'shift') return renderShift(app);
       if (sub === 'menu') return renderMenuViewer(app);
+      if (sub === 'floorplan') return renderFloorPlan(app);
+      if (sub === 'timeclock') return renderTimeClock(app);
+      if (sub === 'employees') return renderEmployees(app);
       return renderManager(app);
     }
     app.innerHTML = '<div class="empty">Unknown view.</div>';
@@ -680,6 +720,260 @@ async function renderFloor(app) {
 }
 
 /* ============================================================
+   VIEW: RESERVATIONS + WAITLIST — floor-plan-integrated booking.
+   Fewer taps than Toast: seat from the list in one tap (check opens
+   automatically), smart table suggestions come from the server in one
+   query, no-show history rides along on every phone number.
+   ============================================================ */
+const siteTodayLocal = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+const STATUS_CHIP = { booked: '', seated: 'active', cancelled: 'bad', no_show: 'bad', completed: '', waiting: 'warn', notified: 'active', left: '', };
+
+async function renderReservations(app) {
+  const role = state.user.role;
+  if (role !== 'server' && role !== 'manager') { app.innerHTML = notAuthorized(); return; }
+  const isMgr = role === 'manager';
+  let date = siteTodayLocal();
+
+  app.innerHTML =
+    '<div class="view-head"><h1>Reservations</h1><span class="spacer"></span>' +
+    '<input type="date" id="resv-date" value="' + esc(date) + '" aria-label="Booking date" style="min-height:44px;background:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--text)">' +
+    '<button class="btn btn-primary" id="resv-new">＋ New</button></div>' +
+    '<div class="resv-cols">' +
+    '<div class="card"><h2>Bookings <span class="count" id="resv-count"></span></h2><div id="resv-list"><div class="empty">Loading…</div></div></div>' +
+    '<div class="card"><div class="view-head" style="margin:0 0 8px"><h2>Waitlist <span class="count" id="wl-count"></span></h2><span class="spacer"></span><button class="btn btn-sm" id="wl-add">＋ Add</button></div><div id="wl-list"><div class="empty">Loading…</div></div></div>' +
+    '</div>';
+
+  $('#resv-date').onchange = (e) => { date = e.target.value || siteTodayLocal(); load(); };
+  $('#resv-new').onclick = openResvModal;
+  $('#wl-add').onclick = openWaitlistModal;
+
+  async function load() {
+    let resvs = [], wl = [];
+    try {
+      [resvs, wl] = await Promise.all([api('/api/reservations?date=' + encodeURIComponent(date)), api('/api/waitlist')]);
+    } catch (e) { if (handleApiError(e) === 'bounced') return; }
+    drawResvs(resvs); drawWaitlist(wl);
+  }
+
+  function drawResvs(rows) {
+    $('#resv-count').textContent = rows.filter((r) => r.status === 'booked').length + ' booked';
+    if (!rows.length) { $('#resv-list').innerHTML = '<div class="empty">No bookings for this date.</div>'; return; }
+    $('#resv-list').innerHTML = rows.map((r) => {
+      const warn = r.no_show_count ? ' <span class="chip bad" title="Prior no-shows">⚠ ' + r.no_show_count + ' no-show' + (r.no_show_count > 1 ? 's' : '') + '</span>' : '';
+      const acts = [];
+      if (r.status === 'booked') acts.push('<button class="btn btn-sm btn-primary" data-a="seat">Seat</button>');
+      if (isMgr && r.status === 'booked') acts.push('<button class="btn btn-sm btn-ghost" data-a="noshow">No-show</button>');
+      if (isMgr && !['cancelled', 'no_show', 'completed'].includes(r.status)) acts.push('<button class="btn btn-sm btn-danger" data-a="cancel">Cancel</button>');
+      return '<div class="resv-row" data-id="' + r.id + '"><div class="grow">' +
+        '<b>' + fmtClock(r.reserved_at) + '</b> · ' + esc(r.customer_name) +
+        ' <span class="muted small">(' + r.party_size + ' guests' + (r.table_label ? ' · Tbl ' + esc(r.table_label) : ' · no table') + ')</span>' +
+        ' <span class="chip ' + (STATUS_CHIP[r.status] || '') + '">' + esc(r.status.replace('_', ' ')) + '</span>' + warn +
+        (r.notes ? '<div class="muted small">' + esc(r.notes) + '</div>' : '') +
+        '</div><div class="resv-actions">' + acts.join('') + '</div></div>';
+    }).join('');
+    $$('#resv-list .resv-row').forEach((row) => {
+      const id = row.dataset.id;
+      const q = (a) => $('[data-a="' + a + '"]', row);
+      if (q('seat')) q('seat').onclick = () => seatReservation(id);
+      if (q('noshow')) q('noshow').onclick = () =>
+        confirmDialog('Mark no-show?', 'This is recorded in the audit log and counts against the phone number.', 'Mark no-show', async () => {
+          try { const r = await api('/api/reservations/' + id, 'PATCH', { status: 'no_show' }); toast('Marked no-show', 'ok'); load(); }
+          catch (e) { handleApiError(e); }
+        });
+      if (q('cancel')) q('cancel').onclick = () =>
+        confirmDialog('Cancel booking?', 'The table is released for this time slot.', 'Cancel booking', async () => {
+          try { await api('/api/reservations/' + id, 'DELETE'); toast('Booking cancelled', 'ok'); load(); }
+          catch (e) { handleApiError(e); }
+        });
+    });
+  }
+
+  function drawWaitlist(rows) {
+    $('#wl-count').textContent = rows.length + ' waiting';
+    if (!rows.length) { $('#wl-list').innerHTML = '<div class="empty">Waitlist is clear.</div>'; return; }
+    $('#wl-list').innerHTML = rows.map((w) => {
+      const wait = w.quoted_wait_min != null ? w.quoted_wait_min + ' min quoted' : 'no quote';
+      const warn = w.no_show_count ? ' <span class="chip bad">⚠ ' + w.no_show_count + '</span>' : '';
+      return '<div class="resv-row" data-id="' + w.id + '"><div class="grow">' +
+        '<b>' + esc(w.customer_name) + '</b> <span class="muted small">(' + w.party_size + ' · ' + esc(wait) + ')</span>' +
+        ' <span class="chip ' + (STATUS_CHIP[w.status] || '') + '">' + esc(w.status) + '</span>' + warn +
+        '</div><div class="resv-actions">' +
+        (w.status === 'waiting' ? '<button class="btn btn-sm" data-a="notify">Notify</button>' : '') +
+        '<button class="btn btn-sm btn-primary" data-a="seat">Seat</button>' +
+        (isMgr ? '<button class="btn btn-sm btn-danger" data-a="rm">✕</button>'
+               : '<button class="btn btn-sm btn-ghost" data-a="left">Left</button>') +
+        '</div></div>';
+    }).join('');
+    $$('#wl-list .resv-row').forEach((row) => {
+      const id = row.dataset.id;
+      const q = (a) => $('[data-a="' + a + '"]', row);
+      if (q('notify')) q('notify').onclick = async () => {
+        try { await api('/api/waitlist/' + id + '/notify', 'POST'); toast('Marked notified', 'ok'); load(); }
+        catch (e) { handleApiError(e); }
+      };
+      if (q('seat')) q('seat').onclick = () => seatWaitlist(id);
+      if (q('rm')) q('rm').onclick = () =>
+        confirmDialog('Remove from waitlist?', 'This entry is deleted.', 'Remove', async () => {
+          try { await api('/api/waitlist/' + id, 'DELETE'); load(); } catch (e) { handleApiError(e); }
+        });
+      if (q('left')) q('left').onclick = async () => {
+        try { await api('/api/waitlist/' + id, 'PATCH', { status: 'left' }); load(); }
+        catch (e) { handleApiError(e); }
+      };
+    });
+  }
+
+  /* Table picker: free + suggested tables for (datetime, party). One tap seats. */
+  async function pickTable(party, whenIso, onPick) {
+    let avail;
+    try {
+      avail = await api('/api/floor/availability?datetime=' + encodeURIComponent(whenIso) + '&party_size=' + party);
+    } catch (e) { handleApiError(e); return; }
+    const free = avail.tables.filter((t) => t.status === 'free');
+    if (!free.length) { toast('No free tables for that time', 'err'); return; }
+    free.sort((a, b) => (b.suggested - a.suggested) || (a.seats - b.seats));
+    const bd = openModal('<h2>Pick a table · ' + party + ' guests</h2><p class="muted">★ = best fit for this party</p>' +
+      '<div class="tbl-pick">' + free.map((t) =>
+        '<button class="table-tile' + (t.suggested ? ' suggested' : '') + '" data-t="' + t.id + '">' +
+        '<span>' + (t.suggested ? '★ ' : '') + esc(t.label) + '</span><span class="sub">' + t.seats + ' seats · ' + esc(t.zone || '') + '</span></button>').join('') +
+      '</div><div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button></div>');
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $$('.table-tile', bd).forEach((b) => b.onclick = async () => { closeModal(); await onPick(Number(b.dataset.t)); });
+  }
+
+  async function seatReservation(id) {
+    let r;
+    try { r = (await api('/api/reservations?date=' + encodeURIComponent(date))).find((x) => String(x.id) === String(id)); }
+    catch (e) { handleApiError(e); return; }
+    if (!r) return;
+    const go = async (tableId) => {
+      try {
+        const out = await api('/api/reservations/' + id, 'PATCH', { status: 'seated', table_id: tableId });
+        toast('Seated — check opened', 'ok');
+        if (out.check_id) location.hash = '#/order/' + out.check_id; else load();
+      } catch (e) { handleApiError(e); }
+    };
+    if (r.table_id) go(r.table_id);
+    else pickTable(r.party_size, r.reserved_at, go);
+  }
+
+  async function seatWaitlist(id) {
+    let w;
+    try { w = (await api('/api/waitlist')).find((x) => String(x.id) === String(id)); }
+    catch (e) { handleApiError(e); return; }
+    if (!w) return;
+    pickTable(w.party_size, new Date().toISOString(), async (tableId) => {
+      try {
+        const out = await api('/api/waitlist/' + id + '/seat', 'POST', { table_id: tableId });
+        toast('Seated — check opened', 'ok');
+        location.hash = '#/order/' + out.check_id;
+      } catch (e) { handleApiError(e); }
+    });
+  }
+
+  function openResvModal() {
+    let party = 2, tableId = null;
+    const dflt = new Date(Date.now() + 2 * 3600e3);
+    const hh = String(dflt.getHours()).padStart(2, '0'), mm = dflt.getMinutes() < 30 ? '00' : '30';
+    const bd = openModal(
+      '<h2>New reservation</h2>' +
+      '<div class="field"><label for="nr-name">Name</label><input type="text" id="nr-name" maxlength="60" placeholder="Guest name"></div>' +
+      '<div class="field"><label for="nr-phone">Phone (optional)</label><input type="tel" id="nr-phone" maxlength="20" placeholder="(619) 555-0123"></div>' +
+      '<div class="field"><label>Party size</label><div class="stepper">' +
+      '<button data-s="dec">−</button><span class="val" id="nr-pval">2</span><button data-s="inc">+</button></div></div>' +
+      '<div class="field"><label for="nr-date">Date</label><input type="date" id="nr-date" value="' + esc(date) + '"></div>' +
+      '<div class="field"><label for="nr-time">Time</label><input type="time" id="nr-time" value="' + hh + ':' + mm + '"></div>' +
+      '<div class="field"><label for="nr-dur">Duration</label><select id="nr-dur"><option value="60">1 hr</option><option value="90" selected>1.5 hr</option><option value="120">2 hr</option><option value="180">3 hr</option></select></div>' +
+      '<div class="field"><label for="nr-table">Table (★ suggested)</label><select id="nr-table"><option value="">— pick after time —</option></select></div>' +
+      '<div class="field"><label for="nr-notes">Notes (optional)</label><input type="text" id="nr-notes" maxlength="200" placeholder="Allergies, occasion…"></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="go">Book</button></div>');
+
+    const setParty = (p) => { party = Math.min(24, Math.max(1, p)); $('#nr-pval', bd).textContent = party; refreshTables(); };
+    $('[data-s="dec"]', bd).onclick = () => setParty(party - 1);
+    $('[data-s="inc"]', bd).onclick = () => setParty(party + 1);
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+
+    let lastKey = '';
+    async function refreshTables() {
+      const d = $('#nr-date', bd).value, t = $('#nr-time', bd).value;
+      if (!d || !t) return;
+      const key = d + '|' + t + '|' + party;
+      if (key === lastKey) return;
+      lastKey = key;
+      const sel = $('#nr-table', bd);
+      sel.innerHTML = '<option value="">Checking…</option>';
+      try {
+        const av = await api('/api/floor/availability?datetime=' + encodeURIComponent(d + 'T' + t + ':00') + '&party_size=' + party);
+        const free = av.tables.filter((x) => x.status === 'free')
+          .sort((a, b) => (b.suggested - a.suggested) || (a.seats - b.seats));
+        sel.innerHTML = '<option value="">No table (unassigned)</option>' + free.map((x) =>
+          '<option value="' + x.id + '"' + (x.suggested ? ' data-s="1"' : '') + '>' +
+          (x.suggested ? '★ ' : '') + esc(x.label) + ' · ' + x.seats + ' seats · ' + esc(x.zone || '') + '</option>').join('');
+        const sug = free.find((x) => x.suggested);
+        if (sug) { sel.value = String(sug.id); tableId = sug.id; }
+      } catch (e) { sel.innerHTML = '<option value="">Unavailable</option>'; }
+    }
+    $('#nr-date', bd).onchange = () => { lastKey = ''; refreshTables(); };
+    $('#nr-time', bd).onchange = () => { lastKey = ''; refreshTables(); };
+    $('#nr-table', bd).onchange = (e) => { tableId = e.target.value ? Number(e.target.value) : null; };
+    refreshTables();
+
+    $('[data-x="go"]', bd).onclick = async () => {
+      const name = $('#nr-name', bd).value.trim();
+      if (!name) { toast('Name is required', 'err'); return; }
+      const body = {
+        customer_name: name, phone: $('#nr-phone', bd).value.trim(), party_size: party,
+        reserved_at: $('#nr-date', bd).value + 'T' + $('#nr-time', bd).value + ':00',
+        duration_min: Number($('#nr-dur', bd).value), notes: $('#nr-notes', bd).value.trim(),
+      };
+      if (tableId) body.table_id = tableId;
+      try {
+        const r = await api('/api/reservations', 'POST', body);
+        closeModal();
+        if (r.no_show_count) toast('⚠ ' + r.no_show_count + ' prior no-show' + (r.no_show_count > 1 ? 's' : '') + ' on this number', 'err');
+        else toast('Booked', 'ok');
+        if ($('#nr-date', bd)) date = $('#nr-date', bd).value;
+        $('#resv-date').value = date;
+        load();
+      } catch (e) { handleApiError(e); }
+    };
+  }
+
+  function openWaitlistModal() {
+    let party = 2, quoted = 20;
+    const bd = openModal(
+      '<h2>Add to waitlist</h2>' +
+      '<div class="field"><label for="wl-name">Name</label><input type="text" id="wl-name" maxlength="60" placeholder="Guest name"></div>' +
+      '<div class="field"><label for="wl-phone">Phone (optional)</label><input type="tel" id="wl-phone" maxlength="20"></div>' +
+      '<div class="field"><label>Party size</label><div class="stepper">' +
+      '<button data-s="dec">−</button><span class="val" id="wl-pval">2</span><button data-s="inc">+</button></div></div>' +
+      '<div class="field"><label>Quoted wait</label><div class="stepper">' +
+      '<button data-q="dec">−</button><span class="val" id="wl-qval">20 min</span><button data-q="inc">+</button></div></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="go">Add</button></div>');
+    $('[data-s="dec"]', bd).onclick = () => { party = Math.max(1, party - 1); $('#wl-pval', bd).textContent = party; };
+    $('[data-s="inc"]', bd).onclick = () => { party = Math.min(24, party + 1); $('#wl-pval', bd).textContent = party; };
+    $('[data-q="dec"]', bd).onclick = () => { quoted = Math.max(0, quoted - 5); $('#wl-qval', bd).textContent = quoted + ' min'; };
+    $('[data-q="inc"]', bd).onclick = () => { quoted = Math.min(180, quoted + 5); $('#wl-qval', bd).textContent = quoted + ' min'; };
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = async () => {
+      const name = $('#wl-name', bd).value.trim();
+      if (!name) { toast('Name is required', 'err'); return; }
+      try {
+        const w = await api('/api/waitlist', 'POST', { customer_name: name, phone: $('#wl-phone', bd).value.trim(), party_size: party, quoted_wait_min: quoted });
+        closeModal();
+        if (w.no_show_count) toast('⚠ ' + w.no_show_count + ' prior no-show' + (w.no_show_count > 1 ? 's' : '') + ' on this number', 'err');
+        else toast('Added to waitlist', 'ok');
+        load();
+      } catch (e) { handleApiError(e); }
+    };
+  }
+
+  load();
+}
+
+/* ============================================================
    VIEW: ORDER (server) — seat-first ordering, HOLD + SEND only.
    Locked rule: NO Stay / Release / Quick Send anywhere.
    ============================================================ */
@@ -800,27 +1094,53 @@ async function renderOrder(app, checkId) {
         const unitCents = (ref.unit_price_cents != null ? ref.unit_price_cents : ref.price_cents) || 0;
         const lineTotal = unitCents * (ref.qty || 1) + (ref.modifiers || []).reduce((a, m) => a + (m.price_delta_cents || 0) * (ref.qty || 1), 0);
         const voidBtn = (kind === 'staged' || ref.state === 'held')
-          ? '<button class="icon-btn" data-void="' + esc(String(ref.temp_id || ref.id)) + '" data-kind="' + kind + '" aria-label="Void item" title="Void">✕</button>' : '';
+          ? '<button class="icon-btn" data-void="' + esc(String(ref.temp_id || ref.id)) + '" data-kind="' + kind + '" data-nm="' + esc(ref.name) + '" aria-label="Void item" title="Void">✕</button>'
+          : (ref.state === 'sent'
+            ? '<button class="icon-btn mgr-void" data-voidmgr="' + esc(String(ref.id)) + '" data-nm="' + esc(ref.name) + '" aria-label="Void sent item — manager approval required" title="Void (manager approval)">✕</button>'
+            : '');
         return '<div class="cart-line"><div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
           (mods ? '<span class="mods">' + mods + '</span>' : '') + '</div>' + pill +
           '<span class="pr">' + fmt(lineTotal) + '</span>' + voidBtn + '</div>';
       }).join('') + '</div>').join('');
     $$('[data-void]', cartBody).forEach((b) => b.onclick = () => {
       const id = b.dataset.void, kind = b.dataset.kind;
-      confirmDialog('Void item', 'Remove this item from the order? (Held items only — sent items go through the kitchen.)', 'Void item', async () => {
-        if (kind === 'staged') {
+      if (kind === 'staged') {
+        confirmDialog('Void item', 'Remove this item from the order? It was never sent anywhere.', 'Void item', async () => {
           staged = staged.filter((s) => s.temp_id !== id);
           saveStaged(checkId, staged);
           drawCart();
-        } else {
-          await voidHeldItem(checkId, id);
-          renderRoute(true);
-        }
-      });
+        });
+      } else {
+        openVoidApproval(id, b.dataset.nm);
+      }
     });
+    /* Sent items: same manager-approval modal. */
+    $$('[data-voidmgr]', cartBody).forEach((b) => b.onclick = () => openVoidApproval(b.dataset.voidmgr, b.dataset.nm));
   }
 
-  async function voidHeldItem(cid, itemId) {
+  /* Manager-approved void (held or sent): the manager enters their PIN at
+     the device; the approval is audit-logged server-side. Offline, the PIN
+     is NOT stored — the queued op carries sha256(PIN) + a one-time nonce,
+     which the server binds to (check, item) on first use (no replay/forge). */
+  function openVoidApproval(itemId, itemName) {
+    const bd = openModal('<h2>Void item</h2>' +
+      '<p class="muted">Void <b>' + esc(itemName || 'item') + '</b>? A manager\'s approval is required — the void is audit-logged.</p>' +
+      '<label class="fld">Reason <input id="vm-reason" maxlength="120" placeholder="e.g. wrong seat"></label>' +
+      '<label class="fld">Manager PIN <input id="vm-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px"></label>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+      '<button class="btn btn-danger" data-x="go">Void item</button></div>');
+    $('[data-x="c"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = async () => {
+      const pin = $('#vm-pin', bd).value.trim();
+      if (!/^\d{4}$/.test(pin)) { toast('Enter the manager\'s 4-digit PIN', 'err'); return; }
+      const reason = $('#vm-reason', bd).value.trim() || undefined;
+      closeModal();
+      await voidApprovedItem(checkId, itemId, pin, reason);
+      renderRoute(true);
+    };
+  }
+
+  async function voidApprovedItem(cid, itemId, managerPin, reason) {
     try {
       if (isOffline()) {
         // if the item is itself a pending offline add, absorb the void into that op
@@ -837,11 +1157,20 @@ async function renderOrder(app, checkId) {
             }
           }
         }
-        if (!absorbed) await Outbox.enqueue('void_item', { check_id: realId(cid), item_id: itemId });
-        toast('Void queued', 'ok');
+        if (!absorbed) {
+          if (!window.crypto || !crypto.subtle || !crypto.getRandomValues) {
+            toast('Offline void needs a secure context — reconnect to void', 'err');
+            return;
+          }
+          // Store approval as sha256(PIN) + one-time nonce — never the raw PIN.
+          const payload = { check_id: realId(cid), item_id: itemId, reason,
+            manager_pin_hash: await sha256Hex(managerPin), approval_nonce: randomNonce() };
+          await Outbox.enqueue('void_item', payload);
+        }
+        toast('Void queued — manager approval syncs on reconnect', 'ok');
       } else {
-        await api('/api/checks/' + realId(cid) + '/items/' + itemId, 'DELETE');
-        toast('Item voided', 'ok');
+        await api('/api/checks/' + realId(cid) + '/void-item', 'POST', { item_id: Number(itemId), manager_pin: managerPin, reason });
+        toast('Item voided — manager approved', 'ok');
       }
     } catch (e) { handleApiError(e); }
   }
@@ -890,6 +1219,32 @@ async function renderOrder(app, checkId) {
     } catch (e) { handleApiError(e); return; }
     renderRoute(true);
   };
+
+  /* Live menu: when a manager edits the menu or 86s an item, every open
+     order screen refetches and redraws — no manual refresh, no stale items. */
+  let menuWs = null;
+  function menuWatch() {
+    if (isOffline()) return;
+    const tok = sessionStorage.getItem('expoline.token');
+    if (!tok) return;
+    try { menuWs = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws?token=' + encodeURIComponent(tok)); }
+    catch (e) { return; }
+    menuWs.onopen = () => { try { menuWs.send(JSON.stringify({ action: 'subscribe', channel: 'menu' })); } catch (e) {} };
+    menuWs.onmessage = async (ev) => {
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (!msg || msg.type !== 'menu_updated') return;
+      try {
+        menu = await getMenu();
+        if (!menu.some((c) => String(c.id) === String(activeCat))) activeCat = menu.length ? menu[0].id : null;
+        drawCats(); drawItems();
+        toast('Menu updated', 'ok');
+      } catch (e) { /* keep the old menu on screen */ }
+    };
+    menuWs.onclose = () => { menuWs = null; };
+    menuWs.onerror = () => { try { menuWs.close(); } catch (e) {} };
+  }
+  menuWatch();
+  app._cleanup = () => { if (menuWs) { try { menuWs.close(); } catch (e) {} menuWs = null; } };
 
   if (menu.length) { activeCat = menu[0].id; drawCats(); drawItems(); }
   drawSeats(); drawCart();
@@ -1093,6 +1448,7 @@ async function renderPay(app, checkId) {
     ['5% surcharge', fmt(t.surcharge)],
     t.service_charge ? ['18% service charge <span class="lbl-note">8+ guests</span>', fmt(t.service_charge)] : null,
     ['Tax', fmt(t.tax)],
+    t.comp ? ['Comp <span class="lbl-note">manager approved</span>', '−' + fmt(t.comp)] : null,
   ].filter(Boolean);
 
   app.innerHTML =
@@ -1109,6 +1465,15 @@ async function renderPay(app, checkId) {
     '<tr><td>Paid</td><td>' + fmt(t.paid) + '</td></tr>' +
     '<tr class="balance' + (t.balance <= 0 ? ' zero' : '') + '"><td>Balance due</td><td>' + fmt(Math.max(0, t.balance)) + '</td></tr>' +
     '</table></div>' +
+
+    '<div class="card"><h2>Comp</h2>' +
+    '<p class="muted small">Manager approval required — amount or %, a reason, and the manager\'s PIN. The comp is audit-logged.</p>' +
+    '<div class="tip-row" id="comp-mode">' +
+    '<button class="tip-chip active" data-cm="amount">$ amount</button><button class="tip-chip" data-cm="percent">% percent</button></div>' +
+    '<div class="field"><label for="comp-val" id="comp-val-label">Comp amount ($)</label><input type="number" id="comp-val" min="0" step="0.01" inputmode="decimal" placeholder="0.00"></div>' +
+    '<div class="field"><label for="comp-reason">Reason (required)</label><input type="text" id="comp-reason" maxlength="120" placeholder="e.g. birthday dessert"></div>' +
+    '<div class="field"><label for="comp-pin">Manager PIN</label><input type="password" id="comp-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px"></div>' +
+    '<button class="btn btn-block" id="comp-apply">Apply comp</button></div>' +
 
     '<div class="card"><h2>Split check</h2>' +
     (t.service_charge ? '<p class="small" style="color:var(--red)">Splitting is unavailable — an 18% service charge is applied to this check.</p>'
@@ -1237,6 +1602,36 @@ async function renderPay(app, checkId) {
     };
   };
 
+  /* ---- comp (manager approval at point of action) ---- */
+  let compMode = 'amount';
+  $$('#comp-mode .tip-chip').forEach((b) => b.onclick = () => {
+    $$('#comp-mode .tip-chip').forEach((x) => x.classList.remove('active'));
+    b.classList.add('active');
+    compMode = b.dataset.cm;
+    $('#comp-val-label').textContent = compMode === 'amount' ? 'Comp amount ($)' : 'Comp percent (%)';
+  });
+  $('#comp-apply').onclick = async () => {
+    if (isOffline()) { toast('Comps need a connection — reconnect first', 'err'); return; }
+    const pin = $('#comp-pin').value.trim();
+    if (!/^\d{4}$/.test(pin)) { toast('Enter the manager\'s 4-digit PIN', 'err'); return; }
+    const reason = $('#comp-reason').value.trim();
+    if (!reason) { toast('A reason is required for comps', 'err'); return; }
+    const v = parseFloat($('#comp-val').value || '0');
+    const body = { manager_pin: pin, reason };
+    if (compMode === 'amount') {
+      if (!(v > 0)) { toast('Enter a comp amount', 'err'); return; }
+      body.amount_cents = Math.round(v * 100);
+    } else {
+      if (!(v > 0) || v > 100) { toast('Enter a percent between 0 and 100', 'err'); return; }
+      body.percent = v;
+    }
+    try {
+      const r = await api('/api/checks/' + realId(checkId) + '/comp', 'POST', body);
+      toast('Comp applied — ' + fmt(r.comp_cents) + ' (approved by ' + (r.approved_by || 'manager') + ')', 'ok');
+      renderRoute(true);
+    } catch (e) { handleApiError(e); }
+  };
+
   /* ---- payments ---- */
   const recordPayment = async (payload) => {
     let resp = null;
@@ -1353,7 +1748,9 @@ function mgrGuard(app) {
 function mgrNav(active) {
   return '<div class="tabs">' +
     [['#/manager', 'Overview', active === 'overview'], ['#/manager/finance', 'Finance & Payouts', active === 'finance'],
-     ['#/manager/shift', 'Shift report', active === 'shift'], ['#/manager/menu', 'Menu', active === 'menu']]
+     ['#/manager/shift', 'Shift report', active === 'shift'], ['#/manager/menu', 'Menu', active === 'menu'],
+     ['#/manager/floorplan', 'Floor plan', active === 'floorplan'], ['#/manager/timeclock', 'Time clock', active === 'timeclock'],
+     ['#/manager/employees', 'Employees', active === 'employees']]
       .map(([h, l, a]) => '<a class="tab' + (a ? ' active' : '') + '" href="' + h + '">' + l + '</a>').join('') + '</div>';
 }
 
@@ -1373,6 +1770,520 @@ async function renderManager(app) {
     '</div><p class="muted small mt">Detailed reconciliation lives under Finance &amp; Payouts — every fee named, no “Other” bucket.</p>';
 }
 
+/* ============================================================
+   VIEW: EMPLOYEES (manager)
+   Employee records: list, add, edit, deactivate. PINs are never
+   displayed or returned by the API. Deactivation blocks login and
+   clock-in. Every change lands in the approval audit below.
+   ============================================================ */
+async function renderEmployees(app) {
+  if (!mgrGuard(app)) return;
+  app.innerHTML = '<div class="view-head"><h1>Employees</h1><span class="spacer"></span>' +
+    '<button class="btn btn-primary" id="emp-add">+ Add employee</button></div>' + mgrNav('employees') +
+    '<div class="card"><div class="t-scroll"><table class="t-table" id="emp-table">' +
+    '<thead><tr><th>#</th><th>Name</th><th>Role</th><th>Wage</th><th>Status</th><th></th></tr></thead>' +
+    '<tbody><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>' +
+    '<p class="muted small mt">Employee # and PIN must be unique. Deactivating keeps payroll history but blocks login and clock-in.</p></div>' +
+    '<div class="card mt"><h3>Manager approvals</h3><p class="muted small">Voids, comps, time adjustments, employee changes — who approved what, and when.</p>' +
+    '<div class="t-scroll"><table class="t-table" id="audit-table">' +
+    '<thead><tr><th>When</th><th>Action</th><th>Actor</th><th>Approver</th><th>Detail</th></tr></thead>' +
+    '<tbody><tr><td colspan="5" class="muted">Loading…</td></tr></tbody></table></div></div>';
+
+  const roleName = (r) => ({ server: 'Server', kitchen: 'Kitchen', manager: 'Manager' }[r] || r);
+
+  const summarize = (r) => {
+    try {
+      const d = JSON.parse(r.details || '{}');
+      if (r.action === 'void_item') return 'Item ' + (r.item_id || d.item_id || '?') + ' on check ' + (r.check_id || d.check_id || '?') + (d.reason ? ' — “' + d.reason + '”' : '');
+      if (r.action === 'comp') return fmt(d.added_cents || 0) + ' on check ' + (r.check_id || '?') + (d.reason ? ' — “' + d.reason + '”' : '');
+      if (r.action === 'adjust') {
+        const bits = [];
+        if (d.before && d.after) {
+          if (d.after.clock_in) bits.push('in ' + d.before.clock_in + ' → ' + d.after.clock_in);
+          if (d.after.clock_out !== undefined) bits.push('out → ' + (d.after.clock_out || 'reopened'));
+        }
+        if (d.break) bits.push('break #' + d.break.id);
+        return 'Shift ' + (r.shift_id || d.shift_id || '?') + (bits.length ? ': ' + bits.join('; ') : '');
+      }
+      if (r.action === 'employee.create') return 'Created ' + ((d.after && d.after.name) || '') + ' (#' + ((d.after && d.after.employee_number) || '?') + ')';
+      if (r.action === 'employee.update') return 'Updated ' + (((d.after && d.after.name) || (d.before && d.before.name)) || ('#' + d.employee_id));
+      if (r.action === 'employee.deactivate') return 'Deactivated ' + ((d.before && d.before.name) || ('#' + d.employee_id));
+      return '';
+    } catch (e) { return ''; }
+  };
+
+  const load = async () => {
+    let emps = [];
+    try { emps = await api('/api/admin/employees'); }
+    catch (e) { if (handleApiError(e) === 'bounced') return; emps = []; }
+    $('#emp-table tbody', app).innerHTML = emps.length ? emps.map((e) =>
+      '<tr><td><b>' + e.employee_number + '</b></td>' +
+      '<td>' + esc(e.name) + '</td><td>' + esc(roleName(e.role)) + '</td>' +
+      '<td>' + fmt(e.wage_rate_cents) + '/hr</td>' +
+      '<td>' + (e.active ? '<span class="pill sent">active</span>' : '<span class="pill held">inactive</span>') + '</td>' +
+      '<td style="white-space:nowrap"><button class="btn btn-ghost btn-sm" data-edit="' + e.id + '">Edit</button> ' +
+      (e.active ? '<button class="btn btn-ghost btn-sm" data-deact="' + e.id + '" data-nm="' + esc(e.name) + '">Deactivate</button>' : '') + '</td></tr>'
+    ).join('') : '<tr><td colspan="6" class="muted">No employees yet.</td></tr>';
+
+    let rows = [];
+    try { rows = await api('/api/admin/approvals/audit?limit=60'); } catch (e) { rows = []; }
+    $('#audit-table tbody', app).innerHTML = rows.length ? rows.map((r) =>
+      '<tr><td class="small">' + esc(fmtDateTime(r.created_at)) + '</td>' +
+      '<td><span class="pill staged">' + esc(r.action) + '</span></td>' +
+      '<td>' + esc(r.actor || '—') + '</td><td>' + esc(r.approver || '—') + '</td>' +
+      '<td class="small">' + esc(summarize(r)) + '</td></tr>'
+    ).join('') : '<tr><td colspan="5" class="muted">No approvals yet.</td></tr>';
+
+    $$('[data-edit]', app).forEach((b) => b.onclick = () => openEmpForm(emps.find((e) => String(e.id) === b.dataset.edit)));
+    $$('[data-deact]', app).forEach((b) => b.onclick = () => {
+      confirmDialog('Deactivate employee', 'Deactivate ' + b.dataset.nm + '? They will no longer be able to log in or clock in. History is kept.', 'Deactivate', async () => {
+        try { await api('/api/admin/employees/' + b.dataset.deact, 'DELETE'); toast('Employee deactivated', 'ok'); load(); }
+        catch (e) { handleApiError(e); }
+      });
+    });
+  };
+
+  const openEmpForm = async (emp) => {
+    let nextNum = '';
+    try { const n = await api('/api/admin/employees/next-number'); nextNum = n.employee_number; } catch (e) { /* ignore */ }
+    const bd = openModal('<h2>' + (emp ? 'Edit employee' : 'Add employee') + '</h2>' +
+      '<label class="fld">Name <input id="ef-name" maxlength="60" value="' + esc(emp ? emp.name : '') + '"></label>' +
+      '<label class="fld">Role <select id="ef-role">' +
+      ['server', 'kitchen', 'manager'].map((r) => '<option value="' + r + '"' + (emp && emp.role === r ? ' selected' : '') + '>' + roleName(r) + '</option>').join('') +
+      '</select></label>' +
+      '<label class="fld">Employee # <input id="ef-num" inputmode="numeric" value="' + (emp ? emp.employee_number : nextNum) + '"></label>' +
+      '<label class="fld">PIN (4 digits)' + (emp ? ' <span class="muted small">— blank keeps current</span>' : '') + ' <input id="ef-pin" inputmode="numeric" maxlength="4" placeholder="' + (emp ? '••••' : 'e.g. 1234') + '"></label>' +
+      '<label class="fld">Wage ($/hr) <input id="ef-wage" type="number" min="0" step="0.01" inputmode="decimal" value="' + ((emp ? emp.wage_rate_cents : 0) / 100).toFixed(2) + '"></label>' +
+      (emp ? '<label class="fld"><input type="checkbox" id="ef-active" style="width:auto;display:inline-block;margin-right:8px"' + (emp.active ? ' checked' : '') + '> Active (login + clock-in allowed)</label>' : '') +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="go">' + (emp ? 'Save' : 'Add employee') + '</button></div>');
+    $('[data-x="c"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = async () => {
+      const body = {
+        name: $('#ef-name', bd).value.trim(),
+        role: $('#ef-role', bd).value,
+        employee_number: Number($('#ef-num', bd).value),
+        wage_rate_cents: Math.round(parseFloat($('#ef-wage', bd).value || '0') * 100),
+      };
+      const pin = $('#ef-pin', bd).value.trim();
+      if (pin) body.pin = pin; else if (!emp) { toast('PIN is required', 'err'); return; }
+      if (emp) body.active = $('#ef-active', bd).checked;
+      try {
+        await api('/api/admin/employees' + (emp ? '/' + emp.id : ''), emp ? 'PUT' : 'POST', body);
+        closeModal(); toast(emp ? 'Employee saved' : 'Employee added', 'ok'); load();
+      } catch (e) { handleApiError(e); }
+    };
+  };
+
+  $('#emp-add', app).onclick = () => openEmpForm(null);
+  await load();
+}
+
+/* ============================================================
+   VIEW: FLOOR PLAN EDITOR (manager)
+   Drag-and-drop floor layout. Mouse + touch (pointer events),
+   20px snap-to-grid, 56px+ touch targets, undo, explicit save.
+   Zone tints are quiet neutrals — never a status hue (DESIGN.md).
+   ============================================================ */
+const FP_SNAP = 20;
+const FP_TINTS = ['fpz0', 'fpz1', 'fpz2', 'fpz3', 'fpz4', 'fpz5'];
+
+async function renderFloorPlan(app) {
+  if (!mgrGuard(app)) return;
+  const fp = { zones: [], activeZone: null, sel: null, undo: [], saved: '', nextNeg: -1 };
+
+  app.innerHTML =
+    '<div class="view-head"><h1>Floor plan</h1><span class="spacer"></span>' +
+    '<button class="btn btn-ghost" id="fp-undo" disabled>↩ Undo</button> ' +
+    '<button class="btn btn-primary" id="fp-save" disabled>Save<span class="fp-dot hidden" id="fp-dot"></span></button></div>' +
+    mgrNav('floorplan') +
+    '<div class="fp-toolbar">' +
+    '<span class="muted small">Template:</span> ' +
+    '<button class="btn btn-ghost btn-sm" data-tpl="current">Current layout</button>' +
+    '<button class="btn btn-ghost btn-sm" data-tpl="empty">Empty</button>' +
+    '<button class="btn btn-ghost btn-sm" data-tpl="cafe">Small café</button>' +
+    '<span class="spacer"></span>' +
+    '<button class="btn btn-ghost btn-sm" id="fp-add-zone">+ Zone</button> ' +
+    '<button class="btn btn-primary btn-sm" id="fp-add-table">+ Table</button></div>' +
+    '<div id="fp-warn"></div>' +
+    '<div class="tabs" id="fp-tabs"></div>' +
+    '<div class="fp-body"><div class="fp-canvas-wrap"><div class="fp-canvas" id="fp-canvas"></div></div>' +
+    '<div class="fp-inspector" id="fp-inspector"></div></div>' +
+    '<div class="card fp-zones"><h3>Zones</h3><div id="fp-zone-list"></div></div>' +
+    '<p class="muted small">Drag tables to arrange them — they snap to the grid. Changes stay on this screen until you press <b>Save</b>.</p>';
+
+  const canvas = $('#fp-canvas'), inspector = $('#fp-inspector');
+  const snap = (v) => Math.round(v / FP_SNAP) * FP_SNAP;
+  const tblSize = (seats) => Math.max(56, Math.min(112, 64 + (seats || 4) * 4));
+  const findTable = (id) => { for (const z of fp.zones) { const t = z.tables.find((t) => String(t.id) === String(id)); if (t) return { t, z }; } return null; };
+  const snapState = () => JSON.stringify(fp.zones.map((z) => ({ id: z.id, name: z.name, tables: z.tables.map((t) => ({ id: t.id, label: t.label, seats: t.seats, x: t.x, y: t.y, shape: t.shape })) })));
+  const isDirty = () => snapState() !== fp.saved;
+  const tintOf = (zoneId) => FP_TINTS[fp.zones.findIndex((z) => String(z.id) === String(zoneId)) % FP_TINTS.length] || 'fpz0';
+
+  function refreshChrome() {
+    const dirty = isDirty();
+    window.__fpDirty = dirty;
+    $('#fp-save').disabled = !dirty;
+    $('#fp-dot').classList.toggle('hidden', !dirty);
+    $('#fp-undo').disabled = !fp.undo.length;
+  }
+  function pushUndo() { fp.undo.push(snapState()); if (fp.undo.length > 50) fp.undo.shift(); }
+  function mutate(fn) { pushUndo(); fn(); fp.sel = null; draw(); refreshChrome(); }
+  function doUndo() {
+    if (!fp.undo.length) return;
+    fp.zones = JSON.parse(fp.undo.pop());
+    if (fp.sel && !findTable(fp.sel)) fp.sel = null;
+    if (!fp.zones.some((z) => String(z.id) === String(fp.activeZone))) fp.activeZone = fp.zones.length ? fp.zones[0].id : null;
+    draw(); refreshChrome(); toast('Undone', 'ok');
+  }
+
+  /* ---- load + auto-layout (client-side grid for tables without x/y) ---- */
+  async function load() {
+    let zones;
+    try { zones = await api('/api/admin/zones'); }
+    catch (e) { if (handleApiError(e) === 'bounced') return false; app.innerHTML = '<div class="empty">Could not load floor plan.</div>'; return false; }
+    fp.zones = zones.map((z) => ({ id: z.id, name: z.name, tables: z.tables.map((t) => ({ ...t })) }));
+    let laidOut = 0;
+    for (const z of fp.zones) {
+      let i = 0;
+      for (const t of z.tables) {
+        if (t.x == null || t.y == null) { t.x = 40 + (i % 4) * 180; t.y = 40 + Math.floor(i / 4) * 150; laidOut++; }
+        i++;
+      }
+    }
+    fp.activeZone = fp.zones.length ? fp.zones[0].id : null;
+    fp.undo = []; fp.sel = null;
+    fp.saved = snapState();
+    // First save persists the auto-layout so the grid isn't lost.
+    if (laidOut) { fp.saved = JSON.stringify([]); }
+    window.__fpGuard = { hash: location.hash };
+    refreshChrome();
+    return true;
+  }
+
+  /* ---- drawing ---- */
+  function draw() { drawWarn(); drawTabs(); drawCanvas(); drawInspector(); drawZoneList(); }
+  function drawWarn() {
+    const seen = new Map(), dupes = new Set();
+    for (const z of fp.zones) for (const t of z.tables) {
+      const k = t.label.toLowerCase();
+      if (seen.has(k)) dupes.add(t.label);
+      seen.set(k, (seen.get(k) || 0) + 1);
+    }
+    $('#fp-warn').innerHTML = dupes.size
+      ? '<div class="fp-warn">⚠ Duplicate table label' + (dupes.size > 1 ? 's' : '') + ': ' +
+        [...dupes].map((d) => '<b>' + esc(d) + '</b>').join(', ') +
+        ' — rename one of each so every table saves cleanly.</div>'
+      : '';
+  }
+  function drawTabs() {
+    const tabs = $('#fp-tabs');
+    tabs.innerHTML = fp.zones.map((z) =>
+      '<button class="tab' + (String(z.id) === String(fp.activeZone) ? ' active' : '') + '" data-z="' + esc(String(z.id)) + '">' +
+      esc(z.name) + '<span class="count">' + z.tables.length + '</span></button>').join('') ||
+      '<span class="muted small">No zones yet — add one to get started.</span>';
+    $$('.tab', tabs).forEach((b) => { b.onclick = () => { fp.activeZone = fp.zones.find((z) => String(z.id) === b.dataset.z).id; fp.sel = null; draw(); }; });
+  }
+  function drawCanvas() {
+    const z = fp.zones.find((x) => String(x.id) === String(fp.activeZone));
+    canvas.innerHTML = '';
+    if (!z) { canvas.innerHTML = '<div class="fp-hint muted">Select a zone, then add tables.</div>'; return; }
+    let maxX = 0, maxY = 0;
+    for (const t of z.tables) { maxX = Math.max(maxX, t.x + tblSize(t.seats)); maxY = Math.max(maxY, t.y + tblSize(t.seats)); }
+    canvas.style.width = Math.max(1100, maxX + 160) + 'px';
+    canvas.style.height = Math.max(600, maxY + 160) + 'px';
+    for (const t of z.tables) {
+      const s = tblSize(t.seats);
+      const d = document.createElement('div');
+      d.className = 'fp-table ' + tintOf(z.id) + (t.shape === 'round' ? ' round' : '') + (String(t.id) === String(fp.sel) ? ' sel' : '');
+      d.style.left = t.x + 'px'; d.style.top = t.y + 'px';
+      d.style.width = s + 'px'; d.style.height = s + 'px';
+      d.dataset.tid = t.id;
+      d.setAttribute('role', 'button');
+      d.setAttribute('aria-label', 'Table ' + t.label + ', ' + t.seats + ' seats. Drag to move, tap to edit.');
+      d.innerHTML = '<span class="fp-label">' + esc(t.label) + '</span><span class="fp-sub">' + t.seats + ' seats</span>';
+      canvas.appendChild(d);
+      bindDrag(d, t);
+    }
+  }
+  function bindDrag(el, t) {
+    let sx = 0, sy = 0, ox = 0, oy = 0, dragging = false, down = false;
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      try { el.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events or no active pointer */ }
+      const r = canvas.getBoundingClientRect();
+      sx = e.clientX - r.left; sy = e.clientY - r.top; ox = t.x; oy = t.y;
+      dragging = false; down = true;
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!down) return;
+      const r = canvas.getBoundingClientRect();
+      const cx = e.clientX - r.left, cy = e.clientY - r.top;
+      if (!dragging && Math.hypot(cx - sx, cy - sy) < 6) return;
+      if (!dragging) { dragging = true; pushUndo(); el.classList.add('dragging'); }
+      const s = tblSize(t.seats);
+      t.x = Math.max(0, snap(ox + (cx - sx) - s / 2));
+      t.y = Math.max(0, snap(oy + (cy - sy) - s / 2));
+      el.style.left = t.x + 'px'; el.style.top = t.y + 'px';
+    });
+    const end = () => {
+      if (!down) return;
+      down = false;
+      if (dragging) { el.classList.remove('dragging'); fp.sel = t.id; draw(); refreshChrome(); }
+      else { fp.sel = t.id; draw(); }
+      dragging = false;
+    };
+    el.addEventListener('pointerup', end);
+    el.addEventListener('pointercancel', end);
+  }
+
+  /* ---- inspector ---- */
+  function drawInspector() {
+    const found = fp.sel ? findTable(fp.sel) : null;
+    if (!found) {
+      const z = fp.zones.find((x) => String(x.id) === String(fp.activeZone));
+      inspector.innerHTML = '<h3>Nothing selected</h3><p class="muted small">' +
+        (z ? 'Tap a table to edit it, or drag it to move it.' : 'Add a zone first, then add tables.') + '</p>';
+      return;
+    }
+    const { t } = found;
+    inspector.innerHTML = '<h3>Table ' + esc(t.label) + '</h3>' +
+      '<div class="field"><label for="fp-label">Label</label><input id="fp-label" type="text" value="' + esc(t.label) + '" maxlength="12"></div>' +
+      '<div class="field"><label>Seats</label><div class="stepper">' +
+      '<button data-s="dec" aria-label="Fewer seats">−</button><span class="val" id="fp-seats">' + t.seats + '</span><button data-s="inc" aria-label="More seats">+</button></div></div>' +
+      '<div class="field"><label>Shape</label><div class="fp-shape-row">' +
+      '<button class="btn btn-ghost btn-sm' + (t.shape === 'square' ? ' active-shape' : '') + '" data-shape="square">▢ Square</button>' +
+      '<button class="btn btn-ghost btn-sm' + (t.shape === 'round' ? ' active-shape' : '') + '" data-shape="round">◯ Round</button></div></div>' +
+      '<div class="field"><label for="fp-zone">Zone</label><select id="fp-zone">' +
+      fp.zones.map((z) => '<option value="' + esc(String(z.id)) + '"' + (String(z.id) === String(t.zone_id) ? ' selected' : '') + '>' + esc(z.name) + '</option>').join('') +
+      '</select></div>' +
+      '<button class="btn btn-danger btn-block" id="fp-del">Delete table</button>';
+    $('#fp-label').addEventListener('change', (e) => {
+      const v = e.target.value.trim();
+      if (!v) { e.target.value = t.label; toast('Label cannot be empty', 'err'); return; }
+      const clash = fp.zones.some((z) => z.tables.some((o) => o !== t && o.label.toLowerCase() === v.toLowerCase()));
+      if (clash) { e.target.value = t.label; toast('A table with that label already exists', 'err'); return; }
+      pushUndo(); t.label = v; draw(); refreshChrome();
+    });
+    $('[data-s="dec"]', inspector).onclick = () => { if (t.seats > 1) { pushUndo(); t.seats--; draw(); refreshChrome(); } };
+    $('[data-s="inc"]', inspector).onclick = () => { if (t.seats < 20) { pushUndo(); t.seats++; draw(); refreshChrome(); } };
+    $$('[data-shape]', inspector).forEach((b) => { b.onclick = () => { pushUndo(); t.shape = b.dataset.shape; draw(); refreshChrome(); }; });
+    $('#fp-zone').addEventListener('change', (e) => {
+      const nz = fp.zones.find((z) => String(z.id) === e.target.value);
+      if (!nz) return;
+      pushUndo();
+      const old = fp.zones.find((z) => String(z.id) === String(t.zone_id));
+      if (old) old.tables = old.tables.filter((o) => o !== t);
+      t.zone_id = nz.id; nz.tables.push(t);
+      fp.activeZone = nz.id; draw(); refreshChrome();
+    });
+    $('#fp-del').onclick = () => confirmDialog('Delete table ' + t.label + '?', 'This cannot be undone after saving.', 'Delete', () => {
+      pushUndo();
+      const zz = fp.zones.find((z) => String(z.id) === String(t.zone_id));
+      if (zz) zz.tables = zz.tables.filter((o) => o !== t);
+      fp.sel = null; draw(); refreshChrome();
+    });
+  }
+
+  /* ---- zone management ---- */
+  function drawZoneList() {
+    const list = $('#fp-zone-list');
+    list.innerHTML = fp.zones.map((z) =>
+      '<div class="fp-zone-row"><span class="fp-zone-dot ' + tintOf(z.id) + '"></span>' +
+      '<input type="text" value="' + esc(z.name) + '" data-zid="' + esc(String(z.id)) + '" maxlength="30" aria-label="Zone name">' +
+      '<span class="muted small">' + z.tables.length + ' tables</span>' +
+      '<button class="btn btn-ghost btn-sm" data-zdel="' + esc(String(z.id)) + '"' + (z.tables.length ? ' disabled title="Move or delete its tables first"' : '') + '>Delete</button></div>').join('') ||
+      '<p class="muted small">No zones yet.</p>';
+    $$('input[data-zid]', list).forEach((inp) => {
+      inp.addEventListener('change', () => {
+        const z = fp.zones.find((x) => String(x.id) === inp.dataset.zid);
+        const v = inp.value.trim();
+        if (!v) { inp.value = z.name; toast('Zone name cannot be empty', 'err'); return; }
+        if (fp.zones.some((o) => o !== z && o.name.toLowerCase() === v.toLowerCase())) { inp.value = z.name; toast('A zone with that name already exists', 'err'); return; }
+        pushUndo(); z.name = v; draw(); refreshChrome();
+      });
+    });
+    $$('[data-zdel]', list).forEach((b) => {
+      b.onclick = () => confirmDialog('Delete zone?', 'The zone will be removed. Tables must be moved or deleted first.', 'Delete', () => {
+        pushUndo();
+        fp.zones = fp.zones.filter((z) => String(z.id) !== b.dataset.zdel);
+        if (String(fp.activeZone) === b.dataset.zdel) fp.activeZone = fp.zones.length ? fp.zones[0].id : null;
+        draw(); refreshChrome();
+      });
+    });
+  }
+
+  /* ---- add table / add zone ---- */
+  function suggestLabel() {
+    const used = new Set();
+    for (const z of fp.zones) for (const t of z.tables) used.add(t.label);
+    let n = 1;
+    while (used.has(String(n))) n++;
+    return String(n);
+  }
+  $('#fp-add-table').onclick = () => {
+    if (!fp.zones.length) { toast('Add a zone first', 'err'); return; }
+    let shape = 'square', seats = 4;
+    const bd = openModal(
+      '<h2>Add table</h2>' +
+      '<div class="field"><label for="nt-label">Label</label><input id="nt-label" type="text" value="' + esc(suggestLabel()) + '" maxlength="12"></div>' +
+      '<div class="field"><label>Seats</label><div class="stepper"><button data-s="dec">−</button><span class="val" id="nt-seats">4</span><button data-s="inc">+</button></div></div>' +
+      '<div class="field"><label>Shape</label><div class="fp-shape-row">' +
+      '<button class="btn btn-ghost btn-sm active-shape" data-shape="square">▢ Square</button>' +
+      '<button class="btn btn-ghost btn-sm" data-shape="round">◯ Round</button></div></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="go">Add table</button></div>');
+    $$('[data-shape]', bd).forEach((b) => { b.onclick = () => { shape = b.dataset.shape; $$('[data-shape]', bd).forEach((x) => x.classList.toggle('active-shape', x === b)); }; });
+    $('[data-s="dec"]', bd).onclick = () => { seats = Math.max(1, seats - 1); $('#nt-seats', bd).textContent = seats; };
+    $('[data-s="inc"]', bd).onclick = () => { seats = Math.min(20, seats + 1); $('#nt-seats', bd).textContent = seats; };
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = () => {
+      const label = $('#nt-label', bd).value.trim();
+      if (!label) { toast('Label is required', 'err'); return; }
+      if (fp.zones.some((z) => z.tables.some((t) => t.label.toLowerCase() === label.toLowerCase()))) { toast('A table with that label already exists', 'err'); return; }
+      closeModal();
+      const z = fp.zones.find((x) => String(x.id) === String(fp.activeZone)) || fp.zones[0];
+      const id = 'n' + (fp.nextNeg--);
+      const n = z.tables.length;
+      pushUndo();
+      z.tables.push({ id, zone_id: z.id, label, seats, shape, x: 40 + (n % 4) * 180, y: 40 + Math.floor(n / 4) * 150 });
+      fp.sel = id; draw(); refreshChrome();
+    };
+  };
+  $('#fp-add-zone').onclick = () => {
+    const bd = openModal('<h2>Add zone</h2><div class="field"><label for="nz-name">Zone name</label>' +
+      '<input id="nz-name" type="text" placeholder="e.g. Rooftop" maxlength="30"></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="go">Add zone</button></div>');
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = () => {
+      const name = $('#nz-name', bd).value.trim();
+      if (!name) { toast('Zone name is required', 'err'); return; }
+      if (fp.zones.some((z) => z.name.toLowerCase() === name.toLowerCase())) { toast('A zone with that name already exists', 'err'); return; }
+      closeModal();
+      pushUndo();
+      const z = { id: 'zn' + (fp.nextNeg--), name, tables: [] };
+      fp.zones.push(z); fp.activeZone = z.id; draw(); refreshChrome();
+    };
+  };
+
+  /* ---- templates ---- */
+  $$('[data-tpl]').forEach((b) => {
+    b.onclick = () => {
+      const tpl = b.dataset.tpl;
+      const apply = () => {
+        pushUndo();
+        if (tpl === 'current') { load().then((ok) => { if (ok) { draw(); refreshChrome(); } }); return; }
+        if (tpl === 'empty') { for (const z of fp.zones) z.tables = []; }
+        if (tpl === 'cafe') {
+          fp.zones = [{ id: 'zn' + (fp.nextNeg--), name: 'Main', tables: [] }];
+          const z = fp.zones[0];
+          const defs = [['1', 2, 'round'], ['2', 2, 'round'], ['3', 2, 'round'], ['4', 2, 'round'], ['5', 4, 'square'], ['6', 4, 'square'], ['7', 6, 'square'], ['8', 4, 'round']];
+          defs.forEach(([label, seats, shape], i) => {
+            z.tables.push({ id: 'n' + (fp.nextNeg--), zone_id: z.id, label, seats, shape, x: 40 + (i % 4) * 180, y: 40 + Math.floor(i / 4) * 150 });
+          });
+          fp.activeZone = z.id;
+        }
+        fp.sel = null; draw(); refreshChrome();
+      };
+      if (tpl === 'empty' || tpl === 'cafe') confirmDialog('Replace layout?', 'This replaces the current tables on screen. Save to keep it, or leave without saving to discard.', 'Replace', apply);
+      else apply();
+    };
+  });
+
+  /* ---- undo / save ---- */
+  $('#fp-undo').onclick = doUndo;
+  document.addEventListener('keydown', keyHandler);
+  function keyHandler(e) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      e.preventDefault(); doUndo();
+    }
+  }
+  window.addEventListener('beforeunload', beforeUnload);
+  function beforeUnload(e) { if (window.__fpDirty) { e.preventDefault(); e.returnValue = ''; } }
+
+  $('#fp-save').onclick = async () => {
+    const btn = $('#fp-save');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      await saveAll();
+      const ok = await load();
+      if (ok) { draw(); refreshChrome(); toast('Floor plan saved', 'ok'); }
+    } catch (e) {
+      toast('Save failed: ' + (e.message || e), 'err');
+      refreshChrome();
+    }
+    btn.innerHTML = 'Save<span class="fp-dot hidden" id="fp-dot"></span>';
+    refreshChrome();
+  };
+
+  async function saveAll() {
+    const saved = JSON.parse(fp.saved || '[]');
+    const savedZones = new Map(saved.map((z) => [String(z.id), z]));
+    const savedTables = new Map();
+    for (const z of saved) for (const t of z.tables) savedTables.set(String(t.id), { ...t, _zone: String(z.id) });
+    const failures = [];
+    const attempt = async (what, fn) => {
+      try { await fn(); } catch (e) { failures.push(what + ': ' + (e.message || e)); }
+    };
+
+    // 1. create new zones first (tables need real zone ids)
+    for (const z of fp.zones) {
+      if (String(z.id).startsWith('zn')) {
+        await attempt('Add zone "' + z.name + '"', async () => {
+          const r = await api('/api/admin/zones', 'POST', { name: z.name });
+          z.id = r.id;
+          for (const t of z.tables) t.zone_id = r.id;
+        });
+      } else if (savedZones.has(String(z.id)) && savedZones.get(String(z.id)).name !== z.name) {
+        await attempt('Rename zone "' + z.name + '"', () => api('/api/admin/zones/' + z.id, 'PUT', { name: z.name }));
+      }
+    }
+    // 2. delete removed tables, then create/update the rest
+    const curTables = new Map();
+    for (const z of fp.zones) for (const t of z.tables) curTables.set(String(t.id), t);
+    for (const [id, st] of savedTables) {
+      if (!curTables.has(id) && !String(id).startsWith('n')) {
+        await attempt('Delete table "' + (st.label || id) + '"', () => api('/api/admin/tables/' + id, 'DELETE'));
+      }
+    }
+    for (const z of fp.zones) {
+      for (const t of z.tables) {
+        const body = { zone_id: z.id, label: t.label, seats: t.seats, x: Math.round(t.x), y: Math.round(t.y), shape: t.shape };
+        if (String(t.id).startsWith('n')) {
+          await attempt('Add table "' + t.label + '"', async () => {
+            const r = await api('/api/admin/tables', 'POST', body);
+            t.id = r.id;
+          });
+        } else {
+          const st = savedTables.get(String(t.id));
+          if (!st || st.label !== t.label || st.seats !== t.seats || st.x !== Math.round(t.x) || st.y !== Math.round(t.y) || st.shape !== t.shape || st._zone !== String(z.id)) {
+            await attempt('Save table "' + t.label + '"', () => api('/api/admin/tables/' + t.id, 'PUT', body));
+          }
+        }
+      }
+    }
+    // 3. delete removed zones (now empty)
+    for (const [id] of savedZones) {
+      if (!fp.zones.some((z) => String(z.id) === String(id)) && !String(id).startsWith('zn')) {
+        const sz = savedZones.get(String(id));
+        await attempt('Delete zone "' + (sz.name || id) + '"', () => api('/api/admin/zones/' + id, 'DELETE'));
+      }
+    }
+    if (failures.length) throw new Error(failures.length + ' change(s) could not be saved — ' + failures.slice(0, 3).join('; ') + (failures.length > 3 ? '…' : ''));
+  }
+
+  /* ---- lifecycle ---- */
+  app._cleanup = () => {
+    document.removeEventListener('keydown', keyHandler);
+    window.removeEventListener('beforeunload', beforeUnload);
+    window.__fpGuard = null; window.__fpDirty = false;
+  };
+  if (await load()) { draw(); refreshChrome(); }
+}
+
 /* Honest reconciliation: card volume − refunds − each named Stripe fee
    = expected payout. Tips shown separately ("tips are not taxed").
    Sales date and payout date are distinct columns. */
@@ -1389,6 +2300,7 @@ async function renderFinance(app) {
     try {
       const r = await api('/api/finance/payouts?date=' + encodeURIComponent(d));
       body.innerHTML = financeHtml(r, d);
+      wireReportExports(d);
     } catch (e) { if (handleApiError(e) !== 'bounced') body.innerHTML = '<div class="empty">Could not load payouts.</div>'; }
   };
   $('#fin-date').addEventListener('change', load);
@@ -1412,7 +2324,13 @@ function financeHtml(r, date) {
         (c.last4 ? ' ••••' + esc(String(c.last4)) : '') + ' · ' + fmt(c.amount_cents || 0) +
         (c.status && c.status !== 'completed' ? ' · ' + esc(String(c.status)) : '') + '</span></td>' +
         '<td class="num neg">−' + fmt(c.fee_cents || 0) + '</td></tr>').join('')
-    : '<tr><td>− Stripe fees <span class="lbl-note">no fee breakdown returned by API</span></td><td class="num neg">−' + fmt(feeTotal) + '</td></tr>';
+    : '<tr><td>− Stripe fees' + (feeTotal > 0 ? ' <span class="lbl-note">aggregate only — no per-payment detail</span>' : ' <span class="lbl-note">none</span>') +
+      '</td><td class="num neg">−' + fmt(feeTotal) + '</td></tr>';
+  const laborCents = p.labor_cents ?? 0;
+  const laborDetail = p.labor ? ' <span class="lbl-note">reg ' + fmt(p.labor.reg_cents || 0) +
+    (p.labor.ot_cents ? ' · OT ' + fmt(p.labor.ot_cents) : '') +
+    (p.labor.premium_cents ? ' · break premiums ' + fmt(p.labor.premium_cents) : '') +
+    (p.labor.weekly_ot_cents ? ' · weekly OT ' + fmt(p.labor.weekly_ot_cents) : '') + '</span>' : '';
   return '<div class="date-cols"><div class="date-col"><div class="k">Sales date</div><div class="v">' + esc(String(salesDate)) + '</div></div>' +
     '<div class="date-col"><div class="k">Payout date</div><div class="v">' + esc(String(payoutDate)) + '</div></div></div>' +
     '<div class="card"><h2>Reconciliation</h2><table class="fin-table">' +
@@ -1421,9 +2339,110 @@ function financeHtml(r, date) {
     feeRows +
     '<tr class="result"><td>= Expected payout</td><td class="num">' + fmt(expected) + '</td></tr>' +
     '</table>' +
-    '<table class="fin-table" style="margin-top:14px"><tr><td>Tips (collected separately)</td><td class="num pos">' + fmt(tips) + '</td></tr></table>' +
+    '<table class="fin-table" style="margin-top:14px"><tr><td>Tips (collected separately)</td><td class="num pos">' + fmt(tips) + '</td></tr>' +
+    '<tr><td>Labor cost (time clock)' + laborDetail + '</td><td class="num">' + fmt(laborCents) + '</td></tr></table>' +
     '<p class="tips-note">Tips are paid out to staff and are not taxed — they never reduce the payout above.</p></div>' +
-    '<p class="muted small">Every fee is itemized by name. There is no “Other” bucket — if a fee exists, it is listed.</p>';
+    '<p class="muted small">Every fee is itemized by name. There is no “Other” bucket — if a fee exists, it is listed.</p>' +
+    reportsExportHtml();
+}
+
+const REP_KINDS = [['sales', 'Sales summary'], ['payouts', 'Payout reconciliation'], ['tax', 'Sales tax'], ['labor', 'Labor'], ['tips', 'Tips']];
+const REP_FMTS = [['xlsx', 'Excel (.xlsx)'], ['csv', 'CSV'], ['pdf', 'PDF'], ['docx', 'Word (.docx)']];
+
+function reportsExportHtml() {
+  return '<div class="card" id="rep-exports"><h2>Accounting exports</h2>' +
+    '<p class="muted small">Genuine .xlsx, .csv, .pdf, and .docx files — every report honors the selected range.</p>' +
+    '<div class="form-grid">' +
+    '<label>Report<select id="rep-kind">' + REP_KINDS.map((k) => '<option value="' + k[0] + '">' + k[1] + '</option>').join('') + '</select></label>' +
+    '<label>Range<select id="rep-period"><option value="day">Day</option><option value="week">Week</option>' +
+    '<option value="month" selected>Month</option><option value="year">Year</option><option value="custom">Custom…</option></select></label>' +
+    '<label id="rep-anchor-wrap">Date<input type="date" id="rep-date"></label>' +
+    '<label id="rep-from-wrap" hidden>From<input type="date" id="rep-from"></label>' +
+    '<label id="rep-to-wrap" hidden>To<input type="date" id="rep-to"></label>' +
+    '</div>' +
+    '<div class="btn-row" style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0">' +
+    REP_FMTS.map((f) => '<button class="btn" data-rep-fmt="' + f[0] + '">⤓ ' + f[1] + '</button>').join('') +
+    '</div>' +
+    '<div class="form-grid"><label>Accountant email<input type="email" id="rep-email" inputmode="email" placeholder="accountant@example.com" autocomplete="email"></label></div>' +
+    '<div style="margin:12px 0"><button class="btn btn-primary" id="rep-share">✉ Email report</button></div>' +
+    '<p class="muted small">Email sharing downloads the report file and opens a prefilled compose in your mail app — attach the downloaded file before sending. Automated server-side email sending is not set up yet (it needs the restaurant’s email-provider credentials).</p>' +
+    '<p class="muted small" id="rep-status" role="status"></p></div>';
+}
+
+function repStatus(msg, bad) {
+  const el = $('#rep-status');
+  if (el) { el.textContent = msg || ''; el.style.color = bad ? 'var(--red)' : ''; }
+}
+
+function repQuery() {
+  const kind = $('#rep-kind').value;
+  const period = $('#rep-period').value;
+  let q = 'period=' + encodeURIComponent(period);
+  if (period === 'custom') {
+    const f = $('#rep-from').value, t = $('#rep-to').value;
+    if (!f || !t) { repStatus('Pick a From and To date for a custom range.', true); return null; }
+    q += '&from=' + encodeURIComponent(f) + '&to=' + encodeURIComponent(t);
+  } else {
+    const d = $('#rep-date').value;
+    if (d) q += '&date=' + encodeURIComponent(d);
+  }
+  return { kind, q, period };
+}
+
+async function downloadReportBlob(fmt) {
+  const rq = repQuery();
+  if (!rq) return null;
+  repStatus('Preparing ' + fmt.toUpperCase() + '…');
+  const path = '/api/finance/reports/' + rq.kind + '?format=' + fmt + '&' + rq.q;
+  const tok = sessionStorage.getItem('expoline.token');
+  let res;
+  try {
+    res = await fetch(API + path, { headers: tok ? { Authorization: 'Bearer ' + tok } : {} });
+  } catch (e) { repStatus('Export failed: network unreachable.', true); return null; }
+  if (!res.ok) {
+    let msg = 'Export failed (' + res.status + ')';
+    try { const j = await res.json(); msg = j.error || msg; } catch (e) { /* ignore */ }
+    repStatus(msg, true);
+    return null;
+  }
+  const blob = await res.blob();
+  const m = /filename="([^"]+)"/.exec(res.headers.get('content-disposition') || '');
+  const name = m ? m[1] : 'expoline-' + rq.kind + '.' + fmt;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 8000);
+  repStatus('Downloaded ' + name);
+  return { name, kind: rq.kind, period: rq.period, fmt };
+}
+
+function wireReportExports(anchorDate) {
+  const per = $('#rep-period');
+  if (!per) return;
+  $('#rep-date').value = anchorDate || '';
+  const sync = () => {
+    const custom = per.value === 'custom';
+    $('#rep-from-wrap').hidden = !custom;
+    $('#rep-to-wrap').hidden = !custom;
+    $('#rep-anchor-wrap').hidden = custom;
+  };
+  per.addEventListener('change', sync); sync();
+  document.querySelectorAll('[data-rep-fmt]').forEach((b) => {
+    b.addEventListener('click', () => { downloadReportBlob(b.getAttribute('data-rep-fmt')); });
+  });
+  $('#rep-share').addEventListener('click', async () => {
+    const dl = await downloadReportBlob('xlsx');
+    if (!dl) return;
+    const kindName = (REP_KINDS.find((k) => k[0] === dl.kind) || [null, dl.kind])[1];
+    const range = dl.period === 'custom' ? 'the selected custom range' : 'the selected ' + dl.period;
+    const email = ($('#rep-email').value || '').trim();
+    const subject = encodeURIComponent('Expoline ' + kindName + ' — ' + range);
+    const bodyText = encodeURIComponent('Hi,\n\nAttached is the Expoline ' + kindName + ' for ' + range + '.\n\n' +
+      'Note: the file "' + dl.name + '" just downloaded to this device — please attach it to this email before sending.\n\n— sent from Expoline');
+    window.location.href = 'mailto:' + encodeURIComponent(email) + '?subject=' + subject + '&body=' + bodyText;
+    repStatus('Downloaded ' + dl.name + ' — opening your mail app. Attach the file before sending.');
+  });
 }
 
 async function renderShift(app) {
@@ -1474,18 +2493,222 @@ function shiftHtml(r, date) {
     '</table></div></div>';
 }
 
+/* ============================================================
+   VIEW: MENU EDITOR (manager only) — phase 2.
+   Categories + items CRUD, one-tap 86 toggle, audit log.
+   Every mutation broadcasts menu_updated so all devices refresh instantly.
+   ============================================================ */
+const ME_COURSES = ['drink', 'appetizer', 'entree', 'dessert'];
+const ME_TYPES = ['food', 'drink', 'dessert'];
+const ME_DAYPARTS = ['LUNCH', 'DINNER', 'DESSERTS', 'KEIKI', 'BAR', 'HAPPY HOUR', 'BRUNCH', 'ALL DAY'];
+
+function meActionLabel(a) {
+  return { 'item.86': '86’d', 'item.un86': 'Restored', 'item.create': 'Added item', 'item.update': 'Edited item', 'item.delete': 'Deleted item', 'category.create': 'Added category', 'category.update': 'Edited category', 'category.delete': 'Deleted category' }[a] || a;
+}
+
 async function renderMenuViewer(app) {
   if (!mgrGuard(app)) return;
-  app.innerHTML = '<div class="view-head"><h1>Menu</h1><span class="muted small">read-only</span></div>' + mgrNav('menu') + '<div id="menu-body"><p class="muted">Loading…</p></div>';
-  try {
-    const menu = await getMenu();
-    $('#menu-body').innerHTML = menu.map((c) =>
-      '<div class="card menu-cat"><h2>' + esc(c.name) + '</h2>' +
-      c.items.map((i) => '<div class="menu-item-row"><span>' + esc(i.name) +
-        (isDrink(i, c.name) ? ' <span class="drink-tag">BAR</span>' : '') +
-        ((i.modifiers || []).length ? ' <span class="muted small">· ' + i.modifiers.length + ' mods</span>' : '') +
-        '</span><span class="pr">' + fmt(i.price_cents) + '</span></div>').join('') + '</div>').join('');
-  } catch (e) { if (handleApiError(e) !== 'bounced') $('#menu-body').innerHTML = '<div class="empty">Could not load menu.</div>'; }
+  const me = { cats: [], activeCat: null, showAudit: false };
+
+  app.innerHTML =
+    '<div class="view-head"><h1>Menu</h1><span class="spacer"></span>' +
+    '<button class="btn btn-ghost btn-sm" id="me-audit-toggle">Recent changes</button> ' +
+    '<button class="btn btn-primary btn-sm" id="me-add-cat">+ Category</button></div>' +
+    mgrNav('menu') +
+    '<div class="tabs" id="me-tabs"></div>' +
+    '<div class="me-toolbar"><span class="spacer"></span><button class="btn btn-primary" id="me-add-item">+ Item</button></div>' +
+    '<div id="me-list"><p class="muted">Loading…</p></div>' +
+    '<div class="card hidden" id="me-audit-card"><h3>Recent changes</h3><div id="me-audit-list"><p class="muted">Loading…</p></div></div>';
+
+  const cat = () => me.cats.find((c) => String(c.id) === String(me.activeCat));
+  async function refresh() { if (await load()) { drawTabs(); drawList(); } }
+  async function load() {
+    try { me.cats = await api('/api/admin/menu'); }
+    catch (e) { if (handleApiError(e) === 'bounced') return false; $('#me-list').innerHTML = '<div class="empty">Could not load menu.</div>'; return false; }
+    if (!me.cats.some((c) => String(c.id) === String(me.activeCat))) me.activeCat = me.cats.length ? String(me.cats[0].id) : null;
+    return true;
+  }
+
+  function drawTabs() {
+    $('#me-tabs').innerHTML = me.cats.map((c) => {
+      const n86 = c.items.filter((i) => !i.active).length;
+      return '<button class="tab' + (String(c.id) === String(me.activeCat) ? ' active' : '') + '" data-c="' + esc(String(c.id)) + '">' +
+        esc(c.name) + ' <span class="muted small">' + c.items.length + '</span>' +
+        (n86 ? ' <span class="me-n86">' + n86 + ' 86’d</span>' : '') + '</button>';
+    }).join('') + (me.cats.length ? '<button class="tab me-manage" id="me-cat-manage" title="Rename or delete this category" aria-label="Manage category">⋯</button>' : '');
+    $$('#me-tabs .tab[data-c]').forEach((b) => b.onclick = () => { me.activeCat = b.dataset.c; drawTabs(); drawList(); });
+    const mg = $('#me-cat-manage');
+    if (mg) mg.onclick = catManage;
+  }
+
+  function drawList() {
+    const c = cat();
+    if (!c) { $('#me-list').innerHTML = '<div class="empty">No categories yet — add one to start building the menu.</div>'; return; }
+    $('#me-list').innerHTML = c.items.map((i) => {
+      const dead = !i.active;
+      const bits = [fmt(i.price_cents), i.course, kdsLabel(i.station)];
+      if (i.daypart) bits.push(i.daypart);
+      if ((i.modifiers || []).length) bits.push(i.modifiers.length + ' mods');
+      if (i.price_note) bits.push(i.price_note);
+      return '<div class="me-row' + (dead ? ' is-86' : '') + '">' +
+        '<button class="me-86btn' + (dead ? ' restore' : '') + '" data-86="' + i.id + '" aria-pressed="' + dead + '" aria-label="' + (dead ? 'Put back on menu: ' : '86 (sold out): ') + esc(i.name) + '">' +
+        (dead ? '↩<span>UN-86</span>' : '86') + '</button>' +
+        '<button class="me-main" data-edit="' + i.id + '" aria-label="Edit ' + esc(i.name) + '">' +
+        '<span class="me-name">' + esc(i.name) +
+        (i.item_type === 'drink' ? ' <span class="drink-tag">BAR</span>' : '') +
+        (dead ? ' <span class="me-86badge">86’D</span>' : '') + '</span>' +
+        '<span class="me-meta">' + esc(bits.join(' · ')) + '</span>' +
+        (i.image_url ? '<span class="me-imgtag">🖼 image set</span>' : '') +
+        '</button></div>';
+    }).join('') || '<div class="empty">No items in this category yet — tap + Item.</div>';
+    $$('#me-list [data-86]').forEach((b) => b.onclick = async () => {
+      const id = b.getAttribute('data-86');
+      b.disabled = true;
+      try {
+        const r = await api('/api/admin/menu/86/' + encodeURIComponent(id), 'POST');
+        toast(r.eightysixed ? '86’d: ' + r.name : 'Back on menu: ' + r.name, r.eightysixed ? 'err' : 'ok');
+        await refresh();
+      } catch (e) { handleApiError(e); b.disabled = false; }
+    });
+    $$('#me-list [data-edit]').forEach((b) => b.onclick = () => openItemModal(b.getAttribute('data-edit')));
+  }
+
+  function saveErr(e) {
+    if (e instanceof ApiError && (e.status === 401 || e.status === 403)) handleApiError(e);
+    else toast(e.message || 'Could not save', 'err');
+  }
+
+  /* ---- category modals ---- */
+  function openCatModal(id) {
+    const c = id ? me.cats.find((x) => String(x.id) === String(id)) : null;
+    const bd = openModal('<h2>' + (c ? 'Rename category' : 'New category') + '</h2>' +
+      '<div class="field"><label>Name</label><input id="mc-name" value="' + esc(c ? c.name : '') + '" maxlength="60"></div>' +
+      '<div class="field"><label>Daypart</label><input id="mc-parent" list="me-dayparts" value="' + esc(c ? (c.parent || '') : '') + '" placeholder="e.g. LUNCH, DINNER, HAPPY HOUR"></div>' +
+      '<div class="field"><label>Sort order <span class="muted small">(blank = at the end)</span></label><input id="mc-sort" type="number" inputmode="numeric" value="' + (c ? c.sort : '') + '"></div>' +
+      '<datalist id="me-dayparts">' + ME_DAYPARTS.map((d) => '<option value="' + d + '">').join('') + '</datalist>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button><button class="btn btn-primary" data-x="save">' + (c ? 'Save' : 'Add category') + '</button></div>');
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $('[data-x="save"]', bd).onclick = async () => {
+      const body = { name: $('#mc-name', bd).value };
+      if ($('#mc-parent', bd).value.trim()) body.parent = $('#mc-parent', bd).value;
+      if ($('#mc-sort', bd).value !== '') body.sort = Number($('#mc-sort', bd).value);
+      try {
+        if (c) await api('/api/admin/menu/categories/' + c.id, 'PUT', body);
+        else { const r = await api('/api/admin/menu/categories', 'POST', body); me.activeCat = String(r.id); }
+        closeModal(); toast(c ? 'Category saved' : 'Category added', 'ok'); await refresh();
+      } catch (e) { saveErr(e); }
+    };
+  }
+
+  function catManage() {
+    const c = cat(); if (!c) return;
+    const bd = openModal('<h2>' + esc(c.name) + '</h2>' +
+      '<p class="muted small">' + c.items.length + ' item' + (c.items.length === 1 ? '' : 's') + ' · daypart ' + esc(c.parent || '—') + '</p>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Close</button>' +
+      '<button class="btn btn-ghost" data-x="rename">Rename</button>' +
+      '<button class="btn btn-danger" data-x="del">Delete</button></div>');
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $('[data-x="rename"]', bd).onclick = () => { closeModal(); openCatModal(c.id); };
+    $('[data-x="del"]', bd).onclick = () => {
+      closeModal();
+      confirmDialog('Delete category', 'Delete “' + c.name + '”? A category with items cannot be deleted — move or delete its items first.', 'Delete', async () => {
+        try { await api('/api/admin/menu/categories/' + c.id, 'DELETE'); toast('Category deleted', 'ok'); me.activeCat = null; await refresh(); }
+        catch (e) { handleApiError(e); }
+      });
+    };
+  }
+
+  /* ---- item modal ---- */
+  function openItemModal(id) {
+    const c = cat(); if (!c) return;
+    const it = id ? c.items.find((x) => String(x.id) === String(id)) : null;
+    const mods = (it && it.modifiers ? it.modifiers : []).map((m) => ({ name: m.name, price_delta_cents: m.price_delta_cents }));
+    const bd = openModal('<h2>' + (it ? 'Edit item' : 'New item') + '</h2>' +
+      '<div class="field"><label>Name</label><input id="mi-name" value="' + esc(it ? it.name : '') + '" maxlength="80"></div>' +
+      '<div class="frow"><div class="field"><label>Price ($)</label><input id="mi-price" type="number" min="0" step="0.01" inputmode="decimal" value="' + (it ? (it.price_cents / 100).toFixed(2) : '') + '"></div>' +
+      '<div class="field"><label>Category</label><select id="mi-cat">' + me.cats.map((x) => '<option value="' + x.id + '"' + (String(x.id) === String(it ? it.category_id : me.activeCat) ? ' selected' : '') + '>' + esc(x.name) + '</option>').join('') + '</select></div></div>' +
+      '<div class="frow"><div class="field"><label>Station</label><select id="mi-station">' + KDS_STATIONS.map((s) => '<option value="' + s.slug + '"' + (it && it.station === s.slug ? ' selected' : '') + '>' + esc(s.label) + '</option>').join('') + '</select></div>' +
+      '<div class="field"><label>Course</label><select id="mi-course">' + ME_COURSES.map((x) => '<option' + (it && it.course === x ? ' selected' : '') + '>' + x + '</option>').join('') + '</select></div>' +
+      '<div class="field"><label>Type</label><select id="mi-type">' + ME_TYPES.map((x) => '<option' + (it && it.item_type === x ? ' selected' : '') + '>' + x + '</option>').join('') + '</select></div></div>' +
+      '<div class="field"><label>Daypart <span class="muted small">(blank = follows category)</span></label><input id="mi-daypart" list="me-dayparts" value="' + esc(it && it.daypart ? it.daypart : '') + '" placeholder="e.g. HAPPY HOUR"></div>' +
+      '<div class="field"><label>Description</label><input id="mi-desc" value="' + esc(it && it.description ? it.description : '') + '" maxlength="200"></div>' +
+      '<div class="frow"><div class="field"><label>Price note</label><input id="mi-note" value="' + esc(it && it.price_note ? it.price_note : '') + '" placeholder="e.g. market price" maxlength="40"></div>' +
+      '<div class="field"><label>Image URL</label><input id="mi-img" value="' + esc(it && it.image_url ? it.image_url : '') + '" placeholder="https://…" inputmode="url"></div></div>' +
+      '<h3>Modifiers</h3><div id="mi-mods"></div>' +
+      '<button class="btn btn-ghost btn-sm" id="mi-addmod" type="button">+ Modifier</button>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      (it ? '<button class="btn btn-danger" data-x="del">Delete</button>' : '') +
+      '<button class="btn btn-primary" data-x="save">' + (it ? 'Save' : 'Add item') + '</button></div>');
+    const modsBox = $('#mi-mods', bd);
+    function drawMods() {
+      modsBox.innerHTML = mods.map((m, i) =>
+        '<div class="me-modrow"><input data-mn="' + i + '" value="' + esc(m.name) + '" placeholder="Modifier name" maxlength="60">' +
+        '<input data-mp="' + i + '" type="number" min="0" step="0.01" inputmode="decimal" value="' + (m.price_delta_cents / 100).toFixed(2) + '" aria-label="Modifier price">' +
+        '<button class="btn btn-ghost btn-sm" data-mx="' + i + '" aria-label="Remove modifier">✕</button></div>').join('') ||
+        '<p class="muted small">No modifiers.</p>';
+      $$('#mi-mods [data-mx]', bd).forEach((b) => b.onclick = () => { syncMods(); mods.splice(Number(b.getAttribute('data-mx')), 1); drawMods(); });
+    }
+    function syncMods() {
+      mods.forEach((m, i) => {
+        const n = modsBox.querySelector('[data-mn="' + i + '"]'), p = modsBox.querySelector('[data-mp="' + i + '"]');
+        if (n) m.name = n.value;
+        if (p) m.price_delta_cents = Math.round((parseFloat(p.value) || 0) * 100);
+      });
+    }
+    $('#mi-addmod', bd).onclick = () => { syncMods(); mods.push({ name: '', price_delta_cents: 0 }); drawMods(); };
+    drawMods();
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $('[data-x="save"]', bd).onclick = async () => {
+      syncMods();
+      const body = {
+        name: $('#mi-name', bd).value,
+        price_cents: Math.round((parseFloat($('#mi-price', bd).value) || 0) * 100),
+        category_id: Number($('#mi-cat', bd).value),
+        station: $('#mi-station', bd).value,
+        course: $('#mi-course', bd).value,
+        item_type: $('#mi-type', bd).value,
+        daypart: $('#mi-daypart', bd).value,
+        description: $('#mi-desc', bd).value,
+        price_note: $('#mi-note', bd).value,
+        image_url: $('#mi-img', bd).value,
+        modifiers: mods.filter((m) => m.name.trim() !== ''),
+      };
+      try {
+        if (it) await api('/api/admin/menu/items/' + it.id, 'PUT', body);
+        else await api('/api/admin/menu/items', 'POST', body);
+        closeModal(); toast(it ? 'Item saved' : 'Item added', 'ok');
+        me.activeCat = String(body.category_id);
+        await refresh();
+      } catch (e) { saveErr(e); }
+    };
+    if (it) $('[data-x="del"]', bd).onclick = () => {
+      closeModal();
+      confirmDialog('Delete item', 'Delete “' + it.name + '”? Items with order history cannot be deleted — 86 them instead.', 'Delete', async () => {
+        try { await api('/api/admin/menu/items/' + it.id, 'DELETE'); toast('Item deleted', 'ok'); await refresh(); }
+        catch (e) { handleApiError(e); }
+      });
+    };
+  }
+
+  /* ---- audit log ---- */
+  async function toggleAudit() {
+    me.showAudit = !me.showAudit;
+    $('#me-audit-card').classList.toggle('hidden', !me.showAudit);
+    if (!me.showAudit) return;
+    try {
+      const rows = await api('/api/admin/menu/audit?limit=30');
+      $('#me-audit-list').innerHTML = rows.length ? rows.map((r) =>
+        '<div class="me-audit-row"><span class="me-audit-act">' + esc(meActionLabel(r.action)) + '</span> ' +
+        '<span>' + esc((r.details && r.details.name) || ('#' + (r.item_id || r.category_id || ''))) + '</span> ' +
+        '<span class="muted small">· ' + esc(r.actor || '?') + ' · ' + esc(String(r.created_at || '').slice(0, 16).replace('T', ' ')) + '</span></div>'
+      ).join('') : '<p class="muted">No changes logged yet.</p>';
+    } catch (e) { handleApiError(e); }
+  }
+
+  $('#me-add-cat').onclick = () => openCatModal(null);
+  $('#me-add-item').onclick = () => { if (!me.cats.length) { toast('Add a category first', 'err'); return; } openItemModal(null); };
+  $('#me-audit-toggle').onclick = toggleAudit;
+  await refresh();
 }
 
 /* ============================================================
@@ -1493,9 +2716,21 @@ async function renderMenuViewer(app) {
    ============================================================ */
 function bindGlobal() {
   window.addEventListener('hashchange', () => {
+    // Floor-plan editor: guard against losing unsaved layout changes.
+    if (window.__fpGuard && !window.__fpBypass && location.hash !== window.__fpGuard.hash) {
+      const dest = location.hash;
+      window.__fpBypass = true;
+      location.hash = window.__fpGuard.hash; // snap back; the re-fire bypasses the guard
+      confirmDialog('Unsaved floor-plan changes', 'Leave without saving? Your layout changes will be lost.', 'Discard', () => {
+        window.__fpGuard = null; window.__fpDirty = false;
+        location.hash = dest;
+      });
+      return;
+    }
+    window.__fpBypass = false;
     if (state.route && state.route.view === 'kds' && parseRoute().view !== 'kds') closeKdsSocket();
     if (typeof $('#app')._cleanup === 'function') { try { $('#app')._cleanup(); } catch (e) {} $('#app')._cleanup = null; }
-    renderRoute();
+    renderRoute().finally(() => { try { maybeClockBanner(); } catch (e) {} });
   });
   window.addEventListener('online', async () => {
     updateOfflineBanner();
@@ -1511,9 +2746,311 @@ async function init() {
   await Outbox.open();
   await updateOfflineBanner();
   if (!location.hash) location.hash = state.user ? (state.user.role === 'kitchen' ? '#/kds' : state.user.role === 'manager' ? '#/manager' : '#/floor') : '#/login';
-  else renderRoute();
+  else renderRoute().finally(() => { try { maybeClockBanner(); } catch (e) {} });
   // flush anything queued from a previous session
   if (state.user && !isOffline()) setTimeout(() => flushOutbox(), 1500);
+}
+
+/* ============================================================
+   GLOBAL BREAK NUDGE
+   On every view except #/clock itself, an employee with an open shift sees
+   a slim nonblocking banner when a meal/rest break is due or overdue, with
+   one-tap Start. Never blocks navigation; all failures are silent.
+   ============================================================ */
+async function maybeClockBanner() {
+  try {
+    if (!state.user) return;
+    if (parseRoute().view === 'clock') return; // clock view has its own banners
+    const app = $('#app');
+    if (!app || app.querySelector('.clock-global-banner')) return;
+    let s;
+    try { s = await api('/api/clock/status'); }
+    catch (e) { return; } // offline / unauthorized: stay silent
+    if (!s || !s.open) return;
+    const need = [];
+    for (const d of (s.due || [])) {
+      if ((d.state === 'due' || d.state === 'overdue') && !need.some((n) => n.kind === d.kind)) {
+        need.push({ kind: d.kind, overdue: d.state === 'overdue' });
+      }
+    }
+    if (!need.length) return;
+    const anyOverdue = need.some((n) => n.overdue);
+    const b = document.createElement('div');
+    b.className = 'clock-global-banner' + (anyOverdue ? ' overdue' : '');
+    b.setAttribute('role', 'status');
+    b.innerHTML = '<span>' + (anyOverdue ? '⚠ <b>Break overdue</b>' : '⏳ <b>Break due</b>') + ' — ' +
+      need.map((n) => n.kind).join(' + ') + '</span> ' +
+      need.map((n) => '<button class="btn btn-sm ' + (n.overdue ? 'btn-primary' : 'btn-ghost') + '" data-gb="' + n.kind + '">Start ' + n.kind + '</button>').join(' ');
+    b.querySelectorAll('[data-gb]').forEach((btn) => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try { await api('/api/clock/break/start', 'POST', { type: btn.dataset.gb }); toast('Break started — enjoy', 'ok'); }
+        catch (e) { handleApiError(e); }
+        b.remove();
+      };
+    });
+    app.prepend(b);
+  } catch (e) { /* never break navigation */ }
+}
+
+/* ============================================================
+   VIEW: TIME CLOCK (all roles)
+   Clock in/out + break prompts. Polls /api/clock/status every 60s so
+   due/overdue break banners appear without a page refresh.
+   ============================================================ */
+const CLOCK_POLL_MS = 60000;
+const ckElapsedFmt = (h) => {
+  h = Math.max(0, Number(h) || 0);
+  const m = Math.round(h * 60);
+  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+};
+
+async function renderClock(app) {
+  app.innerHTML = '<div class="view-head"><h1>Time clock</h1><span class="spacer"></span><span class="muted small" id="clock-now"></span></div>' +
+    '<div id="clock-body"><p class="muted">Loading…</p></div>';
+  const body = $('#clock-body');
+  const tickNow = () => { const c = $('#clock-now'); if (c) c.textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); };
+  tickNow();
+
+  const load = async () => {
+    let s;
+    try { s = await api('/api/clock/status'); }
+    catch (e) { if (handleApiError(e) === 'bounced') return; body.innerHTML = '<div class="empty">Could not load time clock.</div>'; return; }
+    draw(s);
+  };
+
+  const draw = (s) => {
+    if (!s.open) {
+      body.innerHTML = '<div class="card"><h2>Not clocked in</h2>' +
+        '<p class="muted">Tap below to start your shift. Your breaks and overtime are tracked automatically.</p>' +
+        '<button class="btn btn-primary btn-big btn-block" id="ck-in">Clock In</button></div>';
+      $('#ck-in').onclick = async () => {
+        try { await api('/api/clock/in', 'POST', {}); toast('Clocked in — have a great shift', 'ok'); load(); }
+        catch (e) { handleApiError(e); }
+      };
+      return;
+    }
+    let banners = '';
+    for (const d of (s.due || [])) {
+      if (d.kind === 'meal' && d.state === 'overdue') {
+        banners += '<div class="clock-banner overdue" role="alert"><span>⚠ <b>Meal break OVERDUE</b> — start it now to avoid a premium.</span>' +
+          '<button class="btn btn-primary btn-sm" data-start="meal">Start meal break</button></div>';
+      } else if (d.kind === 'meal' && d.state === 'due') {
+        banners += '<div class="clock-banner due"><span>⏳ <b>Meal break due</b> by ' + esc(fmtClock(d.due_at)) + '.</span>' +
+          '<button class="btn btn-ghost btn-sm" data-start="meal">Start meal break</button></div>';
+      } else if (d.kind === 'rest' && d.state === 'due') {
+        banners += '<div class="clock-banner due"><span>⏳ <b>Rest break due</b> — take 10 minutes.</span>' +
+          '<button class="btn btn-ghost btn-sm" data-start="rest">Start rest break</button></div>';
+      }
+    }
+    const mealIp = (s.breaks || []).some((b) => b.type === 'meal' && !b.end_at && !b.waived);
+    const restIp = (s.breaks || []).some((b) => b.type === 'rest' && !b.end_at);
+    const chips = (s.breaks || []).map((b) => {
+      if (b.waived) return '<span class="chip">Meal ' + (b.meal_seq || 1) + ' waived</span>';
+      const lbl = b.type === 'meal' ? 'Meal' : 'Rest';
+      const tm = fmtClock(b.start_at) + (b.end_at ? '–' + fmtClock(b.end_at) + ' (' + b.minutes + 'm)' : ' — in progress');
+      return '<span class="chip' + (!b.end_at ? ' active' : '') + '">' + lbl + ' ' + tm + '</span>';
+    }).join(' ');
+    body.innerHTML = banners +
+      '<div class="card"><h2>' + esc(s.employee_name) + ' <span class="muted small">· ' + esc(s.role) + '</span></h2>' +
+      '<div class="stat-grid">' +
+      '<div class="stat"><div class="k">Clocked in</div><div class="v">' + esc(fmtClock(s.clock_in)) + '</div></div>' +
+      '<div class="stat"><div class="k">Elapsed</div><div class="v">' + esc(ckElapsedFmt(s.elapsed_h)) + '</div></div>' +
+      '<div class="stat"><div class="k">Rate</div><div class="v">' + fmt(s.regular_rate_cents) + '/hr</div></div>' +
+      '</div>' +
+      (chips ? '<p class="mt">' + chips + '</p>' : '<p class="muted small mt">No breaks yet this shift.</p>') +
+      '<div class="clock-actions">' +
+      (mealIp ? '<button class="btn btn-big btn-amber" id="ck-end-meal">End meal break</button>'
+        : '<button class="btn btn-big btn-ghost" id="ck-start-meal">Start meal break</button>') +
+      (restIp ? '<button class="btn btn-big btn-amber" id="ck-end-rest">End rest break</button>'
+        : '<button class="btn btn-big btn-ghost" id="ck-start-rest">Start rest break</button>') +
+      '</div>' +
+      '<div id="ck-attest" class="card mt hidden"><h3>End meal break</h3>' +
+      '<label class="check"><input type="checkbox" id="ck-dutyfree"> <span>I was <b>fully relieved of duty</b> for this entire meal break.</span></label>' +
+      '<p class="muted small">California requires an uninterrupted, duty-free 30-minute meal period.</p>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" id="ck-attest-cancel">Cancel</button>' +
+      '<button class="btn btn-primary" id="ck-attest-ok">End break</button></div></div>' +
+      '<button class="btn btn-block mt" id="ck-out" style="min-height:56px">Clock Out</button></div>';
+
+    const start = async (t) => { try { await api('/api/clock/break/start', 'POST', { type: t }); load(); } catch (e) { handleApiError(e); } };
+    body.querySelectorAll('[data-start]').forEach((b) => { b.onclick = () => start(b.dataset.start); });
+    const sm = $('#ck-start-meal'); if (sm) sm.onclick = () => start('meal');
+    const sr = $('#ck-start-rest'); if (sr) sr.onclick = () => start('rest');
+    const er = $('#ck-end-rest'); if (er) er.onclick = async () => { try { await api('/api/clock/break/end', 'POST', { type: 'rest' }); load(); } catch (e) { handleApiError(e); } };
+    const em = $('#ck-end-meal');
+    if (em) em.onclick = () => $('#ck-attest').classList.remove('hidden');
+    const ac = $('#ck-attest-cancel'); if (ac) ac.onclick = () => $('#ck-attest').classList.add('hidden');
+    const ao = $('#ck-attest-ok');
+    if (ao) ao.onclick = async () => {
+      if (!$('#ck-dutyfree').checked) { toast('Please confirm you were fully relieved of duty', 'err'); return; }
+      try { await api('/api/clock/break/end', 'POST', { type: 'meal', duty_free: true }); toast('Meal break ended', 'ok'); load(); }
+      catch (e) { handleApiError(e); }
+    };
+    $('#ck-out').onclick = async () => {
+      try {
+        const v = await api('/api/clock/out', 'POST', {});
+        const viol = (v.compliance.violations || []).join(' + ');
+        toast(viol ? 'Clocked out — ⚠ break premium owed (' + viol + ')' : 'Clocked out — shift total ' + fmt(v.pay.total_cents), viol ? 'err' : 'ok');
+        load();
+      } catch (e) { handleApiError(e); }
+    };
+  };
+
+  await load();
+  const iv1 = setInterval(load, CLOCK_POLL_MS);
+  const iv2 = setInterval(tickNow, 20000);
+  app._cleanup = () => { clearInterval(iv1); clearInterval(iv2); };
+}
+
+/* ============================================================
+   VIEW: MANAGER TIME CLOCK (#/manager/timeclock)
+   Who's in now, shifts + breaks + compliance, premiums, overtime,
+   day labor rollup, team rates, and shift adjustments.
+   ============================================================ */
+function ckMealChip(v, seq, okFlag) {
+  const b = (v.breaks || []).find((x) => x.type === 'meal' && (x.meal_seq || 1) === seq);
+  const tag = 'M' + seq;
+  if (b && b.waived) return '<span class="chip">' + tag + ' waived</span>';
+  if (b && b.end_at) return '<span class="chip">' + tag + ' ✓ ' + fmtClock(b.start_at) + '–' + fmtClock(b.end_at) + '</span>';
+  if (b && !b.end_at) return '<span class="chip active">' + tag + ' …in progress</span>';
+  if (!okFlag && v.compliance.finalized) return '<span class="chip bad">⚠ ' + tag + ' missed</span>';
+  if (!okFlag) return '<span class="chip warn">' + tag + ' pending</span>';
+  return '<span class="chip">—</span>';
+}
+
+async function renderTimeClock(app) {
+  if (!mgrGuard(app)) return;
+  const defDate = await siteDate();
+  app.innerHTML = '<div class="view-head"><h1>Time clock</h1><span class="spacer"></span>' +
+    '<label class="muted small">Date <input type="date" id="tc-date" class="date-in" value="' + esc(defDate) + '"></label></div>' +
+    mgrNav('timeclock') + '<div id="tc-body"><p class="muted">Loading…</p></div>';
+  const body = $('#tc-body');
+
+  const load = async () => {
+    const d = ($('#tc-date') && $('#tc-date').value) || defDate;
+    let data, users;
+    try {
+      data = await api('/api/admin/clock/shifts?date=' + encodeURIComponent(d));
+      users = await api('/api/admin/clock/users');
+    } catch (e) { if (handleApiError(e) === 'bounced') return; body.innerHTML = '<div class="empty">Could not load time clock.</div>'; return; }
+    draw(data, users, d);
+  };
+
+  const violTxt = (v) => (v.compliance.violations || []).map((x) => x === 'meal' ? 'meal' : x).join(' + ');
+
+  const draw = (data, users, d) => {
+    const L = data.labor || {};
+    const onShift = (data.on_shift || []).map((s) =>
+      '<span class="chip active">' + esc(s.employee_name) + ' <span class="muted">· in ' + esc(fmtClock(s.clock_in)) + '</span></span>').join(' ') || '<span class="muted">Nobody clocked in.</span>';
+    const rows = (data.shifts || []).map((v) => {
+      const comp = v.compliance;
+      const meals = comp.meals_required === 0 ? '<span class="muted">—</span>'
+        : ckMealChip(v, 1, comp.meal1_ok) + (comp.meals_required > 1 ? ' ' + ckMealChip(v, 2, comp.meal2_ok) : '');
+      const rest = comp.rests_required === 0 ? '<span class="muted">—</span>'
+        : (comp.rests_ok
+          ? '<span class="chip">R ✓ ' + comp.rests_taken + '/' + comp.rests_required + '</span>'
+          : '<span class="chip ' + (comp.finalized ? 'bad' : 'warn') + '">⚠ R ' + comp.rests_taken + '/' + comp.rests_required + '</span>');
+      const otH = (v.pay.ot15_hours || 0) + (v.pay.ot2_hours || 0);
+      return '<tr>' +
+        '<td><b>' + esc(v.employee_name) + '</b><br><span class="muted small">' + esc(v.role) + '</span></td>' +
+        '<td class="small">' + esc(fmtClock(v.clock_in)) + '<br><span class="muted">' + (v.clock_out ? esc(fmtClock(v.clock_out)) : 'open') + '</span></td>' +
+        '<td>' + v.hours.toFixed(2) + 'h</td>' +
+        '<td>' + meals + ' ' + rest + '</td>' +
+        '<td>' + (otH > 0 ? otH.toFixed(2) + 'h<br><span class="muted small">' + fmt(v.pay.ot15_cents + v.pay.ot2_cents) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+        '<td>' + (v.pay.premium_cents > 0 ? '<span class="red"><b>⚠ ' + fmt(v.pay.premium_cents) + '</b><br><span class="small">' + esc(violTxt(v)) + '</span></span>' : '<span class="muted">—</span>') + '</td>' +
+        '<td><b>' + fmt(v.pay.total_cents) + '</b></td>' +
+        '<td><button class="btn btn-ghost btn-sm" data-adj="' + v.id + '">Adjust</button></td></tr>';
+    }).join('');
+    const violRows = (data.violations || []).map((x) =>
+      '<div class="clock-banner overdue slim"><span>⚠ <b>' + esc(x.employee_name) + '</b> — missed ' + esc(violTxt({ compliance: { violations: x.violations } })) + ' break: <b>' + fmt(x.premium_cents) + '</b> premium owed.</span></div>').join('');
+    const rates = (users || []).map((u) =>
+      '<div class="rate-row"><span><b>' + esc(u.name) + '</b> <span class="muted small">· ' + esc(u.role) + '</span></span>' +
+      '<span>$<input type="number" class="rate-in" data-u="' + u.id + '" min="0" step="0.01" value="' + ((u.hourly_rate_cents || 0) / 100).toFixed(2) + '">/hr ' +
+      '<button class="btn btn-ghost btn-sm" data-rate="' + u.id + '">Save</button></span></div>').join('');
+
+    body.innerHTML =
+      '<div class="card"><h3>On shift now</h3><p>' + onShift + '</p></div>' +
+      '<div class="stat-grid">' +
+      '<div class="stat"><div class="k">Labor cost · ' + esc(d) + '</div><div class="v">' + fmt(L.total_cents) + '</div></div>' +
+      '<div class="stat"><div class="k">Break premiums owed</div><div class="v ' + (L.premium_cents > 0 ? 'red' : '') + '">' + fmt(L.premium_cents) + '</div></div>' +
+      '<div class="stat"><div class="k">Overtime pay</div><div class="v ' + ((L.ot_cents + L.weekly_ot_cents) > 0 ? 'amber' : '') + '">' + fmt((L.ot_cents || 0) + (L.weekly_ot_cents || 0)) + '</div></div>' +
+      '<div class="stat"><div class="k">Regular pay</div><div class="v">' + fmt(L.reg_cents) + '</div></div>' +
+      '</div>' +
+      (violRows || '') +
+      '<div class="card mt"><h3>Shifts</h3><div class="t-scroll"><table class="t-table">' +
+      '<thead><tr><th>Employee</th><th>In / Out</th><th>Hours</th><th>Breaks</th><th>OT</th><th>Premium</th><th>Labor</th><th></th></tr></thead>' +
+      '<tbody>' + (rows || '<tr><td colspan="8" class="muted">No shifts this date.</td></tr>') + '</tbody></table></div></div>' +
+      '<div class="card"><h3>Team hourly rates</h3>' + rates +
+      '<p class="muted small mt">Rates are captured on each shift at clock-in, so past shifts keep their historical rate. Changes apply to future shifts.</p></div>' +
+      '<p class="muted small">Break rules use California defaults (30-min duty-free meal before the 5th hour, 10-min paid rest per 4h or major fraction, 1h premium per violation type per day, OT after 8/12h daily and 40h weekly). Thresholds are config data — verify against current CA DIR guidance before the pilot. We are not lawyers.</p>';
+
+    body.querySelectorAll('[data-rate]').forEach((b) => {
+      b.onclick = async () => {
+        const inp = body.querySelector('.rate-in[data-u="' + b.dataset.rate + '"]');
+        const cents = Math.round(parseFloat(inp.value || '0') * 100);
+        if (!Number.isFinite(cents) || cents < 0) { toast('Enter a valid rate', 'err'); return; }
+        try { await api('/api/admin/clock/users/' + b.dataset.rate + '/rate', 'PUT', { hourly_rate_cents: cents }); toast('Rate saved', 'ok'); }
+        catch (e) { handleApiError(e); }
+      };
+    });
+    body.querySelectorAll('[data-adj]').forEach((b) => {
+      b.onclick = () => {
+        const sh = (data.shifts || []).find((s) => String(s.id) === b.dataset.adj);
+        if (sh) openAdjust(sh, d, load);
+      };
+    });
+  };
+
+  const openAdjust = (shift, d, reload) => {
+    const shiftId = shift.id;
+    const toLocal = (iso) => {
+      if (!iso) return '';
+      const t = new Date(iso), p = (n) => String(n).padStart(2, '0');
+      return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate()) + 'T' + p(t.getHours()) + ':' + p(t.getMinutes());
+    };
+    const breakRows = (shift.breaks || []).map((b) =>
+      '<div class="card slim" style="margin:8px 0;padding:10px"><b class="small">' + esc(b.type === 'meal' ? 'Meal break' : 'Rest break') + '</b>' +
+      '<label class="fld">Start <input type="datetime-local" data-brk="' + b.id + '" data-f="start_at" value="' + toLocal(b.start_at) + '"></label>' +
+      '<label class="fld">End <input type="datetime-local" data-brk="' + b.id + '" data-f="end_at" value="' + toLocal(b.end_at) + '"></label></div>'
+    ).join('');
+    const bd = openModal('<h2>Adjust shift</h2>' +
+      '<p class="muted small">Manager correction — the original values stay in the audit log with the approver\'s name. Times are local (site timezone).</p>' +
+      '<label class="fld">Clock in <input type="datetime-local" id="adj-in" value="' + toLocal(shift.clock_in) + '"></label>' +
+      '<label class="fld">Clock out <input type="datetime-local" id="adj-out" value="' + toLocal(shift.clock_out) + '"></label>' +
+      '<p class="muted small">Leave clock-out empty to reopen a closed shift.</p>' +
+      (breakRows ? '<h3 class="mt">Breaks</h3>' + breakRows : '') +
+      '<label class="fld">Manager PIN <span class="muted small">— approves this correction</span> <input id="adj-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px"></label>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="save">Save adjustment</button></div>');
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $('[data-x="save"]', bd).onclick = async () => {
+      const toIso = (s) => s ? new Date(s).toISOString() : null;
+      const pin = $('#adj-pin', bd).value.trim();
+      if (!/^\d{4}$/.test(pin)) { toast('Enter your 4-digit manager PIN to approve', 'err'); return; }
+      const ci = $('#adj-in', bd).value, co = $('#adj-out', bd).value;
+      const patch = { shift_id: Number(shiftId), manager_pin: pin };
+      if (ci) patch.clock_in = toIso(ci);
+      if (co) patch.clock_out = toIso(co); else patch.clock_out = null;
+      try {
+        await api('/api/admin/clock/adjust', 'POST', patch);
+        // Break corrections, one call per changed break.
+        for (const b of (shift.breaks || [])) {
+          const sIn = $('[data-brk="' + b.id + '"][data-f="start_at"]', bd);
+          const eIn = $('[data-brk="' + b.id + '"][data-f="end_at"]', bd);
+          const ns = toIso(sIn.value), ne = eIn.value ? toIso(eIn.value) : null;
+          const os = b.start_at ? new Date(b.start_at).toISOString() : null;
+          const oe = b.end_at ? new Date(b.end_at).toISOString() : null;
+          if (ns !== os || ne !== oe) {
+            await api('/api/admin/clock/adjust', 'POST', { shift_id: Number(shiftId), manager_pin: pin, break_id: b.id, start_at: ns, end_at: ne });
+          }
+        }
+        closeModal(); toast('Shift adjusted — pay recomputed', 'ok'); reload();
+      } catch (e) { handleApiError(e); }
+    };
+  };
+
+  $('#tc-date').onchange = load;
+  await load();
 }
 
 document.addEventListener('DOMContentLoaded', init);

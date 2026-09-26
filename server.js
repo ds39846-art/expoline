@@ -208,8 +208,53 @@ db.exec('PRAGMA foreign_keys=ON;');
   }
 })();
 
+/* Feature modules (gift cards, loyalty, kiosk, online ordering). Each module
+   owns its tables via migrate(db); guarded and idempotent on every boot. */
+require('./routes/giftcards').migrate(db);
+require('./routes/loyalty').migrate(db);
+require('./routes/kiosk').migrate(db);
+require('./routes/online').migrate(db);
+
 /* Seed employees from existing users once SITE_ID is known (see below,
    after the config section — migrations above run before SITE_ID exists). */
+
+/* Reservations + waitlist (phase 2). Runs on every boot; guarded via
+   CREATE TABLE IF NOT EXISTS + IF NOT EXISTS indexes. uuid columns follow
+   the sync-identity pattern (crypto.randomUUID() at insert) so a future
+   LAN site brain can reference these rows across engines. */
+(() => {
+  db.exec(`CREATE TABLE IF NOT EXISTS reservations (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT UNIQUE,
+    site_id TEXT,
+    customer_name TEXT,
+    phone TEXT,
+    party_size INTEGER,
+    reserved_at TEXT,
+    duration_min INTEGER DEFAULT 90,
+    table_id INTEGER,
+    status TEXT CHECK(status IN ('booked','seated','cancelled','no_show','completed')),
+    notes TEXT,
+    created_by TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS waitlist (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT UNIQUE,
+    site_id TEXT,
+    customer_name TEXT,
+    phone TEXT,
+    party_size INTEGER,
+    quoted_wait_min INTEGER,
+    status TEXT CHECK(status IN ('waiting','notified','seated','left','cancelled')),
+    notified_at TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_reservations_site_time ON reservations(site_id, reserved_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_reservations_table_time ON reservations(site_id, table_id, reserved_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_reservations_phone ON reservations(site_id, phone)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_waitlist_site_status ON waitlist(site_id, status, created_at)`);
+})();
 
 /* --------------------------------- config --------------------------------- */
 const PORT = parseInt(process.env.EXPOLINE_PORT || '4317', 10);
@@ -469,6 +514,10 @@ function issueToken(user) {
 /** 401 unless a valid Bearer token is present. Mounted on /api with two public paths. */
 function authMiddleware(req, res, next) {
   if (req.path === '/health' || req.path === '/auth/login') return next();
+  // Public online-ordering endpoints (customer's phone — no staff token).
+  if (req.path === '/online/menu'
+      || (req.path === '/online/orders' && req.method === 'POST')
+      || req.path === '/online/last') return next();
   const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
   const user = m ? tokens.get(m[1]) : null;
   if (!user) return res.status(401).json({ error: 'Unauthorized: valid Bearer token required' });
@@ -574,6 +623,13 @@ app.use((req, res, next) => {
     console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - t0}ms`);
   });
   next();
+});
+
+/* Kiosk + menu boards: PUBLIC customer/TV endpoints — registered before the
+   auth wall so they stay token-free (Express matches in registration order).
+   All staff routes below keep Bearer auth. */
+require('./routes/kiosk').register(app, {
+  db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated,
 });
 
 app.use('/api', authMiddleware);
@@ -1501,7 +1557,7 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
         amount_cents: p.amount_cents, tip_cents: p.tip_cents, fee_cents: fee,
         fee_label: 'DEMO', refunded_cents: refunded, status: p.status,
       });
-    } else if (p.method === 'cash') {
+    } else if (p.method === 'cash' || p.method === 'gift_card') {
       cashSales += p.amount_cents;
     }
   }
@@ -1553,7 +1609,7 @@ app.get('/api/finance/shift', managerOnly(), (req, res) => {
         const b = p.brand || 'Unknown';
         brandBreakdown[b] = (brandBreakdown[b] || 0) + p.amount_cents;
         cardTips += p.tip_cents || 0;
-      } else if (p.method === 'cash') {
+      } else if (p.method === 'cash' || p.method === 'gift_card') {
         cashSales += p.amount_cents;
       }
     }
@@ -1627,7 +1683,7 @@ function payoutDay(date) {
       cardVolume += p.amount_cents;
       refunds += refunded;
       fees += demoFeeCents(p.amount_cents - refunded);
-    } else if (p.method === 'cash') {
+    } else if (p.method === 'cash' || p.method === 'gift_card') {
       cashSales += p.amount_cents;
     }
   }
@@ -1717,7 +1773,7 @@ const REPORT_DEFS = {
           for (const p of (payByCheck.get(c.id) || [])) {
             r.tips_cents += p.tip_cents || 0;
             const net = p.amount_cents - (p.refunded_cents || 0);
-            if (p.method === 'cash') r.cash_cents += net;
+            if (p.method === 'cash' || p.method === 'gift_card') r.cash_cents += net;
             else if (p.method === 'card_demo') r.card_cents += net;
           }
         }
@@ -1852,7 +1908,7 @@ const REPORT_DEFS = {
         const k = d + '|' + nm;
         if (!byKey.has(k)) byKey.set(k, { date: d, server_name: nm, cash_tips_cents: 0, card_tips_cents: 0, total_tips_cents: 0 });
         const r = byKey.get(k);
-        if (p.method === 'cash') r.cash_tips_cents += p.tip_cents;
+        if (p.method === 'cash' || p.method === 'gift_card') r.cash_tips_cents += p.tip_cents;
         else r.card_tips_cents += p.tip_cents;
         r.total_tips_cents += p.tip_cents;
       }
@@ -2769,7 +2825,390 @@ app.get('/api/admin/approvals/audit', managerOnly(), (req, res) => {
   res.json(db.prepare('SELECT id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at FROM approval_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
 });
 
+/* --------------------- reservations + waitlist ----------------------
+   Native reservations + waitlist, deeply integrated with the floor plan.
+   Differentiators vs Toast/TouchBistro:
+   - /api/floor/availability returns every table with its live slot status
+     (free / occupied / booked) plus x/y/shape/zone — the floor plan IS the
+     availability view.
+   - Smart best-fit table suggestion in ONE query (no N+1).
+   - One-tap seat: waitlist entry or reservation -> open check on the table.
+   - Server-side overlap prevention; per-phone no-show history surfaced on
+     every booking. */
+const RESV_STATUSES = new Set(['booked', 'seated', 'cancelled', 'no_show', 'completed']);
+const WL_STATUSES = new Set(['waiting', 'notified', 'seated', 'left', 'cancelled']);
+
+const cleanPhone = (p) => (typeof p === 'string' ? p.replace(/\D/g, '') : '');
+const parseSlot = (s) => {
+  if (typeof s !== 'string' || !s.trim()) return null;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : t;
+};
+
+function resvById(id) {
+  return db.prepare('SELECT * FROM reservations WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+function wlById(id) {
+  return db.prepare('SELECT * FROM waitlist WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+function tableById(id) {
+  return db.prepare('SELECT id, label, seats, zone_id, x, y, shape FROM tables WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+
+/** No-show history for a phone number (digits-normalized). Shown on repeat bookings. */
+function noShowCount(phone) {
+  const p = cleanPhone(phone);
+  if (!p) return 0;
+  return db.prepare("SELECT COUNT(*) AS c FROM reservations WHERE site_id = ? AND phone = ? AND status = 'no_show'").get(SITE_ID, p).c;
+}
+
+/** Overlap guard: active reservation on table whose [reserved_at, +duration) hits [startMs, endMs).
+    Epoch comparison via strftime avoids ISO 'T' vs SQLite ' ' format pitfalls. */
+function resvOverlap(tableId, startMs, endMs, excludeId) {
+  return db.prepare(
+    `SELECT id FROM reservations
+     WHERE site_id = ? AND table_id = ? AND status IN ('booked','seated')
+       AND id != COALESCE(?, -1)
+       AND strftime('%s', reserved_at) < strftime('%s', ?)
+       AND strftime('%s', reserved_at, '+' || duration_min || ' minutes') > strftime('%s', ?)
+     LIMIT 1`
+  ).get(SITE_ID, tableId, excludeId ?? null, new Date(endMs).toISOString(), new Date(startMs).toISOString()) || null;
+}
+
+/** Open a check on a table (shared by reservation-arrive + waitlist-seat). */
+function openCheckOnTable(tableId, guestCount, tabName, serverId) {
+  const table = tableById(tableId);
+  if (!table) return { error: 'Valid table_id is required' };
+  if (!isInt(guestCount) || guestCount < 1) return { error: 'guest_count must be a positive integer' };
+  const existing = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1").get(tableId);
+  if (existing) return { error: 'Table already has an open check', check_id: existing.id };
+  const r = db.prepare(
+    "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
+  ).run(crypto.randomUUID(), SITE_ID, tableId, serverId, tabName || null, guestCount, nowIso());
+  const check = checkResponse(r.lastInsertRowid);
+  broadcastCheckUpdated(check.id);
+  return { check };
+}
+
+/** Push {type:'resv_updated'} to 'reservations' channel subscribers. */
+function broadcastResvUpdated() {
+  for (const ws of wss.clients) {
+    if ((ws.subs || []).some((s) => s.channel === 'reservations')) {
+      wsSend(ws, { type: 'resv_updated' });
+    }
+  }
+}
+
+/* Site-local day helpers (America/Los_Angeles for the Bali Hai pilot). */
+function tzOffsetMs(tz, utcMs) {
+  const d = new Date(utcMs);
+  const tzDate = new Date(d.toLocaleString('en-US', { timeZone: tz }));
+  const utcDate = new Date(d.toLocaleString('en-US', { timeZone: 'UTC' }));
+  return tzDate.getTime() - utcDate.getTime();
+}
+function siteTodayStr() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: SITE_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+function siteDayBounds(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
+  if (!m) return null;
+  const naiveUtc = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  const off = tzOffsetMs(SITE_TZ, naiveUtc + 12 * 3600e3);
+  const startMs = naiveUtc - off;
+  return [new Date(startMs).toISOString(), new Date(startMs + 86400000).toISOString()];
+}
+
+function resvView(r) {
+  const t = r.table_id != null ? tableById(r.table_id) : null;
+  return {
+    id: r.id, uuid: r.uuid, customer_name: r.customer_name, phone: r.phone,
+    party_size: r.party_size, reserved_at: r.reserved_at, duration_min: r.duration_min,
+    table_id: r.table_id, table_label: t ? t.label : null, status: r.status,
+    notes: r.notes, created_by: r.created_by, created_at: r.created_at,
+    no_show_count: noShowCount(r.phone),
+  };
+}
+
+app.post('/api/reservations', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const name = cleanLabel(b.customer_name);
+  if (!name) return res.status(400).json({ error: 'customer_name is required' });
+  if (!isInt(b.party_size) || b.party_size < 1 || b.party_size > 24)
+    return res.status(400).json({ error: 'party_size must be a whole number from 1 to 24' });
+  const startMs = parseSlot(b.reserved_at);
+  if (startMs == null) return res.status(400).json({ error: 'reserved_at must be a valid ISO datetime' });
+  if (startMs < Date.now() - 2 * 3600e3)
+    return res.status(400).json({ error: 'reserved_at is too far in the past' });
+  const duration = b.duration_min == null ? 90 : b.duration_min;
+  if (!isInt(duration) || duration < 15 || duration > 480)
+    return res.status(400).json({ error: 'duration_min must be 15–480' });
+  let tableId = null;
+  if (b.table_id != null) {
+    const t = tableById(b.table_id);
+    if (!t) return res.status(400).json({ error: 'Valid table_id is required' });
+    tableId = t.id;
+    const clash = resvOverlap(tableId, startMs, startMs + duration * 60000, null);
+    if (clash) return res.status(409).json({ error: 'Table is already booked for that time', conflicting_reservation_id: clash.id });
+  }
+  const phone = cleanPhone(b.phone);
+  const r = db.prepare(
+    `INSERT INTO reservations (uuid, site_id, customer_name, phone, party_size, reserved_at, duration_min,
+       table_id, status, notes, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?)`
+  ).run(crypto.randomUUID(), SITE_ID, name, phone || null, b.party_size,
+    new Date(startMs).toISOString(), duration, tableId,
+    cleanLabel(b.notes) || null, req.user.name, nowIso());
+  broadcastResvUpdated();
+  res.status(201).json(resvView(resvById(r.lastInsertRowid)));
+});
+
+app.get('/api/reservations', serverPlus(), (req, res) => {
+  let date = req.query.date;
+  if (date == null || date === '') date = siteTodayStr();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  const bounds = siteDayBounds(date);
+  if (!bounds) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  const rows = db.prepare(
+    `SELECT * FROM reservations WHERE site_id = ? AND reserved_at >= ? AND reserved_at < ?
+     ORDER BY reserved_at`
+  ).all(SITE_ID, bounds[0], bounds[1]);
+  res.json(rows.map(resvView));
+});
+
+/** PATCH: change status (booked→seated one-tap opens the check; no_show is
+    manager-only and audited) or reassign table (overlap-checked). */
+app.patch('/api/reservations/:id', serverPlus(), (req, res) => {
+  const r = resvById(req.params.id);
+  if (!r) return res.status(404).json({ error: 'Reservation not found' });
+  const b = req.body || {};
+  const before = { status: r.status, table_id: r.table_id };
+
+  let tableId = r.table_id;
+  if (b.table_id !== undefined) {
+    if (b.table_id == null) {
+      tableId = null;
+    } else {
+      const t = tableById(b.table_id);
+      if (!t) return res.status(400).json({ error: 'Valid table_id is required' });
+      tableId = t.id;
+    }
+  }
+  if (b.status !== undefined && !RESV_STATUSES.has(b.status))
+    return res.status(400).json({ error: 'Invalid status' });
+  const newStatus = b.status !== undefined ? b.status : r.status;
+
+  if (['cancelled', 'no_show', 'completed'].includes(r.status) && newStatus !== r.status)
+    return res.status(400).json({ error: `Reservation is already ${r.status}` });
+  if (newStatus === 'no_show' && req.user.role !== 'manager')
+    return res.status(403).json({ error: 'Only managers can mark a no-show' });
+  if (newStatus === 'cancelled' && req.user.role !== 'manager')
+    return res.status(403).json({ error: 'Only managers can cancel a reservation' });
+  if (newStatus === 'seated' && r.status !== 'booked')
+    return res.status(400).json({ error: 'Only booked reservations can be seated' });
+
+  // Overlap check whenever the table or the time window matters.
+  if (tableId != null && (tableId !== r.table_id || newStatus === 'seated')) {
+    const startMs = Date.parse(r.reserved_at);
+    const clash = resvOverlap(tableId, startMs, startMs + r.duration_min * 60000, r.id);
+    if (clash) return res.status(409).json({ error: 'Table is already booked for that time', conflicting_reservation_id: clash.id });
+  }
+
+  let checkId = null;
+  if (newStatus === 'seated') {
+    if (tableId == null) return res.status(400).json({ error: 'Assign a table to seat this reservation' });
+    const opened = openCheckOnTable(tableId, r.party_size, r.customer_name, req.user.id);
+    if (opened.error && !opened.check_id)
+      return res.status(400).json({ error: opened.error });
+    checkId = opened.check ? opened.check.id : opened.check_id; // reuse open check if one exists
+  }
+
+  db.prepare('UPDATE reservations SET status = ?, table_id = ? WHERE id = ?')
+    .run(newStatus, tableId, r.id);
+  if (newStatus === 'no_show' || newStatus === 'cancelled') {
+    auditApproval(req, newStatus === 'no_show' ? 'resv_no_show' : 'resv_cancel',
+      {}, { reservation_id: r.id, before, after: { status: newStatus, table_id: tableId } });
+  }
+  broadcastResvUpdated();
+  const out = resvView(resvById(r.id));
+  if (checkId) out.check_id = checkId;
+  res.json(out);
+});
+
+/** DELETE cancels a reservation (manager-only, audited). */
+app.delete('/api/reservations/:id', managerOnly(), (req, res) => {
+  const r = resvById(req.params.id);
+  if (!r) return res.status(404).json({ error: 'Reservation not found' });
+  if (['cancelled', 'no_show', 'completed'].includes(r.status))
+    return res.status(400).json({ error: `Reservation is already ${r.status}` });
+  db.prepare("UPDATE reservations SET status = 'cancelled' WHERE id = ?").run(r.id);
+  auditApproval(req, 'resv_cancel', {}, { reservation_id: r.id, before: { status: r.status }, after: { status: 'cancelled' } });
+  broadcastResvUpdated();
+  res.json({ id: r.id, status: 'cancelled' });
+});
+
+/* --------------------------------- waitlist -------------------------------- */
+function wlView(w) {
+  return {
+    id: w.id, uuid: w.uuid, customer_name: w.customer_name, phone: w.phone,
+    party_size: w.party_size, quoted_wait_min: w.quoted_wait_min, status: w.status,
+    notified_at: w.notified_at, created_at: w.created_at,
+    no_show_count: noShowCount(w.phone),
+  };
+}
+
+app.post('/api/waitlist', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const name = cleanLabel(b.customer_name);
+  if (!name) return res.status(400).json({ error: 'customer_name is required' });
+  if (!isInt(b.party_size) || b.party_size < 1 || b.party_size > 24)
+    return res.status(400).json({ error: 'party_size must be a whole number from 1 to 24' });
+  const quoted = b.quoted_wait_min == null ? null : b.quoted_wait_min;
+  if (quoted != null && (!isInt(quoted) || quoted < 0 || quoted > 480))
+    return res.status(400).json({ error: 'quoted_wait_min must be 0–480' });
+  const phone = cleanPhone(b.phone);
+  const r = db.prepare(
+    `INSERT INTO waitlist (uuid, site_id, customer_name, phone, party_size, quoted_wait_min, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?)`
+  ).run(crypto.randomUUID(), SITE_ID, name, phone || null, b.party_size, quoted, nowIso());
+  broadcastResvUpdated();
+  res.status(201).json(wlView(wlById(r.lastInsertRowid)));
+});
+
+app.get('/api/waitlist', serverPlus(), (req, res) => {
+  const rows = db.prepare(
+    `SELECT * FROM waitlist WHERE site_id = ? AND status IN ('waiting','notified') ORDER BY created_at`
+  ).all(SITE_ID);
+  res.json(rows.map(wlView));
+});
+
+app.post('/api/waitlist/:id/notify', serverPlus(), (req, res) => {
+  const w = wlById(req.params.id);
+  if (!w) return res.status(404).json({ error: 'Waitlist entry not found' });
+  if (w.status !== 'waiting') return res.status(400).json({ error: `Entry is ${w.status}` });
+  db.prepare("UPDATE waitlist SET status = 'notified', notified_at = ? WHERE id = ?").run(nowIso(), w.id);
+  broadcastResvUpdated();
+  res.json(wlView(wlById(w.id)));
+});
+
+/** One-tap seat: waiting/notified entry -> open check on the chosen table. */
+app.post('/api/waitlist/:id/seat', serverPlus(), (req, res) => {
+  const w = wlById(req.params.id);
+  if (!w) return res.status(404).json({ error: 'Waitlist entry not found' });
+  if (!['waiting', 'notified'].includes(w.status))
+    return res.status(400).json({ error: `Entry is ${w.status}` });
+  const t = tableById((req.body || {}).table_id);
+  if (!t) return res.status(400).json({ error: 'Valid table_id is required' });
+  const opened = openCheckOnTable(t.id, w.party_size, w.customer_name, req.user.id);
+  if (opened.error) return res.status(400).json({ error: opened.error, check_id: opened.check_id || null });
+  db.prepare("UPDATE waitlist SET status = 'seated' WHERE id = ?").run(w.id);
+  broadcastResvUpdated();
+  res.json({ entry: wlView(wlById(w.id)), check_id: opened.check.id });
+});
+
+app.patch('/api/waitlist/:id', serverPlus(), (req, res) => {
+  const w = wlById(req.params.id);
+  if (!w) return res.status(404).json({ error: 'Waitlist entry not found' });
+  const st = (req.body || {}).status;
+  if (!WL_STATUSES.has(st) || st === 'seated')
+    return res.status(400).json({ error: "status must be one of: waiting, notified, left, cancelled (use /seat to seat)" });
+  db.prepare('UPDATE waitlist SET status = ? WHERE id = ?').run(st, w.id);
+  broadcastResvUpdated();
+  res.json(wlView(wlById(w.id)));
+});
+
+app.delete('/api/waitlist/:id', managerOnly(), (req, res) => {
+  const w = wlById(req.params.id);
+  if (!w) return res.status(404).json({ error: 'Waitlist entry not found' });
+  db.prepare('DELETE FROM waitlist WHERE id = ?').run(w.id);
+  auditApproval(req, 'waitlist_delete', {}, { waitlist_id: w.id, name: w.customer_name });
+  broadcastResvUpdated();
+  res.json({ deleted: w.id });
+});
+
+/* ------------------------- floor availability -------------------------
+   The floor plan IS the availability view: every table with its live slot
+   status, position, shape, and zone — plus best-fit suggestions computed in
+   a SINGLE query (no N+1). */
+function suggestTables(partySize, startMs, endMs, limit) {
+  return db.prepare(
+    `SELECT t.id FROM tables t
+     WHERE t.site_id = ? AND t.seats >= ?
+       AND NOT EXISTS (
+         SELECT 1 FROM reservations r
+         WHERE r.site_id = ? AND r.table_id = t.id AND r.status IN ('booked','seated')
+           AND strftime('%s', r.reserved_at) < strftime('%s', ?)
+           AND strftime('%s', r.reserved_at, '+' || r.duration_min || ' minutes') > strftime('%s', ?)
+       )
+     ORDER BY (t.seats - ?) ASC, t.id ASC
+     LIMIT ?`
+  ).all(SITE_ID, partySize, SITE_ID, new Date(endMs).toISOString(), new Date(startMs).toISOString(), partySize, limit)
+    .map((r) => r.id);
+}
+
+app.get('/api/floor/availability', serverPlus(), (req, res) => {
+  const startMs = req.query.datetime ? parseSlot(req.query.datetime) : Date.now();
+  if (startMs == null) return res.status(400).json({ error: 'datetime must be a valid ISO datetime' });
+  const party = req.query.party_size == null ? 2 : parseInt(req.query.party_size, 10);
+  if (!isInt(party) || party < 1 || party > 24)
+    return res.status(400).json({ error: 'party_size must be 1–24' });
+  const dur = req.query.duration_min == null ? 90 : parseInt(req.query.duration_min, 10);
+  if (!isInt(dur) || dur < 15 || dur > 480)
+    return res.status(400).json({ error: 'duration_min must be 15–480' });
+  const endMs = startMs + dur * 60000;
+
+  const tables = db.prepare(
+    `SELECT t.id, t.label, t.seats, t.zone_id, z.name AS zone, t.x, t.y, t.shape,
+       (SELECT r.id FROM reservations r
+        WHERE r.site_id = ? AND r.table_id = t.id AND r.status IN ('booked','seated')
+          AND strftime('%s', r.reserved_at) < strftime('%s', ?)
+          AND strftime('%s', r.reserved_at, '+' || r.duration_min || ' minutes') > strftime('%s', ?)
+        LIMIT 1) AS resv_id,
+       (SELECT c.id FROM checks c WHERE c.table_id = t.id AND c.status = 'open' LIMIT 1) AS open_check_id
+     FROM tables t LEFT JOIN zones z ON z.id = t.zone_id
+     WHERE t.site_id = ?
+     ORDER BY z.sort, t.label`
+  ).all(SITE_ID, new Date(endMs).toISOString(), new Date(startMs).toISOString(), SITE_ID);
+
+  const resvIds = [...new Set(tables.map((t) => t.resv_id).filter((v) => v != null))];
+  const resvMap = new Map();
+  if (resvIds.length) {
+    const rows = db.prepare(
+      `SELECT id, customer_name, party_size, reserved_at, duration_min FROM reservations WHERE id IN (${resvIds.map(() => '?').join(',')})`
+    ).all(...resvIds);
+    for (const r of rows) resvMap.set(r.id, r);
+  }
+  const suggested = new Set(suggestTables(party, startMs, endMs, 3));
+  res.json({
+    datetime: new Date(startMs).toISOString(),
+    duration_min: dur,
+    party_size: party,
+    tables: tables.map((t) => ({
+      id: t.id, label: t.label, seats: t.seats, zone_id: t.zone_id, zone: t.zone,
+      x: t.x, y: t.y, shape: t.shape,
+      open_check_id: t.open_check_id,
+      status: t.open_check_id ? 'occupied' : (t.resv_id ? 'booked' : 'free'),
+      reservation: t.resv_id ? resvMap.get(t.resv_id) || null : null,
+      suggested: suggested.has(t.id),
+    })),
+  });
+});
+
 /* --------------------------- 404 for unknown /api --------------------------- */
+/* Feature modules (authenticated — staff token required). Registered after all
+   core routes, before the /api 404 catch-all. */
+require('./routes/giftcards').register(app, {
+  db, SITE_ID, managerOnly, serverPlus, nowIso, crypto,
+  persistTotals, checkResponse, paymentView, broadcastCheckUpdated, auditApproval,
+});
+require('./routes/loyalty').register(app, {
+  db, SITE_ID, serverPlus, nowIso, crypto, persistTotals,
+  broadcastCheckUpdated, auditApproval,
+});
+require('./routes/online').register(app, {
+  db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
+  persistTotals, checkResponse, broadcastCheckUpdated,
+});
+
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
 /* ------------------------- static frontend + SPA fallback ------------------- */
