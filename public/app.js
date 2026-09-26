@@ -1371,6 +1371,10 @@ async function renderOrder(app, checkId) {
        "quick buttons for popular items"). Manager flags items as popular in
        the menu editor; 86'd items never appear here. */
     '<div class="quick-pick" id="quick-pick" style="display:none"></div>' +
+    /* Menu search — instant filter across all categories. Faster than scrolling
+       19 categories when you know the item name. */
+    '<div class="menu-search-row"><input type="search" id="menu-search" placeholder="🔍 Search menu…" autocomplete="off" aria-label="Search menu items">' +
+    '<button class="btn btn-ghost btn-sm" id="menu-search-clear" style="display:none" aria-label="Clear search">✕</button></div>' +
     '<div class="order-layout"><div><div class="item-grid" id="item-grid"></div>' +
     '<div class="drinks-note">🍸 <b>Drinks</b> are tagged <span class="drink-tag">BAR</span> — they fire to the <b>bar</b> immediately on send, never holding up food.</div></div>' +
     '<div class="cart-panel"><div class="card"><h3>Order</h3><div id="cart-body"></div>' +
@@ -1398,6 +1402,27 @@ async function renderOrder(app, checkId) {
     $$('.tab', catTabs).forEach((b) => b.onclick = () => { activeCat = b.dataset.c; drawCats(); drawItems(); });
   };
   const drawItems = () => {
+    const q = (searchInput && searchInput.value || '').trim().toLowerCase();
+    /* Search mode: flat results across all categories. */
+    if (q) {
+      const hits = [];
+      visibleMenu().forEach((c) => (c.items || []).forEach((i) => {
+        if ((i.name || '').toLowerCase().includes(q)) hits.push({ item: i, catName: c.name });
+      }));
+      if (!hits.length) { itemGrid.innerHTML = '<div class="empty">No items match “' + esc(searchInput.value.trim()) + '”.</div>'; return; }
+      itemGrid.innerHTML = hits.map(({ item: i, catName }) => {
+        const drink = isDrink(i, catName);
+        return '<button class="item-card" data-i="' + esc(String(i.id)) + '" data-cat="' + esc(catName) + '">' +
+          (drink ? '<span class="drink-tag">BAR</span>' : '') +
+          '<span class="nm">' + esc(i.name) + '</span><span class="pr">' + fmt(i.price_cents) + '</span>' +
+          '<span class="cat-lbl">' + esc(catName) + '</span></button>';
+      }).join('');
+      $$('.item-card', itemGrid).forEach((b) => b.onclick = () => {
+        const item = hits.find(({ item: x }) => String(x.id) === b.dataset.i).item;
+        addItemFlow(item, b.dataset.cat);
+      });
+      return;
+    }
     const cat = visibleMenu().find((c) => String(c.id) === String(activeCat));
     if (!cat) { itemGrid.innerHTML = '<div class="empty">No menu loaded.</div>'; return; }
     itemGrid.innerHTML = cat.items.map((i) => {
@@ -1411,6 +1436,16 @@ async function renderOrder(app, checkId) {
       addItemFlow(item, cat.name);
     });
   };
+
+  /* Menu search wiring. */
+  const searchInput = $('#menu-search'), searchClear = $('#menu-search-clear');
+  if (searchInput) {
+    searchInput.addEventListener('input', () => {
+      searchClear.style.display = searchInput.value ? '' : 'none';
+      drawItems();
+    });
+    searchClear.onclick = () => { searchInput.value = ''; searchClear.style.display = 'none'; drawItems(); searchInput.focus(); };
+  }
 
   /* Phase 3A (P0-6/NG-E/P0-2): guided modifier flow — modifier GROUPS with
      required/min/max, defaults pre-checked, 86'd options disabled, nested
