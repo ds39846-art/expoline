@@ -228,53 +228,79 @@ function register(app, ctx) {
       lines.push({ menuItem, qty, modifiers: pricedMods });
     }
 
-    const kioskTable = ensureKioskTable(db, SITE_ID);
-    const at = nowIso();
-    const checkId = db.prepare(
-      "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, NULL, ?, 1, 'open', ?)"
-    ).run(crypto.randomUUID(), SITE_ID, kioskTable.id, customerName ? `Kiosk · ${customerName}` : 'Kiosk', at).lastInsertRowid;
-
-    const insItem = db.prepare(
-      "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at, sent_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, 'sent', ?, ?)"
-    );
-    const byStation = new Map();
-    for (const ln of lines) {
-      const r = insItem.run(
-        crypto.randomUUID(), checkId, ln.menuItem.id, ln.qty,
-        ln.menuItem.price_cents, JSON.stringify(ln.modifiers), ln.menuItem.course, at, at
-      );
-      const station = ln.menuItem.station || 'expediter';
-      if (!byStation.has(station)) byStation.set(station, []);
-      byStation.get(station).push({
-        item_id: Number(r.lastInsertRowid),
-        name: ln.menuItem.name,
-        seat: 1,
-        qty: ln.qty,
-        modifiers: ln.modifiers,
-      });
-    }
-
-    // KDS tickets — same station-grouping shape as the send flow.
+    // Phase 1B money audit (concurrency): the entire order write runs in one
+    // write transaction with an 86 re-check, so an item 86'd mid-order
+    // cannot land on the kiosk check. Broadcasts happen after COMMIT so
+    // subscribers never see uncommitted tickets.
+    const ids = [...new Set(lines.map((l) => l.menuItem.id))];
+    const placeholders = ids.map(() => '?').join(',');
+    let checkId;
     const tickets = [];
-    const insTicket = db.prepare(
-      "INSERT INTO kds_tickets (uuid, check_id, site_id, station, table_label, server_name, items_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)"
-    );
-    for (const [station, ticketItems] of byStation) {
-      const r = insTicket.run(
-        crypto.randomUUID(), checkId, SITE_ID, station,
-        KIOSK_TABLE_LABEL, 'Kiosk', JSON.stringify(ticketItems), at
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      const recheck = db.prepare(
+        `SELECT id, active FROM menu_items WHERE id IN (${placeholders})`
+      ).all(...ids);
+      const activeMap = new Map(recheck.map((r) => [r.id, r.active]));
+      for (const [idx, ln] of lines.entries()) {
+        if (activeMap.get(ln.menuItem.id) !== 1) {
+          db.exec('ROLLBACK');
+          return res.status(400).json({ error: `items[${idx}]: "${ln.menuItem.name}" is 86'd right now` });
+        }
+      }
+      const kioskTable = ensureKioskTable(db, SITE_ID);
+      const at = nowIso();
+      checkId = db.prepare(
+        "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, NULL, ?, 1, 'open', ?)"
+      ).run(crypto.randomUUID(), SITE_ID, kioskTable.id, customerName ? `Kiosk · ${customerName}` : 'Kiosk', at).lastInsertRowid;
+
+      const insItem = db.prepare(
+        "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at, sent_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, 'sent', ?, ?)"
       );
-      const row = db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid);
-      const ticket = {
-        id: row.id, check_id: row.check_id, station: row.station,
-        table_label: row.table_label, server_name: row.server_name,
-        items: ticketItems, status: row.status, created_at: row.created_at,
-      };
-      tickets.push(ticket);
-      if (typeof ctx.broadcastTicket === 'function') ctx.broadcastTicket(ticket);
+      const byStation = new Map();
+      for (const ln of lines) {
+        const r = insItem.run(
+          crypto.randomUUID(), checkId, ln.menuItem.id, ln.qty,
+          ln.menuItem.price_cents, JSON.stringify(ln.modifiers), ln.menuItem.course, at, at
+        );
+        const station = ln.menuItem.station || 'expediter';
+        if (!byStation.has(station)) byStation.set(station, []);
+        byStation.get(station).push({
+          item_id: Number(r.lastInsertRowid),
+          name: ln.menuItem.name,
+          seat: 1,
+          qty: ln.qty,
+          modifiers: ln.modifiers,
+        });
+      }
+
+      // KDS tickets — same station-grouping shape as the send flow.
+      const insTicket = db.prepare(
+        "INSERT INTO kds_tickets (uuid, check_id, site_id, station, table_label, server_name, items_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)"
+      );
+      for (const [station, ticketItems] of byStation) {
+        const r = insTicket.run(
+          crypto.randomUUID(), checkId, SITE_ID, station,
+          KIOSK_TABLE_LABEL, 'Kiosk', JSON.stringify(ticketItems), at
+        );
+        const row = db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid);
+        tickets.push({
+          id: row.id, check_id: row.check_id, station: row.station,
+          table_label: row.table_label, server_name: row.server_name,
+          items: ticketItems, status: row.status, created_at: row.created_at,
+        });
+      }
+
+      persistTotals(checkId);
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw e;
     }
 
-    persistTotals(checkId);
+    for (const t of tickets) {
+      if (typeof ctx.broadcastTicket === 'function') ctx.broadcastTicket(t);
+    }
     broadcastCheckUpdated(checkId);
     res.status(201).json({ check: checkResponse(checkId), tickets });
   });

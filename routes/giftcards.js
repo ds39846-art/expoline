@@ -122,7 +122,7 @@ function cardView(c) {
 function register(app, ctx) {
   const { db, SITE_ID, managerOnly, serverPlus, nowIso, crypto,
           persistTotals, checkResponse, paymentView, broadcastCheckUpdated,
-          auditApproval } = ctx;
+          auditApproval, idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear } = ctx;
 
   const findCard = (rawCode) => {
     const norm = normalizeCode(rawCode);
@@ -158,11 +158,27 @@ function register(app, ctx) {
   /* ---------------- issue ---------------- */
   app.post('/api/gift-cards/issue', managerOnly(), (req, res) => {
     const { initial_cents } = req.body || {};
+    // Phase 1B: idempotency replay FIRST — a retried issue returns the
+    // already-issued card even though validation below would re-run.
+    const ikey0 = idemKeyFrom(req);
+    if (ikey0) {
+      const rp0 = idemReplay('gift_card_issue', ikey0);
+      if (rp0) return res.status(rp0.status).json(rp0.body);
+    }
     if (!isInt(initial_cents) || initial_cents <= 0) {
       return res.status(400).json({ error: 'initial_cents must be a positive integer' });
     }
     if (initial_cents > MAX_ISSUE_CENTS) {
       return res.status(400).json({ error: `initial_cents cannot exceed ${MAX_ISSUE_CENTS} ($${MAX_ISSUE_CENTS / 100})` });
+    }
+    // Phase 1B: reserve the idempotency key AFTER validation, BEFORE minting.
+    const ikey = ikey0;
+    let idem = null;
+    if (ikey) {
+      const rsv = idemReserve('gift_card_issue', ikey);
+      if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+      if (rsv.state === 'processing') return res.status(409).json({ error: 'Duplicate issue already in progress — retry shortly' });
+      idem = ikey;
     }
     try {
       const card = txn(() => {
@@ -183,8 +199,11 @@ function register(app, ctx) {
         before: null,
         after: { code: card.code, initial_cents: card.initial_cents },
       });
-      res.status(201).json({ card: cardView(card) });
+      const out = { card: cardView(card) };
+      if (idem) idemStore('gift_card_issue', idem, 201, out);
+      res.status(201).json(out);
     } catch (e) {
+      if (idem) idemClear('gift_card_issue', idem);
       res.status(e.status || 500).json({ error: e.message || 'Issue failed' });
     }
   });
@@ -192,6 +211,12 @@ function register(app, ctx) {
   /* ---------------- reload ---------------- */
   app.post('/api/gift-cards/reload', managerOnly(), (req, res) => {
     const { code, amount_cents } = req.body || {};
+    // Phase 1B: idempotency replay FIRST.
+    const ikey0 = idemKeyFrom(req);
+    if (ikey0) {
+      const rp0 = idemReplay('gift_card_reload', ikey0);
+      if (rp0) return res.status(rp0.status).json(rp0.body);
+    }
     const card = findCard(code);
     if (!card) return res.status(404).json({ error: 'Gift card not found' });
     if (card.status === 'voided') return res.status(400).json({ error: 'Card is voided and cannot be reloaded' });
@@ -200,6 +225,15 @@ function register(app, ctx) {
     }
     if (amount_cents > MAX_ISSUE_CENTS) {
       return res.status(400).json({ error: `amount_cents cannot exceed ${MAX_ISSUE_CENTS}` });
+    }
+    // Phase 1B: reserve the idempotency key AFTER validation, BEFORE the reload.
+    const ikey = ikey0;
+    let idem = null;
+    if (ikey) {
+      const rsv = idemReserve('gift_card_reload', ikey);
+      if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+      if (rsv.state === 'processing') return res.status(409).json({ error: 'Duplicate reload already in progress — retry shortly' });
+      idem = ikey;
     }
     try {
       const updated = txn(() => {
@@ -214,8 +248,11 @@ function register(app, ctx) {
         ).run(card.id, amount_cents, nowIso(), req.user ? req.user.name : '?');
         return db.prepare('SELECT * FROM gift_cards WHERE id = ?').get(card.id);
       });
-      res.json({ card: cardView(updated) });
+      const out = { card: cardView(updated) };
+      if (idem) idemStore('gift_card_reload', idem, 200, out);
+      res.json(out);
     } catch (e) {
+      if (idem) idemClear('gift_card_reload', idem);
       res.status(500).json({ error: 'Reload failed' });
     }
   });
@@ -268,6 +305,13 @@ function register(app, ctx) {
   /* ---------------- redeem → real payment row ---------------- */
   app.post('/api/gift-cards/redeem', serverPlus(), (req, res) => {
     const { check_id, gift_card_code, amount_cents, tip_cents = 0 } = req.body || {};
+    // Phase 1B: idempotency replay FIRST — a retried redeem replays the
+    // stored payment even though the card balance / check balance changed.
+    const ikey0 = idemKeyFrom(req);
+    if (ikey0) {
+      const rp0 = idemReplay('gift_card_redeem', ikey0);
+      if (rp0) return res.status(rp0.status).json(rp0.body);
+    }
     const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(check_id, SITE_ID);
     if (!check) return res.status(404).json({ error: 'Check not found' });
     if (check.status !== 'open') {
@@ -299,6 +343,23 @@ function register(app, ctx) {
       return res.status(400).json({
         error: `Insufficient gift card balance (${card.balance_cents}¢ available)`,
       });
+    }
+    // Phase 1B money audit: a redemption may never exceed the remaining
+    // check balance (no negative balances via over-application).
+    if (amount > totals.balance) {
+      return res.status(400).json({
+        error: `amount_cents (${amount}¢) exceeds the remaining check balance (${totals.balance}¢)`,
+      });
+    }
+
+    // Phase 1B: reserve the idempotency key AFTER validation, BEFORE the spend.
+    const ikey = ikey0;
+    let idem = null;
+    if (ikey) {
+      const rsv = idemReserve('gift_card_redeem', ikey);
+      if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+      if (rsv.state === 'processing') return res.status(409).json({ error: 'Duplicate redeem already in progress — retry shortly' });
+      idem = ikey;
     }
 
     try {
@@ -340,12 +401,15 @@ function register(app, ctx) {
         return { payment, card: fresh, checkId: check.id };
       });
       broadcastCheckUpdated(out.checkId);
-      res.status(201).json({
+      const resp = {
         payment: out.payment,
         card: cardView(out.card),
         check: checkResponse(out.checkId),
-      });
+      };
+      if (idem) idemStore('gift_card_redeem', idem, 201, resp);
+      res.status(201).json(resp);
     } catch (e) {
+      if (idem) idemClear('gift_card_redeem', idem);
       res.status(e.status || 500).json({ error: e.message || 'Redeem failed' });
     }
   });

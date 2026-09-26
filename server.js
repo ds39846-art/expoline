@@ -25,6 +25,14 @@
  *   Stripe DEMO fee per card payment: round(net_amount_cents * 0.026) + 15¢,
  *     computed on the NET amount (amount - refunded); fully-refunded payments
  *     incur no fee. Always labeled "DEMO" — no real charges, ever.
+ *   Idempotency (Phase 1B): payment / refund / gift-card issue+reload+redeem /
+ *     loyalty-redeem mutations accept an Idempotency-Key (request header or
+ *     `idempotency_key` body field) — a retried double-tap/double-POST with
+ *     the same key replays the stored response instead of double-applying.
+ *   Discounts (manager comp + loyalty redeem) can never exceed the check
+ *     subtotal; totals can never go negative. Payments can never exceed the
+ *     remaining balance. Modifiers must exist on the menu item and are
+ *     always re-priced server-side from menu_modifiers (client prices ignored).
  * ========================================================================== */
 
 const path = require('node:path');
@@ -71,6 +79,10 @@ if (!fs.existsSync(DB_PATH)) {
 const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode=WAL;');
 db.exec('PRAGMA foreign_keys=ON;');
+// Phase 1B money audit: wait (rather than fail fast with SQLITE_BUSY) when a
+// second process holds the write lock — concurrent POS terminals / kiosk /
+// online ordering must serialize instead of erroring on money writes.
+db.exec('PRAGMA busy_timeout=5000;');
 
 /* Floor-plan editor migration (phase 2): position + shape columns on tables.
    Runs on every boot; ALTER TABLE is a no-op-safe guard via PRAGMA table_info. */
@@ -264,6 +276,24 @@ require('./routes/online').migrate(db);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_waitlist_site_status ON waitlist(site_id, status, created_at)`);
 })();
 
+/* Idempotency keys (Phase 1B money audit). Guards payment / refund /
+   gift-card / loyalty-redeem endpoints against double-tap and double-POST:
+   a retried request carrying the same Idempotency-Key (header or
+   `idempotency_key` body field) replays the stored response instead of
+   executing the money mutation a second time. */
+(() => {
+  db.exec(`CREATE TABLE IF NOT EXISTS idempotency_keys (
+    site_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'processing' CHECK(status IN ('processing','completed')),
+    response_status INTEGER,
+    response_json TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (site_id, scope, key)
+  )`);
+})();
+
 /* --------------------------------- config --------------------------------- */
 const PORT = parseInt(process.env.EXPOLINE_PORT || process.env.PORT || '4317', 10);
 const SITE_TZ = 'America/Los_Angeles'; // Bali Hai pilot site timezone for date bucketing
@@ -335,6 +365,97 @@ function withTransaction(fn) {
     try { db.exec('ROLLBACK'); } catch { /* ignore */ }
     throw e;
   }
+}
+
+/* ------------------------- idempotency-key helpers -------------------------
+ * Phase 1B money audit. Two-step usage inside a money-mutating handler:
+ *   const ikey = idemKeyFrom(req);
+ *   // 1) replay FIRST, before any state-dependent validation:
+ *   if (ikey) { const rp = idemReplay('payments', ikey);
+ *     if (rp) return res.status(rp.status).json(rp.body); }
+ *   ... validate ...
+ *   // 2) reserve AFTER validation passes, before the mutation:
+ *   let idem = null;
+ *   if (ikey) {
+ *     const rsv = idemReserve('payments', ikey);
+ *     if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+ *     if (rsv.state === 'processing') return res.status(409).json({ error: 'Duplicate request in progress — retry shortly' });
+ *     idem = ikey;
+ *   }
+ *   try {
+ *     ... mutate ...
+ *     const out = { ... }; const status = 201;
+ *     if (idem) idemStore('payments', idem, status, out);
+ *     return res.status(status).json(out);
+ *   } catch (e) { if (idem) idemClear('payments', idem); throw e; }
+ * A 'processing' row older than IDEM_STALE_MS is treated as orphaned (the
+ * first attempt crashed before storing) and reclaimed, so a retry can
+ * proceed instead of 409-ing forever. All DB calls here are synchronous,
+ * so reserve/store cannot interleave with another request mid-handler. */
+const IDEM_STALE_MS = 120_000;
+
+function idemKeyFrom(req) {
+  const h = req.get('Idempotency-Key') || req.get('idempotency-key');
+  const b = (req.body || {}).idempotency_key;
+  const k = (h != null ? String(h) : b != null ? String(b) : '').trim().slice(0, 128);
+  return k || null;
+}
+
+/* Completed-key lookup. Call FIRST in the handler (before any
+ * state-dependent validation): a retry must replay the stored response even
+ * when the world has moved on (e.g. the balance is now lower). */
+function idemReplay(scope, key) {
+  const row = db.prepare(
+    'SELECT status, response_status, response_json FROM idempotency_keys WHERE site_id = ? AND scope = ? AND key = ?'
+  ).get(SITE_ID, scope, key);
+  if (row && row.status === 'completed') {
+    let body = {};
+    try { body = JSON.parse(row.response_json || '{}'); } catch { body = {}; }
+    return { status: row.response_status || 200, body };
+  }
+  return null;
+}
+
+function idemReserve(scope, key) {
+  // returns {state:'new'} | {state:'replay',...} | {state:'processing'}
+  // Claim is atomic across processes: exactly one contender wins the
+  // INSERT OR IGNORE; losers read the winner's row and replay or back off.
+  const rp = idemReplay(scope, key);
+  if (rp) return { state: 'replay', status: rp.status, body: rp.body };
+  const ins = db.prepare(
+    "INSERT OR IGNORE INTO idempotency_keys (site_id, scope, key, status, created_at) VALUES (?, ?, ?, 'processing', ?)"
+  ).run(SITE_ID, scope, key, nowIso());
+  if (ins.changes === 1) return { state: 'new' };
+  const row = db.prepare(
+    'SELECT status, response_status, response_json, created_at FROM idempotency_keys WHERE site_id = ? AND scope = ? AND key = ?'
+  ).get(SITE_ID, scope, key);
+  if (!row) return { state: 'new' }; // lost a race with a delete; next call re-claims
+  if (row.status === 'completed') {
+    let body = null;
+    try { body = JSON.parse(row.response_json); } catch { /* keep null */ }
+    return { state: 'replay', status: row.response_status || 200, body };
+  }
+  const age = Date.now() - new Date(row.created_at).getTime();
+  if (Number.isFinite(age) && age >= IDEM_STALE_MS) {
+    // Orphaned 'processing' row (first attempt crashed before storing).
+    // Reclaim is conditional so only one contender wins it.
+    const upd = db.prepare(
+      "UPDATE idempotency_keys SET created_at = ? WHERE site_id = ? AND scope = ? AND key = ? AND status = 'processing'"
+    ).run(nowIso(), SITE_ID, scope, key);
+    if (upd.changes === 1) return { state: 'new' };
+  }
+  return { state: 'processing' };
+}
+
+function idemStore(scope, key, status, body) {
+  db.prepare(
+    "UPDATE idempotency_keys SET status = 'completed', response_status = ?, response_json = ?, created_at = ? WHERE site_id = ? AND scope = ? AND key = ?"
+  ).run(status, JSON.stringify(body), nowIso(), SITE_ID, scope, key);
+}
+
+function idemClear(scope, key) {
+  db.prepare('DELETE FROM idempotency_keys WHERE site_id = ? AND scope = ? AND key = ?')
+    .run(SITE_ID, scope, key);
 }
 
 /** YYYY-MM-DD of an ISO timestamp in the site timezone. */
@@ -1247,12 +1368,24 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
   if (!isInt(seat) || seat < 1 || seat > check.guest_count) {
     return res.status(400).json({ error: `seat must be an integer between 1 and ${check.guest_count}` });
   }
-  if (!isInt(qty) || qty < 1) return res.status(400).json({ error: 'qty must be a positive integer' });
+  if (!isInt(qty) || qty < 1 || qty > 999) return res.status(400).json({ error: 'qty must be a positive integer (max 999)' });
   if (!Array.isArray(modifiers)) return res.status(400).json({ error: 'modifiers must be an array' });
+  // Phase 1B money audit: modifiers are NEVER trusted from the client.
+  // Each modifier must exist on this menu item (matched by name); the
+  // canonical price_delta_cents from menu_modifiers is used and any
+  // client-supplied price_delta_cents is ignored. This closes the
+  // arbitrary-discount hole (e.g. a client-invented -$50.00 modifier).
+  const modStmt = db.prepare('SELECT price_delta_cents FROM menu_modifiers WHERE item_id = ? AND name = ?');
+  const pricedMods = [];
   for (const m of modifiers) {
-    if (!m || typeof m.name !== 'string' || !isInt(m.price_delta_cents)) {
-      return res.status(400).json({ error: 'Each modifier needs {name, price_delta_cents}' });
+    if (!m || typeof m.name !== 'string' || !m.name.trim()) {
+      return res.status(400).json({ error: 'Each modifier needs a name' });
     }
+    const row = modStmt.get(menuItem.id, m.name.trim());
+    if (!row) {
+      return res.status(400).json({ error: `Unknown modifier "${m.name.trim()}" for "${menuItem.name}" — modifiers must come from the menu` });
+    }
+    pricedMods.push({ name: m.name.trim(), price_delta_cents: row.price_delta_cents });
   }
   // MP (market price) items: price_cents = 0 requires a manager-entered price.
   // Fixed-price items ALWAYS use the menu price — a request-supplied
@@ -1271,11 +1404,29 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
     return res.status(400).json({ error: 'unit_price_cents must be a non-negative integer' });
   }
 
-  const r = db.prepare(
-    "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
-  ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(modifiers), menuItem.course, nowIso());
-  const item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
-  persistTotals(check.id);
+  // Phase 1B money audit (concurrency): re-check the 86 flag INSIDE a write
+  // transaction. The menu editor can 86 an item between our earlier
+  // active=1 read and this INSERT; BEGIN IMMEDIATE serializes us against
+  // that toggle so an 86'd item can never slip onto a check.
+  let item;
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const fresh = db.prepare('SELECT active FROM menu_items WHERE id = ? AND site_id = ?')
+      .get(menuItem.id, SITE_ID);
+    if (!fresh || fresh.active !== 1) {
+      db.exec('ROLLBACK');
+      return res.status(400).json({ error: 'That item was just 86\'d — please reorder' });
+    }
+    const r = db.prepare(
+      "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
+    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(pricedMods), menuItem.course, nowIso());
+    item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
+    persistTotals(check.id);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+    throw e;
+  }
   broadcastCheckUpdated(check.id);
   res.status(201).json(itemView(item));
 });
@@ -1458,8 +1609,16 @@ app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
     return res.status(400).json({ error: 'amount_cents or percent is required' });
   }
   const before = check.comp_cents || 0;
+  // Phase 1B money audit: cumulative comps may never exceed the check
+  // subtotal — a discount can't exceed what's owed, and the total must never
+  // depend on the Math.max(0, …) clamp to stay non-negative.
+  if (before + comp > t0.subtotal) {
+    return res.status(400).json({ error: `Comp of ${before + comp}¢ exceeds the check subtotal of ${t0.subtotal}¢` });
+  }
+  // Atomic increment (never read-then-overwrite) so two concurrent comps
+  // accumulate instead of the second clobbering the first.
+  db.prepare('UPDATE checks SET comp_cents = comp_cents + ? WHERE id = ?').run(comp, check.id);
   const after = before + comp;
-  db.prepare('UPDATE checks SET comp_cents = ? WHERE id = ?').run(after, check.id);
   const t = persistTotals(check.id);
   broadcastCheckUpdated(check.id);
   auditApproval(req, 'comp', { check_id: check.id },
@@ -1637,40 +1796,77 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
   if (!isInt(tip_cents) || tip_cents < 0) {
     return res.status(400).json({ error: 'tip_cents must be a non-negative integer' });
   }
-  if (tendered_cents != null && !isInt(tendered_cents)) {
-    return res.status(400).json({ error: 'tendered_cents must be an integer' });
+  if (tendered_cents != null && (!isInt(tendered_cents) || tendered_cents < 0)) {
+    return res.status(400).json({ error: 'tendered_cents must be a non-negative integer' });
+  }
+
+  // Phase 1B money audit: idempotency replay comes FIRST — a retried
+  // double-tap/double-POST with the same key replays the stored payment
+  // instead of re-running validation against the now-changed balance.
+  const ikey = idemKeyFrom(req);
+  if (ikey) {
+    const rp = idemReplay('payments', ikey);
+    if (rp) return res.status(rp.status).json(rp.body);
   }
 
   const totals = persistTotals(check.id);
   if (totals.balance <= 0) return res.status(400).json({ error: 'Check is already paid in full' });
-
-  let authCode = null;
-  let demo = null;
-  if (method === 'card_demo') {
-    // Simulated terminal: DEMO ONLY — no real charge is ever made.
-    authCode = 'DEMO' + crypto.randomBytes(3).toString('hex').toUpperCase();
-    demo = { approved: true, auth_code: authCode, message: 'DEMO terminal - no real charge' };
+  // Phase 1B money audit: a payment may never exceed the remaining balance —
+  // over-application used to drive the balance negative and mark the check
+  // paid with money the house never collected.
+  if (amount_cents > totals.balance) {
+    return res.status(400).json({ error: `amount_cents (${amount_cents}¢) exceeds the remaining balance (${totals.balance}¢)` });
   }
 
-  const r = db.prepare(
-    "INSERT INTO payments (uuid, check_id, site_id, method, amount_cents, tip_cents, tendered_cents, brand, last4, auth_code, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)"
-  ).run(crypto.randomUUID(), check.id, SITE_ID, method, amount_cents, tip_cents, tendered_cents ?? null,
-    brand || (method === 'card_demo' ? 'DEMO' : null), last4 || null, authCode, nowIso());
-  const payment = paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(r.lastInsertRowid));
-
-  const after = persistTotals(check.id);
-  if (after.balance <= 0) {
-    db.prepare("UPDATE checks SET status = 'paid' WHERE id = ?").run(check.id);
+  // Reserve AFTER validation, BEFORE the mutation.
+  let idem = null;
+  if (ikey) {
+    const rsv = idemReserve('payments', ikey);
+    if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+    if (rsv.state === 'processing') return res.status(409).json({ error: 'Duplicate payment already in progress — retry shortly' });
+    idem = ikey;
   }
 
-  broadcastCheckUpdated(check.id);
-  const out = { payment, check: checkResponse(check.id) };
-  if (method === 'cash' && tendered_cents != null) out.change_cents = tendered_cents - amount_cents;
-  if (demo) out.demo = demo;
-  res.status(201).json(out);
+  try {
+    let authCode = null;
+    let demo = null;
+    if (method === 'card_demo') {
+      // Simulated terminal: DEMO ONLY — no real charge is ever made.
+      authCode = 'DEMO' + crypto.randomBytes(3).toString('hex').toUpperCase();
+      demo = { approved: true, auth_code: authCode, message: 'DEMO terminal - no real charge' };
+    }
+
+    const r = db.prepare(
+      "INSERT INTO payments (uuid, check_id, site_id, method, amount_cents, tip_cents, tendered_cents, brand, last4, auth_code, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)"
+    ).run(crypto.randomUUID(), check.id, SITE_ID, method, amount_cents, tip_cents, tendered_cents ?? null,
+      brand || (method === 'card_demo' ? 'DEMO' : null), last4 || null, authCode, nowIso());
+    const payment = paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(r.lastInsertRowid));
+
+    const after = persistTotals(check.id);
+    if (after.balance <= 0) {
+      db.prepare("UPDATE checks SET status = 'paid' WHERE id = ?").run(check.id);
+    }
+
+    broadcastCheckUpdated(check.id);
+    const out = { payment, check: checkResponse(check.id) };
+    if (method === 'cash' && tendered_cents != null) out.change_cents = tendered_cents - amount_cents;
+    if (demo) out.demo = demo;
+    if (idem) idemStore('payments', idem, 201, out);
+    return res.status(201).json(out);
+  } catch (e) {
+    if (idem) idemClear('payments', idem);
+    throw e;
+  }
 });
 
 app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
+  // Phase 1B money audit: idempotency replay FIRST — a retried double-POST
+  // replays the stored refund even though the payment now reads 'refunded'.
+  const ikey0 = idemKeyFrom(req);
+  if (ikey0) {
+    const rp0 = idemReplay('refunds', ikey0);
+    if (rp0) return res.status(rp0.status).json(rp0.body);
+  }
   const payment = db.prepare('SELECT * FROM payments WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!payment) return res.status(404).json({ error: 'Payment not found' });
   if (payment.status === 'refunded') return res.status(400).json({ error: 'Payment already fully refunded' });
@@ -1684,10 +1880,30 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
 
   const newRefunded = (payment.refunded_cents || 0) + refundAmt;
   const newStatus = newRefunded >= payment.amount_cents ? 'refunded' : 'partial_refund';
-  db.prepare('UPDATE payments SET refunded_cents = ?, status = ? WHERE id = ?')
-    .run(newRefunded, newStatus, payment.id);
 
-  const totals = persistTotals(payment.check_id);
+  // Phase 1B money audit: reserve the idempotency key AFTER validation,
+  // BEFORE the mutation.
+  const ikey = ikey0;
+  let idem = null;
+  if (ikey) {
+    const rsv = idemReserve('refunds', ikey);
+    if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+    if (rsv.state === 'processing') return res.status(409).json({ error: 'Duplicate refund already in progress — retry shortly' });
+    idem = ikey;
+  }
+
+  try {
+    // Conditional UPDATE on the exact refunded_cents we read: the
+    // check-and-set is atomic, so a concurrent refund can't double-apply.
+    const upd = db.prepare('UPDATE payments SET refunded_cents = ?, status = ? WHERE id = ? AND refunded_cents = ?')
+      .run(newRefunded, newStatus, payment.id, payment.refunded_cents || 0);
+    if (upd.changes !== 1) {
+      const err = new Error('Payment changed while refunding — please retry');
+      err.status = 409;
+      throw err;
+    }
+
+    const totals = persistTotals(payment.check_id);
   const check = db.prepare('SELECT status FROM checks WHERE id = ?').get(payment.check_id);
   /* A refund on a still-active ('paid') check reopens it so the balance stays
      visible on the floor. A 'closed' check is end-of-lifecycle history: the
@@ -1699,7 +1915,13 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
     db.prepare("UPDATE checks SET status = 'open', closed_at = NULL WHERE id = ?").run(payment.check_id);
   }
   broadcastCheckUpdated(payment.check_id);
-  res.json({ payment: paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(payment.id)) });
+  const out = { payment: paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(payment.id)) };
+  if (idem) idemStore('refunds', idem, 200, out);
+  return res.json(out);
+} catch (e) {
+  if (idem) idemClear('refunds', idem);
+  throw e;
+}
 });
 
 app.post('/api/checks/:id/close', serverPlus(), (req, res) => {
@@ -3445,10 +3667,12 @@ app.get('/api/floor/availability', serverPlus(), (req, res) => {
 require('./routes/giftcards').register(app, {
   db, SITE_ID, managerOnly, serverPlus, nowIso, crypto,
   persistTotals, checkResponse, paymentView, broadcastCheckUpdated, auditApproval,
+  idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear,
 });
 require('./routes/loyalty').register(app, {
   db, SITE_ID, serverPlus, nowIso, crypto, persistTotals,
   broadcastCheckUpdated, auditApproval,
+  idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear,
 });
 require('./routes/online').register(app, {
   db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,

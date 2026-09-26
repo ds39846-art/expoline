@@ -80,7 +80,8 @@ function migrate(db) {
 
 function register(app, ctx) {
   const { db, SITE_ID, serverPlus, nowIso, crypto, persistTotals,
-    broadcastCheckUpdated, auditApproval } = ctx;
+    broadcastCheckUpdated, auditApproval,
+    idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear } = ctx;
 
   /* GET /api/loyalty/lookup?phone= — find a customer by phone (digits only).
      Returns { customer } or { customer: null }. */
@@ -169,6 +170,13 @@ function register(app, ctx) {
     const b = req.body || {};
     const phone = normPhone(b.phone);
     const points = b.points;
+    // Phase 1B: idempotency replay FIRST — a retried redeem replays the
+    // stored discount even though the points balance changed.
+    const ikey0 = idemKeyFrom(req);
+    if (ikey0) {
+      const rp0 = idemReplay('loyalty_redeem', ikey0);
+      if (rp0) return res.status(rp0.status).json(rp0.body);
+    }
     if (!phone) return res.status(400).json({ error: 'phone is required' });
     if (!Number.isInteger(points) || points <= 0 || points % 100 !== 0) {
       return res.status(400).json({ error: 'points must be a positive multiple of 100' });
@@ -194,9 +202,26 @@ function register(app, ctx) {
         error: `Reward $${(discount / 100).toFixed(2)} exceeds check total $${(t0.total / 100).toFixed(2)} — redeem fewer points`,
       });
     }
+    // Phase 1B money audit: cumulative discounts (prior comps + this redeem)
+    // may never exceed the check subtotal.
+    const beforeComp = check.comp_cents || 0;
+    if (beforeComp + discount > t0.subtotal) {
+      return res.status(400).json({
+        error: `Reward $${(discount / 100).toFixed(2)} would push total discounts past the check subtotal — redeem fewer points`,
+      });
+    }
+
+    // Phase 1B: reserve the idempotency key AFTER validation, BEFORE the spend.
+    const ikey = ikey0;
+    let idem = null;
+    if (ikey) {
+      const rsv = idemReserve('loyalty_redeem', ikey);
+      if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+      if (rsv.state === 'processing') return res.status(409).json({ error: 'Duplicate redeem already in progress — retry shortly' });
+      idem = ikey;
+    }
 
     const now = nowIso();
-    const beforeComp = check.comp_cents || 0;
     let applied = false;
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -209,7 +234,9 @@ function register(app, ctx) {
           `INSERT INTO loyalty_txns (uuid, site_id, customer_id, check_id, points_delta, type, created_at)
            VALUES (?, ?, ?, ?, ?, 'redeem', ?)`
         ).run(crypto.randomUUID(), SITE_ID, c.id, check.id, -points, now);
-        db.prepare('UPDATE checks SET comp_cents = ? WHERE id = ?').run(beforeComp + discount, check.id);
+        // Atomic increment (never read-then-overwrite) so a concurrent comp
+        // or redeem can't clobber this discount.
+        db.prepare('UPDATE checks SET comp_cents = comp_cents + ? WHERE id = ?').run(discount, check.id);
         db.exec('COMMIT');
         applied = true;
       } else {
@@ -217,9 +244,13 @@ function register(app, ctx) {
       }
     } catch (e) {
       try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+      if (idem) idemClear('loyalty_redeem', idem);
       throw e;
     }
-    if (!applied) return res.status(400).json({ error: 'Insufficient points' });
+    if (!applied) {
+      if (idem) idemClear('loyalty_redeem', idem);
+      return res.status(400).json({ error: 'Insufficient points' });
+    }
 
     const t = persistTotals(check.id);
     broadcastCheckUpdated(check.id);
@@ -227,7 +258,9 @@ function register(app, ctx) {
       { customer_id: c.id, phone, points_redeemed: points, discount_cents: discount,
         before_comp_cents: beforeComp, after_comp_cents: beforeComp + discount });
     const updated = db.prepare('SELECT * FROM customers WHERE id = ?').get(c.id);
-    res.json({ discount_cents: discount, customer: customerView(updated), totals: t });
+    const resp = { discount_cents: discount, customer: customerView(updated), totals: t };
+    if (idem) idemStore('loyalty_redeem', idem, 200, resp);
+    res.json(resp);
   });
 }
 

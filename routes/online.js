@@ -211,12 +211,34 @@ function register(app, ctx) {
     const tax = Math.round(subtotal * taxRate());
     const total = subtotal + tax;
     const createdAt = nowIso();
-    const r = db.prepare(
-      `INSERT INTO online_orders
-        (uuid, site_id, customer_name, phone, items_json, subtotal_cents, tax_cents, total_cents, status, pickup_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'placed', ?, ?)`
-    ).run(crypto.randomUUID(), SITE_ID, name, phone, JSON.stringify(priced), subtotal, tax, total, pickupAt, createdAt);
-    res.status(201).json(orderView(getOrder(r.lastInsertRowid)));
+    // Phase 1B money audit (concurrency): re-check 86 flags inside a write
+    // transaction — an item 86'd between validation and INSERT must not
+    // land on a placed online order.
+    let orderId;
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      const recheck = db.prepare(
+        `SELECT id, active FROM menu_items WHERE id IN (${placeholders})`
+      ).all(...ids);
+      const activeMap = new Map(recheck.map((r) => [r.id, r.active]));
+      for (const l of priced) {
+        if (activeMap.get(l.menu_item_id) !== 1) {
+          db.exec('ROLLBACK');
+          return res.status(400).json({ error: `“${l.name}” is 86'd right now — please pick something else` });
+        }
+      }
+      const r = db.prepare(
+        `INSERT INTO online_orders
+          (uuid, site_id, customer_name, phone, items_json, subtotal_cents, tax_cents, total_cents, status, pickup_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'placed', ?, ?)`
+      ).run(crypto.randomUUID(), SITE_ID, name, phone, JSON.stringify(priced), subtotal, tax, total, pickupAt, createdAt);
+      orderId = r.lastInsertRowid;
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw e;
+    }
+    res.status(201).json(orderView(getOrder(orderId)));
   });
 
   /* ---- GET /api/online/last?phone= — one-tap reorder (PUBLIC) ---- */
