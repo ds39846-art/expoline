@@ -3,8 +3,9 @@
 Phone-number identification, earn on close (idempotent), redeem as comp.
 """
 import json, sys, urllib.request, urllib.error
+import os
 
-BASE = "http://localhost:4332"
+BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4332"))
 S = "1111"; K = "2222"; M = "2580"
 PHONE = "5550001111"
 

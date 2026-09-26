@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Expoline MVP v0.1 — QA Test 1: full user flow with hand-computed money assertions."""
 import json, sys, urllib.request, urllib.error
+import os
 
-BASE = "http://localhost:4317"
+BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4317"))
 S = "1111"; K = "2222"; M = "2580"
 
 def login(pin):

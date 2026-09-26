@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Expoline QA Test 2: role enforcement. Expect exact 401/403/404/200s."""
 import json, sys, urllib.request, urllib.error
-BASE = "http://localhost:4317"
+import os
+BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4317"))
 def api(method, path, token=None, body=None):
     req = urllib.request.Request(BASE + path, method=method,
         data=json.dumps(body).encode() if body is not None else None,

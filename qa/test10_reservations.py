@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Expoline — QA Test 10: native reservations + waitlist (floor-plan integrated)."""
 import json, sys, urllib.request, urllib.error, urllib.parse
+import os
 from datetime import datetime, timedelta, timezone
 
-BASE = "http://localhost:4322"
+BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4322"))
 S = "1111"; M = "2580"
 
 def login(pin):

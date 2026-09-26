@@ -5,8 +5,9 @@ empty patch), 404s, voided-item rejection, closed-check rejection,
 sent-item manager-PIN gate (403 without/wrong PIN, 200 + audit with PIN),
 totals recompute, kitchen role blocked."""
 import json, sys, urllib.request, urllib.error
+import os
 
-BASE = "http://localhost:4331"
+BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4331"))
 S = "1111"; K = "2222"; M = "2580"
 
 def login(pin):

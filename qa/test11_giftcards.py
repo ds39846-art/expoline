@@ -4,8 +4,9 @@ Covers: issue (code format, validation, roles), balance lookup, redeem
 (full + partial), reload, void (unused ok / used rejected), over-balance
 redeem rejected, double-spend race, gift-card payments in finance."""
 import json, re, sys, threading, urllib.request, urllib.error
+import os
 
-BASE = "http://localhost:4331"
+BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4331"))
 S = "1111"; K = "2222"; M = "2580"
 
 def api(method, path, token=None, body=None, raw=False):

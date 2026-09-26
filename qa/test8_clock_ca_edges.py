@@ -1,7 +1,8 @@
 """CA edge cases: waivers, 13h day, on-time meal, premium stacking (port 4321)."""
 import json, urllib.request, urllib.error, datetime, sqlite3, sys
+import os
 
-BASE = 'http://localhost:4321'
+BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4321"))
 passed, failed = [], []
 def check(name, cond, detail=''):
     (passed if cond else failed).append(name)
