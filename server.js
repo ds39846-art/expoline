@@ -2225,9 +2225,10 @@ app.patch('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
       // Idempotent retry after a dropped response — the edit already applied.
       const cur = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(item.id);
       /* Phase 3A ext: wrap the hotfix's flat itemView in {item, fired} for
-         test21/UI compatibility — hotfix data (itemView, approved_by) kept. */
-      return res.json({ item: itemView(cur), fired: item.state !== 'held',
-        already_applied: true, approved_by: approval.mgr.name, kds_deltas: 0 });
+         test21/UI compatibility — flat fields kept at top level too. */
+      const curFlat = itemView(cur);
+      return res.json(Object.assign({}, curFlat, { item: curFlat, fired: item.state !== 'held',
+        already_applied: true, approved_by: approval.mgr.name, kds_deltas: 0 }));
     }
   }
   const before = { qty: item.qty, modifiers: parseJson(item.modifiers_json, []),
@@ -2295,9 +2296,11 @@ app.patch('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
     } catch { /* deltas_json owned by parity_orders migrate */ }
   }
   /* Phase 3A ext: wrap the hotfix's flat itemView in {item, fired} for
-     test21/UI compatibility — hotfix data (itemView, totals, approved_by,
-     kds_deltas) kept. */
-  res.json(Object.assign({ item: itemView(updated), fired: item.state !== 'held' },
+     test21/UI compatibility — AND keep the flat itemView fields at top level
+     for the item-edit hotfix contract (test17) and older clients. */
+  const flat = itemView(updated);
+  res.json(Object.assign({}, flat,
+    { item: flat, fired: item.state !== 'held' },
     approval ? { approved_by: approval.mgr.name } : {}, { totals: t, kds_deltas: kdsDeltas }));
 });
 /**

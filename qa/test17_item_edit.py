@@ -47,8 +47,13 @@ def open_check(table_id, guests=2):
 menu = api("GET", "/api/menu", ST)
 items = [i for cat in menu for i in cat.get("items", []) if i["price_cents"] > 0]
 ok(len(items) > 0, "menu has priced items")
-ITEM = items[0]
-MODS = [{"name": "Rare", "price_delta_cents": 0}, {"name": "Extra sauce", "price_delta_cents": 150}]
+# Use a menu item with REAL modifier options — the server validates modifiers
+# against the menu (Toast/SpotOn parity); free-form modifiers are rejected.
+ITEM = next((i for i in items if i.get("modifiers")), items[0])
+MODS = [{"name": m["name"], "price_delta_cents": m["price_delta_cents"]}
+        for m in (ITEM.get("modifiers") or [])[:2]]
+ok(len(MODS) > 0, "test item has real modifiers", ITEM["name"])
+MOD_DELTA = sum(m["price_delta_cents"] for m in MODS)
 
 print("== held item: qty edit ==")
 cid = open_check(21)
@@ -63,8 +68,8 @@ ok(tot1 > tot0, "check totals recomputed after edit", f"{tot0} -> {tot1}")
 
 print("== held item: modifier edit ==")
 r = api("PATCH", f"/api/checks/{cid}/items/{iid}", ST, {"modifiers": MODS})
-ok([m["name"] for m in r.get("modifiers", [])] == ["Rare", "Extra sauce"], "modifiers stored")
-ok(r.get("line_total_cents") == ITEM["price_cents"] * 3 + 150 * 3, "line total includes modifier deltas x qty")
+ok([m["name"] for m in r.get("modifiers", [])] == [m["name"] for m in MODS], "modifiers stored")
+ok(r.get("line_total_cents") == ITEM["price_cents"] * 3 + MOD_DELTA * 3, "line total includes modifier deltas x qty")
 
 print("== validation ==")
 expect_status("PATCH", f"/api/checks/{cid}/items/{iid}", ST, {"qty": 0}, 400, "qty 0 rejected")
@@ -102,7 +107,7 @@ expect_status("PATCH", f"/api/checks/{cid}/items/{iid}", ST, {"qty": 1}, 400, "v
 cid3 = open_check(23)
 it3 = api("POST", f"/api/checks/{cid3}/items", ST, {"menu_item_id": ITEM["id"], "qty": 1, "seat": 1})
 api("POST", f"/api/checks/{cid3}/send", ST)
-api("POST", f"/api/checks/{cid3}/payments", ST, {"method": "cash", "amount_cents": 100000})
+api("POST", f"/api/checks/{cid3}/payments", ST, {"method": "cash", "amount_cents": 100000, "tendered_cents": 100000})
 api("POST", f"/api/checks/{cid3}/close", ST)
 expect_status("PATCH", f"/api/checks/{cid3}/items/{it3['id']}", ST, {"qty": 2}, 400, "edit on closed check rejected")
 
