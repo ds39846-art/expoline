@@ -695,8 +695,27 @@ function applyOps(check, ops, idmap) {
   return check;
 }
 
+/* Site money config — the SERVER is the single source of truth (calcTotals);
+   the client only reads it here for display labels and offline estimates. */
+async function siteConfig() {
+  const fallback = { tax_rate: 0.0775, surcharge_pct: 0.05, service_charge_pct: 0.18, service_charge_min_guests: 8 };
+  try {
+    const c = await api('/api/config');
+    const cfg = (c && c.config) || c || {};
+    const num = (v, d) => (typeof v === 'number' && isFinite(v) ? v : d);
+    return {
+      tax_rate: num(cfg.tax_rate, fallback.tax_rate),
+      surcharge_pct: num(cfg.surcharge_pct, fallback.surcharge_pct),
+      service_charge_pct: num(cfg.service_charge_pct, fallback.service_charge_pct),
+      service_charge_min_guests: num(cfg.service_charge_min_guests, fallback.service_charge_min_guests),
+    };
+  } catch (e) { return fallback; }
+}
+const pctLabel = (p) => (Math.round(p * 1000) / 10).toString().replace(/\.0$/, '') + '%';
+
 /* Client-side totals used ONLY while offline (labeled "estimated").
-   Rules mirror the contract: 5% surcharge, 18% service charge on 8+ guests. */
+   Rules mirror the server contract; percentages/threshold come from the
+   cached /api/config (defaults 5% surcharge, 18% service charge on 8+). */
 function estimateTotals(check) {
   const items = (check.items || []).filter((i) => i.state !== 'void');
   let sub = 0;
@@ -706,8 +725,16 @@ function estimateTotals(check) {
     for (const m of (i.modifiers || [])) sub += (m.price_delta_cents || 0) * q;
   }
   const guests = check.guest_count || check.guests || 0;
-  const surcharge = Math.round(sub * 0.05);
-  const service_charge = guests >= 8 ? Math.round(sub * 0.18) : 0;
+  let surPct = 0.05, scPct = 0.18, scMin = 8;
+  try {
+    const c = JSON.parse(localStorage.getItem('expoline.cache:/api/config') || 'null');
+    const cfg = (c && c.config) || c || {};
+    if (typeof cfg.surcharge_pct === 'number' && isFinite(cfg.surcharge_pct)) surPct = cfg.surcharge_pct;
+    if (typeof cfg.service_charge_pct === 'number' && isFinite(cfg.service_charge_pct)) scPct = cfg.service_charge_pct;
+    if (typeof cfg.service_charge_min_guests === 'number' && isFinite(cfg.service_charge_min_guests)) scMin = cfg.service_charge_min_guests;
+  } catch (e) { /* offline fallbacks above */ }
+  const surcharge = Math.round(sub * surPct);
+  const service_charge = scMin > 0 && guests >= scMin ? Math.round(sub * scPct) : 0;
   let rate = null;
   const t = check.totals || {};
   if (t.subtotal > 0) {
@@ -766,6 +793,7 @@ async function renderRoute(soft) {
       if (sub === 'floorplan') return renderFloorPlan(app);
       if (sub === 'timeclock') return renderTimeClock(app);
       if (sub === 'employees') return renderEmployees(app);
+      if (sub === 'settings') return renderSvcChargeSettings(app);
       return renderManager(app);
     }
     app.innerHTML = '<div class="empty">Unknown view.</div>';
@@ -1742,10 +1770,12 @@ async function renderPay(app, checkId) {
   const guests = check.guest_count || check.guests || 0;
   let tipCents = 0, tipPct = 0;
 
+  const sc = await siteConfig();
+
   const moneyRows = [
     ['Subtotal', fmt(t.subtotal)],
-    ['5% surcharge', fmt(t.surcharge)],
-    t.service_charge ? ['18% service charge <span class="lbl-note">8+ guests</span>', fmt(t.service_charge)] : null,
+    [pctLabel(sc.surcharge_pct) + ' surcharge', fmt(t.surcharge)],
+    t.service_charge ? [pctLabel(sc.service_charge_pct) + ' service charge <span class="lbl-note">' + sc.service_charge_min_guests + '+ guests · mandatory — not a tip</span>', fmt(t.service_charge)] : null,
     ['Tax', fmt(t.tax)],
     t.comp ? ['Comp <span class="lbl-note">manager approved</span>', '−' + fmt(t.comp)] : null,
   ].filter(Boolean);
@@ -1763,7 +1793,10 @@ async function renderPay(app, checkId) {
       (check.payments || []).map((p) => '<tr><td>' + esc(paymentLabel(p)) + (p.pending ? ' <span class="pill held">queued</span>' : '') + '</td><td>' + fmt(p.amount_cents) + (p.tip_cents ? ' <span class="muted small">+ ' + fmt(p.tip_cents) + ' tip</span>' : '') + '</td></tr>').join('') : '') +
     '<tr><td>Paid</td><td>' + fmt(t.paid) + '</td></tr>' +
     '<tr class="balance' + (t.balance <= 0 ? ' zero' : '') + '"><td>Balance due</td><td>' + fmt(Math.max(0, t.balance)) + '</td></tr>' +
-    '</table></div>' +
+    '</table>' +
+    (t.service_charge ? '<p class="muted small">The service charge is mandatory restaurant revenue, not a tip — it is never auto-distributed as tips, and it is taxed as part of the sale in CA. Confirm tax treatment with your accountant.</p>' : '') +
+    '<div style="margin-top:10px"><button class="btn" id="print-receipt">🖨 Print receipt</button></div>' +
+    '</div>' +
 
     '<div class="card"><h2>Comp</h2>' +
     '<p class="muted small">Manager approval required — amount or %, a reason, and the manager\'s PIN. The comp is audit-logged.</p>' +
@@ -1775,7 +1808,7 @@ async function renderPay(app, checkId) {
     '<button class="btn btn-block" id="comp-apply">Apply comp</button></div>' +
 
     '<div class="card"><h2>Split check</h2>' +
-    (t.service_charge ? '<p class="small" style="color:var(--red)">Splitting is unavailable — an 18% service charge is applied to this check.</p>'
+    (t.service_charge ? '<p class="small" style="color:var(--red)">Splitting is unavailable — a ' + pctLabel(sc.service_charge_pct) + ' service charge is applied to this check.</p>'
       : '<div class="split-row"><button class="btn" id="split-even">Split evenly</button>' +
         '<button class="btn" id="split-seat">Split by seat</button>' +
         '<button class="btn" id="split-move">Move items</button></div>') +
@@ -1802,6 +1835,8 @@ async function renderPay(app, checkId) {
 
   /* ---- tip ---- */
   const tipLine = $('#tip-line');
+  const prBtn = $('#print-receipt');
+  if (prBtn) prBtn.onclick = () => printReceipt(check, t, view.items || [], sc);
   const drawTip = () => { tipLine.textContent = 'Tip: ' + fmt(tipCents) + (tipPct ? ' (' + tipPct + '%)' : ''); };
   $$('#tip-row .tip-chip').forEach((b) => b.onclick = () => {
     $$('#tip-row .tip-chip').forEach((x) => x.classList.remove('active'));
@@ -2038,6 +2073,54 @@ async function renderPay(app, checkId) {
 }
 
 /* ============================================================
+   Printable guest receipt. The pay/check summary is the live receipt
+   surface; this renders a clean print-only copy with the same numbers:
+   every line item, subtotal, surcharge, the mandatory service charge
+   (labeled as NOT a tip), tax, total, payments/tips, and the
+   accountant disclaimer. Never invents values — all from server totals.
+   ============================================================ */
+function printReceipt(check, t, items, sc) {
+  const rows = (items || []).map((i) => {
+    const q = i.qty || 1, p = i.price_cents || 0;
+    return '<tr><td>' + esc(i.name || 'Item') + (q > 1 ? ' × ' + q : '') + '</td><td class="r">' + fmt(p * q) + '</td></tr>';
+  }).join('');
+  const payRows = (check.payments || []).map((p) => '<tr><td>' + esc(p.method === 'card_demo' ? 'Card' : (p.method || 'Payment')) +
+    (p.brand ? ' · ' + esc(p.brand) : '') + (p.last4 ? ' ••••' + esc(p.last4) : '') +
+    (p.tip_cents ? ' <span class="dim">+ ' + fmt(p.tip_cents) + ' tip</span>' : '') +
+    '</td><td class="r">' + fmt(p.amount_cents || 0) + '</td></tr>').join('');
+  const when = new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+  const html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Receipt — Bali Hai</title>' +
+    '<style>body{font-family:Georgia,serif;max-width:340px;margin:0 auto;padding:16px;color:#111}' +
+    'h1{font-size:20px;text-align:center;margin:4px 0}h2{font-size:14px;text-align:center;font-weight:normal;margin:0 0 12px}' +
+    'table{width:100%;border-collapse:collapse;font-size:13px}td{padding:3px 0;vertical-align:top}' +
+    '.r{text-align:right;white-space:nowrap}.tot td{border-top:1px solid #111;font-weight:bold;font-size:15px}' +
+    '.note{font-size:11px;color:#444;margin:8px 0}.ctr{text-align:center}.dim{color:#555}' +
+    '@media print{body{padding:0}.noprint{display:none}}</style></head><body>' +
+    '<h1>Bali Hai Restaurant</h1><h2>Guest receipt</h2>' +
+    '<p class="ctr dim" style="font-size:12px">' + esc(check.table_label || 'Check') +
+    ' · ' + (check.guest_count || check.guests || 0) + ' guests · ' + esc(when) + '</p>' +
+    '<table>' + rows +
+    '<tr><td>Subtotal</td><td class="r">' + fmt(t.subtotal) + '</td></tr>' +
+    (t.surcharge ? '<tr><td>' + pctLabel(sc.surcharge_pct) + ' surcharge</td><td class="r">' + fmt(t.surcharge) + '</td></tr>' : '') +
+    (t.service_charge ? '<tr><td>' + pctLabel(sc.service_charge_pct) + ' service charge<br><span class="dim">' + sc.service_charge_min_guests + '+ guests · mandatory — NOT a tip</span></td><td class="r">' + fmt(t.service_charge) + '</td></tr>' : '') +
+    '<tr><td>Tax</td><td class="r">' + fmt(t.tax) + '</td></tr>' +
+    (t.comp ? '<tr><td>Comp (manager approved)</td><td class="r">−' + fmt(t.comp) + '</td></tr>' : '') +
+    '<tr class="tot"><td>Total</td><td class="r">' + fmt(t.total) + '</td></tr></table>' +
+    (payRows ? '<table style="margin-top:8px">' + payRows +
+      '<tr><td>Paid</td><td class="r">' + fmt(t.paid) + '</td></tr>' +
+      '<tr><td>Balance due</td><td class="r">' + fmt(Math.max(0, t.balance)) + '</td></tr></table>' : '') +
+    (t.service_charge ? '<p class="note">The service charge is mandatory restaurant revenue, not a tip — it is never auto-distributed as tips, and it is taxed as part of the sale in CA.</p>' : '') +
+    '<p class="note">Tax treatment follows CA CDTFA guidance for mandatory service charges. This receipt is not tax or legal advice — confirm with your accountant.</p>' +
+    '<p class="ctr dim" style="font-size:12px">Thank you — please come again</p>' +
+    '<p class="ctr noprint"><button onclick="window.print()" style="font-size:16px;padding:10px 24px">Print</button></p>' +
+    '<script>window.onload=function(){window.print()}<\/script></body></html>';
+  const w = window.open('', '_blank', 'width=400,height=700');
+  if (!w) { toast('Popup blocked — allow popups to print the receipt', 'err'); return; }
+  w.document.write(html);
+  w.document.close();
+}
+
+/* ============================================================
    VIEW: MANAGER (manager only)
    ============================================================ */
 function mgrGuard(app) {
@@ -2049,7 +2132,8 @@ function mgrNav(active) {
     [['#/manager', 'Overview', active === 'overview'], ['#/manager/finance', 'Finance & Payouts', active === 'finance'],
      ['#/manager/shift', 'Shift report', active === 'shift'], ['#/manager/menu', 'Menu', active === 'menu'],
      ['#/manager/floorplan', 'Floor plan', active === 'floorplan'], ['#/manager/timeclock', 'Time clock', active === 'timeclock'],
-     ['#/manager/employees', 'Employees', active === 'employees']]
+     ['#/manager/employees', 'Employees', active === 'employees'],
+     ['#/manager/settings', 'Settings', active === 'settings']]
       .map(([h, l, a]) => '<a class="tab' + (a ? ' active' : '') + '" href="' + h + '">' + l + '</a>').join('') + '</div>';
 }
 
@@ -2067,6 +2151,81 @@ async function renderManager(app) {
     '<div class="stat"><div class="k">Open checks</div><div class="v amber">' + open + '</div></div>' +
     '<div class="stat"><div class="k">Covers</div><div class="v">' + covers + '</div></div>' +
     '</div><p class="muted small mt">Detailed reconciliation lives under Finance &amp; Payouts — every fee named, no “Other” bucket.</p>';
+}
+
+/* ============================================================
+   VIEW: SETTINGS — service charge (manager)
+   A mandatory service charge is restaurant revenue, NOT a tip: it is never
+   auto-distributed to staff and never appears in tip lines or the Tips
+   report. In California it is part of the taxable sale (CDTFA Publication 22,
+   Jan 2025; Annotation 550.0740). Changes require a live manager PIN and are
+   audit-logged with before/after values. This screen is not tax or legal
+   advice — confirm with your accountant.
+   ============================================================ */
+async function renderSvcChargeSettings(app) {
+  if (!mgrGuard(app)) return;
+  app.innerHTML = '<div class="view-head"><h1>Settings</h1></div>' + mgrNav('settings') +
+    '<div class="card"><h2>Large-party service charge</h2>' +
+    '<p class="muted small">A mandatory service charge is <b>restaurant revenue, not a tip</b> — it is never auto-distributed as tips and never appears in tip lines or the Tips report. In California it is part of the taxable sale (CDTFA Publication 22, Jan 2025; Annotation 550.0740). This screen is not tax or legal advice — <b>confirm with your accountant</b>.</p>' +
+    '<div class="form-grid">' +
+    '<label>Charge %<input type="number" id="sc-pct" min="0" max="50" step="0.1" inputmode="decimal" placeholder="18"></label>' +
+    '<label>Min guests (threshold)<input type="number" id="sc-min" min="0" max="99" step="1" inputmode="numeric" placeholder="8"></label>' +
+    '<label>Manager PIN<input type="password" id="sc-pin" inputmode="numeric" maxlength="8" placeholder="••••" style="max-width:140px"></label>' +
+    '</div>' +
+    '<p class="muted small">The percentage applies to the check subtotal for parties at or above the threshold. Set the threshold to <b>0</b> to disable the charge entirely. Sales tax is computed on subtotal + surcharge + service charge − comps.</p>' +
+    '<button class="btn btn-primary" id="sc-save">Save changes</button></div>' +
+    '<div class="card mt"><h3>Change history</h3><p class="muted small">Every change is audit-logged with before/after values.</p>' +
+    '<div class="t-scroll"><table class="t-table" id="sc-audit">' +
+    '<thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Detail</th></tr></thead>' +
+    '<tbody><tr><td colspan="4" class="muted">Loading…</td></tr></tbody></table></div></div>';
+
+  const summarize = (r) => {
+    try {
+      const b = JSON.parse(r.before_json || '{}'), a = JSON.parse(r.after_json || '{}');
+      const bits = [];
+      if (a.service_charge_pct !== undefined && a.service_charge_pct !== b.service_charge_pct)
+        bits.push('charge ' + pctLabel(b.service_charge_pct || 0) + ' → ' + pctLabel(a.service_charge_pct));
+      if (a.service_charge_min_guests !== undefined && a.service_charge_min_guests !== b.service_charge_min_guests)
+        bits.push('threshold ' + (b.service_charge_min_guests ?? '?') + ' → ' + (a.service_charge_min_guests ?? '?'));
+      return (bits.length ? bits.join('; ') : 'no value change') +
+        (a.approver && a.approver !== r.actor ? ' (PIN by ' + a.approver + ')' : '');
+    } catch (e) { return ''; }
+  };
+
+  const load = async () => {
+    try {
+      const cfg = await api('/api/admin/service-charge/config');
+      $('#sc-pct').value = (cfg.current.service_charge_pct * 100).toString();
+      $('#sc-min').value = String(cfg.current.service_charge_min_guests);
+    } catch (e) { if (handleApiError(e) === 'bounced') return; }
+    let rows = [];
+    try { rows = await api('/api/admin/service-charge/audit?limit=60'); } catch (e) { rows = []; }
+    $('#sc-audit tbody', app).innerHTML = rows.length ? rows.map((r) =>
+      '<tr><td class="small">' + esc(fmtDateTime(r.created_at)) + '</td>' +
+      '<td>' + esc(r.actor || '—') + '</td>' +
+      '<td><span class="pill staged">' + esc(r.action) + '</span></td>' +
+      '<td class="small">' + esc(summarize(r)) + '</td></tr>'
+    ).join('') : '<tr><td colspan="4" class="muted">No changes yet.</td></tr>';
+  };
+
+  $('#sc-save').onclick = async () => {
+    const pct = parseFloat($('#sc-pct').value);
+    const min = parseInt($('#sc-min').value, 10);
+    const pin = $('#sc-pin').value;
+    if (!pin) { toast('Enter your manager PIN to save', 'err'); return; }
+    const saves = [];
+    if (isFinite(pct)) saves.push(['service_charge_pct', pct / 100]);
+    if (Number.isInteger(min)) saves.push(['service_charge_min_guests', min]);
+    if (!saves.length) { toast('Enter a charge % and/or a threshold', 'err'); return; }
+    try {
+      for (const [key, value] of saves)
+        await api('/api/admin/service-charge/config', 'PUT', { key, value, manager_pin: pin });
+      $('#sc-pin').value = '';
+      toast('Service charge updated', 'ok');
+      await load();
+    } catch (e) { handleApiError(e); }
+  };
+  await load();
 }
 
 /* ============================================================
@@ -2639,8 +2798,10 @@ function financeHtml(r, date) {
     '<tr class="result"><td>= Expected payout</td><td class="num">' + fmt(expected) + '</td></tr>' +
     '</table>' +
     '<table class="fin-table" style="margin-top:14px"><tr><td>Tips (collected separately)</td><td class="num pos">' + fmt(tips) + '</td></tr>' +
+    '<tr><td>Service charge <span class="lbl-note">informational — inside card volume, not a tip</span></td><td class="num">' + fmt(p.service_charge_cents ?? 0) + '</td></tr>' +
     '<tr><td>Labor cost (time clock)' + laborDetail + '</td><td class="num">' + fmt(laborCents) + '</td></tr></table>' +
-    '<p class="tips-note">Tips are paid out to staff and are not taxed — they never reduce the payout above.</p></div>' +
+    '<p class="tips-note">Tips are paid out to staff and are not taxed — they never reduce the payout above.</p>' +
+    (p.service_charge_cents ? '<p class="muted small">The mandatory service charge is restaurant revenue, already included in card volume — it is never paid out as a tip or wage. Confirm tax treatment with your accountant.</p>' : '') + '</div>' +
     '<p class="muted small">Every fee is itemized by name. There is no “Other” bucket — if a fee exists, it is listed.</p>' +
     reportsExportHtml();
 }

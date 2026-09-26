@@ -13,6 +13,7 @@ def api(method, path, token=None, body=None):
         return (e.code, json.loads(e.read().decode() or "{}"))
 def tok(pin): return api("POST","/api/auth/login",None,{"pin":pin})[1]["token"]
 ST, KT, MT = tok("1111"), tok("2222"), tok("2580")
+TODAY = api("GET","/api/config",MT)[1]["site_date"]  # date-agnostic: no hardcoded finance date
 checks, fails = 0, []
 def want(got, want_code, name):
     global checks
@@ -26,7 +27,7 @@ def want(got, want_code, name):
 kids = api("GET","/api/kds/tickets",KT)[1]
 tid = kids[0]["id"] if kids else 999999
 # need a payment id for refund tests: get from payouts
-pays = api("GET","/api/finance/payouts?date=2026-09-25",MT)[1]
+pays = api("GET",f"/api/finance/payouts?date={TODAY}",MT)[1]
 pid = pays["card_payments"][0]["id"] if pays["card_payments"] else 999999
 
 print("-- no token --")
@@ -71,14 +72,14 @@ c5 = api("GET","/api/checks/open",MT)[1]
 chk = [c for c in c5 if c["table_id"]==5][0]
 it = api("POST",f"/api/checks/{chk['id']}/items",MT,{"menu_item_id":90,"seat":1,"qty":1,"modifiers":[]})[1]  # Soda 400
 pay = api("POST",f"/api/checks/{chk['id']}/payments",MT,{"method":"card_demo","amount_cents":453,"brand":"Visa","last4":"4242"})[1]
-before = api("GET","/api/finance/payouts?date=2026-09-25",MT)[1]
+before = api("GET",f"/api/finance/payouts?date={TODAY}",MT)[1]
 rf = api("POST",f"/api/payments/{pay['payment']['id']}/refund",MT,{"amount_cents":453})
 want(rf, 200, "manager refund 200")
 ok = rf[1]["payment"]["status"]=="refunded" and rf[1]["payment"]["refunded_cents"]==453
 checks += 1
 print(f"  {'✓' if ok else '✗'} refund status/refunded_cents"); 
 if not ok: fails.append("FAIL manager refund fields")
-after = api("GET","/api/finance/payouts?date=2026-09-25",MT)[1]
+after = api("GET",f"/api/finance/payouts?date={TODAY}",MT)[1]
 delta_ref = after["refunds_cents"]-before["refunds_cents"]
 delta_exp = after["expected_payout_cents"]-before["expected_payout_cents"]
 fee = round(0*0.026)+15  # net 0 after full refund -> fee 0; fee before = round(453*0.026)+15=27

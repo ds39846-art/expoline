@@ -10,11 +10,23 @@
  *   line total     : qty * unit_price_cents + qty * Σ modifier price_delta_cents
  *   subtotal       : Σ lines
  *   surcharge      : round(subtotal * surcharge_pct)    (5% on every check)
- *   service charge : guest_count >= 8 ? round(subtotal * 18%) : 0
- *   taxable        : subtotal + surcharge
- *     - tips are NEVER taxed
- *     - the 18% service charge is NOT taxed in this demo (documented; some
- *       jurisdictions tax it — revisit before real pilot billing)
+ *   service charge : guest_count >= min_guests ? round(subtotal * pct) : 0
+ *     (defaults 18% on 8+ guests; configurable per site in site_config —
+ *      manager-editable via PUT /api/admin/service-charge/config, with live
+ *      manager PIN verification + audit log)
+ *   A MANDATORY service charge is restaurant revenue, NOT a tip. It is never
+ *   auto-distributed to staff and never appears in tip lines or the Tips
+ *   report; the house distributes (or keeps) it per its own policy. In
+ *   California it is part of the taxable sale (see below). The manager UI
+ *   and every report carry a "confirm with your accountant" note — Expoline
+ *   is not giving tax or legal advice.
+ *   taxable        : subtotal + surcharge + service_charge - comps
+ *     - tips are NEVER taxed (only voluntary tips retained by employees are
+ *       nontaxable — CA CDTFA Publication 22, Dining and Beverage Industry,
+ *       Jan 2025)
+ *     - the mandatory service charge IS taxed: mandatory charges are included
+ *       in taxable gross receipts (CDTFA Pub 22 §"Tips, gratuities, and
+ *       service charges"; Sales and Use Tax Annotation 550.0740)
  *   tax            : round(taxable * tax_rate)          (7.75% from site_config)
  *   total          : subtotal + surcharge + service_charge + tax
  *   balance        : total - Σ(amount_cents - refunded_cents) over all payments
@@ -161,6 +173,22 @@ db.exec('PRAGMA busy_timeout=5000;');
     created_at TEXT
   )`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_clock_shifts_user ON clock_shifts(site_id, user_id, clock_out)`);
+})();
+
+/* Service charge config audit (phase 4). The 18%-on-8+ default is just
+   site_config data; every change is manager-editable (PIN-verified) and
+   lands here with before/after values. Runs on every boot. */
+(() => {
+  db.exec(`CREATE TABLE IF NOT EXISTS service_charge_audit (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    actor TEXT,
+    action TEXT,
+    before_json TEXT,
+    after_json TEXT,
+    details TEXT,
+    created_at TEXT
+  )`);
 })();
 
 /* Employee records + manager approvals (phase 2). Runs on every boot.
@@ -511,11 +539,13 @@ function calcTotals(checkId) {
   const check = db.prepare('SELECT guest_count, COALESCE(comp_cents, 0) AS comp_cents FROM checks WHERE id = ?').get(checkId);
   const guests = check ? (check.guest_count || 0) : 0;
   const comp = check ? (check.comp_cents || 0) : 0;
-  const serviceCharge = guests >= cfg.service_charge_min_guests
+  const serviceCharge = (cfg.service_charge_min_guests > 0 && guests >= cfg.service_charge_min_guests)
     ? Math.round(subtotal * cfg.service_charge_pct) : 0;
-  // Taxable base: subtotal + surcharge. Tips NEVER taxed; service charge not taxed (demo).
-  // Manager-approved comps reduce the amount owed (never below zero).
-  const taxable = subtotal + surcharge;
+  // Taxable base (California): subtotal + surcharge + mandatory service charge.
+  // Tips are NEVER taxed. Mandatory service charges ARE taxed — they are
+  // part of the taxable sale (CDTFA Publication 22, Jan 2025; Annotation
+  // 550.0740). Manager-approved comps reduce the amount owed (never below zero).
+  const taxable = subtotal + surcharge + serviceCharge;
   const tax = Math.round(taxable * cfg.tax_rate);
   const total = Math.max(0, subtotal + surcharge + serviceCharge + tax - comp);
   const pay = db.prepare(
@@ -610,6 +640,12 @@ function canonStation(s) {
   return KDS_STATION_SLUGS.includes(slug) ? slug : null;
 }
 
+/* KDS tickets intentionally carry NO financial fields (no subtotal, tax,
+ * tip, surcharge, or service charge). The kitchen display is a production
+ * view: stations see items to make, never money. A service-charge line here
+ * would be the first financial figure on KDS and could be misread as an
+ * item or a tip — so it is deliberately absent. Financial breakdowns live
+ * on the pay/check summary, the printed receipt, and Finance reports. */
 function ticketView(row) {
   return {
     id: row.id,
@@ -1734,10 +1770,11 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot split a ${check.status} check` });
 
-  // 8+ parties carry a service charge and must stay on ONE check.
+  // Large parties carry a service charge and must stay on ONE check.
   const totals = persistTotals(check.id);
   if (totals.service_charge > 0) {
-    return res.status(400).json({ error: 'Cannot split: this check has an 18% large-party service charge and must stay on a single check' });
+    const pctLabel = Math.round(getConfig().service_charge_pct * 1000) / 10;
+    return res.status(400).json({ error: `Cannot split: this check has a ${pctLabel}% large-party service charge and must stay on a single check` });
   }
   const payCount = db.prepare('SELECT COUNT(*) AS n FROM payments WHERE check_id = ?').get(check.id).n;
   if (payCount > 0) {
@@ -2088,6 +2125,10 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
   // Time-clock labor for the same sales date, so Finance shows the full
   // picture (premiums are wages and belong in labor cost).
   const labor = dayLabor(date).summary;
+  // Service charge is informational only: it is restaurant revenue already
+  // inside card volume above. Attributed from checks closed on the sales
+  // date (same bucketing as the sales report). Never a tip, never wages.
+  const serviceCharge = serviceChargeOn(date);
   res.json({
     demo: true,
     note: DEMO_FINANCE_NOTE,
@@ -2099,6 +2140,8 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
     stripe_fees_cents: fees,
     stripe_fee_label: 'DEMO (simulated)',
     expected_payout_cents: expectedPayout,
+    service_charge_cents: serviceCharge,
+    service_charge_note: 'Informational only — the mandatory service charge is restaurant revenue already included in card volume above. It is never paid out as a tip or wage. Confirm tax treatment with your accountant.',
     cash_sales_cents: cashSales,
     tips_cents: tips,
     card_payments: cardPayments,
@@ -2120,12 +2163,13 @@ app.get('/api/finance/shift', managerOnly(), (req, res) => {
   if (serverId != null) { sql += ' AND server_id = ?'; params.push(serverId); }
   const checks = db.prepare(sql).all(...params).filter((c) => tzDate(c.closed_at) === date);
 
-  let subtotal = 0, tips = 0, cashSales = 0, cardTips = 0;
+  let subtotal = 0, tips = 0, cashSales = 0, cardTips = 0, serviceCharge = 0;
   const brandBreakdown = {};
   const payStmt = db.prepare('SELECT * FROM payments WHERE check_id = ?');
   for (const c of checks) {
     const t = persistTotals(c.id);
     subtotal += t.subtotal;
+    serviceCharge += t.service_charge;
     for (const p of payStmt.all(c.id)) {
       tips += p.tip_cents || 0;
       if (p.method === 'card_demo' && (p.status === 'completed' || p.status === 'partial_refund')) {
@@ -2146,6 +2190,8 @@ app.get('/api/finance/shift', managerOnly(), (req, res) => {
     server_id: serverId,
     checks_closed: checks.length,
     subtotal_cents: subtotal,
+    service_charge_cents: serviceCharge,
+    service_charge_note: 'Mandatory service charge is restaurant revenue, not a tip — it stays with the house and is taxed as part of the sale in CA. Confirm with your accountant.',
     tips_cents: tips,
     card_brand_breakdown: brandBreakdown,
     cash_sales_cents: cashSales,
@@ -2214,8 +2260,21 @@ function payoutDay(date) {
     sales_date: date, payout_date: addDays(date, cfg.payout_lag_days),
     card_volume_cents: cardVolume, refunds_cents: refunds,
     stripe_fees_cents: fees, expected_payout_cents: cardVolume - refunds - fees,
+    // Informational only: restaurant revenue already inside card volume,
+    // attributed from checks closed on the sales date. Never a tip/wage.
+    service_charge_cents: serviceChargeOn(date),
     cash_sales_cents: cashSales, tips_cents: tips,
   };
+}
+
+/** Service charge (cents) on checks closed on a sales date — shared by the
+ *  payouts endpoint and the payouts report. Informational only. */
+function serviceChargeOn(date) {
+  let s = 0;
+  for (const c of db.prepare("SELECT id, closed_at FROM checks WHERE site_id = ? AND status IN ('paid','closed') AND closed_at IS NOT NULL").all(SITE_ID)) {
+    if (tzDate(c.closed_at) === date) s += persistTotals(c.id).service_charge || 0;
+  }
+  return s;
 }
 
 function eachDate(from, to) {
@@ -2264,7 +2323,9 @@ function seventhDayRows(weekStart) {
 const REPORT_DEFS = {
   sales: {
     title: 'Sales summary',
-    notes: ['Net sales = gross + surcharge + service charge − comps.', 'Tips are not sales and are not taxed.'],
+    notes: ['Net sales = gross + surcharge + service charge − comps.', 'Tips are not sales and are not taxed.',
+      'The mandatory service charge is restaurant revenue (NOT a tip): it is never auto-distributed to staff and never appears in tip lines or the Tips report.',
+      'Tax treatment follows CA CDTFA guidance for mandatory service charges (Publication 22, Jan 2025; Annotation 550.0740). Expoline is not giving tax advice — confirm with your accountant.'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'checks', label: 'Checks', kind: 'int' },
@@ -2310,7 +2371,7 @@ const REPORT_DEFS = {
   },
   payouts: {
     title: 'Payout reconciliation',
-    notes: ['Expected payout = card volume − refunds − Stripe fees (DEMO rate: 2.6% + 15¢ per card payment).', 'Sales date and payout date are distinct — payouts land ' + getConfig().payout_lag_days + ' days after the sales date.', 'Tips are collected separately and never reduce the payout.'],
+    notes: ['Expected payout = card volume − refunds − Stripe fees (DEMO rate: 2.6% + 15¢ per card payment).', 'Sales date and payout date are distinct — payouts land ' + getConfig().payout_lag_days + ' days after the sales date.', 'Tips are collected separately and never reduce the payout.', 'Service charge is restaurant revenue, not a tip: it stays inside card volume and the payout, and is never paid out as a tip or wage. The Service charge column is informational only — it is already inside card volume.'],
     columns: [
       { key: 'sales_date', label: 'Sales date', kind: 'date' },
       { key: 'payout_date', label: 'Payout date', kind: 'date' },
@@ -2318,8 +2379,9 @@ const REPORT_DEFS = {
       { key: 'refunds_cents', label: 'Refunds', kind: 'money' },
       { key: 'stripe_fees_cents', label: 'Stripe fees (DEMO)', kind: 'money' },
       { key: 'expected_payout_cents', label: 'Expected payout', kind: 'money' },
+      { key: 'service_charge_cents', label: 'Service charge (info)', kind: 'money' },
     ],
-    totalKeys: ['card_volume_cents', 'refunds_cents', 'stripe_fees_cents', 'expected_payout_cents'],
+    totalKeys: ['card_volume_cents', 'refunds_cents', 'stripe_fees_cents', 'expected_payout_cents', 'service_charge_cents'],
     build(from, to) {
       const rows = eachDate(from, to).map((d) => payoutDay(d));
       return { rows, extraTables: [] };
@@ -2327,7 +2389,8 @@ const REPORT_DEFS = {
   },
   tax: {
     title: 'Sales tax',
-    notes: ['Taxable sales = gross + surcharge + service charge − comps. Tips are not taxed and are shown only for completeness.'],
+    notes: ['Taxable sales = gross + surcharge + service charge − comps. Tips are not taxed and are shown only for completeness.',
+      'Mandatory service charges are included in taxable gross receipts in CA (CDTFA Publication 22, Jan 2025; Annotation 550.0740). Confirm with your accountant.'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'checks', label: 'Checks', kind: 'int' },
@@ -2359,7 +2422,8 @@ const REPORT_DEFS = {
   },
   labor: {
     title: 'Labor',
-    notes: ['Regular, daily overtime (1.5× after 8h, 2× after 12h), and CA break premiums come from the time clock.', 'Weekly overtime (hours beyond 40/week at 1.5×) and seventh-consecutive-day premiums (first 8h at 1.5×, beyond 8h at 2×) are listed separately by workweek and included in the combined total.'],
+    notes: ['Regular, daily overtime (1.5× after 8h, 2× after 12h), and CA break premiums come from the time clock.', 'Weekly overtime (hours beyond 40/week at 1.5×) and seventh-consecutive-day premiums (first 8h at 1.5×, beyond 8h at 2×) are listed separately by workweek and included in the combined total.',
+      'Service charges are house revenue, not wages or tips — they never appear in this report unless the house separately distributes them under house policy (distribution is not automatic).'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'employee_number', label: '#', kind: 'text' },
@@ -2427,7 +2491,8 @@ const REPORT_DEFS = {
   },
   tips: {
     title: 'Tips',
-    notes: ['Tips are not sales and are not taxed. Cash tips are kept by the server directly; card tips are paid out by the house at checkout.'],
+    notes: ['Tips are not sales and are not taxed. Cash tips are kept by the server directly; card tips are paid out by the house at checkout.',
+      'The mandatory service charge is NOT a tip and never appears here — it is restaurant revenue, never auto-distributed as tips; any distribution to staff follows house policy, not this report.'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'server_name', label: 'Server', kind: 'text' },
@@ -2502,6 +2567,12 @@ function buildCsv(def, data) {
     lines.push(csvCell({ kind: 'text' }, t.title));
     table(t.columns, t.rows, t.totals);
   }
+  if ((def.notes && def.notes.length) || data.combinedNote) {
+    lines.push('');
+    lines.push(csvCell({ kind: 'text' }, 'Notes'));
+    for (const n of (def.notes || [])) lines.push(csvCell({ kind: 'text' }, n));
+    if (data.combinedNote) lines.push(csvCell({ kind: 'text' }, data.combinedNote));
+  }
   return lines.join('\r\n') + '\r\n';
 }
 
@@ -2549,7 +2620,7 @@ async function buildXlsx(title, periodLabel, def, data) {
     const w2 = wb.addWorksheet(t.title.slice(0, 31));
     addTable(w2, t.columns, t.rows, t.totals, 1);
   }
-  if (data.combinedNote) {
+  if ((def.notes && def.notes.length) || data.combinedNote) {
     const wn = wb.addWorksheet('Notes');
     wn.getCell('A1').value = title; wn.getCell('A1').font = { bold: true, size: 14 };
     (def.notes || []).forEach((n, i) => { wn.getCell('A' + (3 + i)).value = n; });
@@ -3382,6 +3453,80 @@ app.put('/api/admin/clock/users/:id/rate', managerOnly(), (req, res) => {
 app.get('/api/admin/clock/audit', managerOnly(), (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit || '100', 10) || 100, 1), 500);
   res.json(db.prepare('SELECT id, actor, action, shift_id, details, created_at FROM clock_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
+});
+
+/* ---------------- service charge settings (phase 4) -----------------------
+ * The mandatory service charge (default 18% on parties of 8+) is site_config
+ * data, editable per site by a manager. Server-side enforcement: every
+ * check recomputes via calcTotals() from live config — clients can estimate
+ * but never set the charge. A mandatory service charge is restaurant
+ * revenue, NOT a tip: never auto-distributed to staff, never in tip lines or
+ * the Tips report. In CA it is part of the taxable sale (CDTFA Publication
+ * 22, Jan 2025; Annotation 550.0740). UI + report notes carry a "confirm with
+ * your accountant" disclaimer — Expoline is not giving tax advice.
+ */
+const SVC_CHARGE_DEFAULTS = { service_charge_pct: 0.18, service_charge_min_guests: 8 };
+
+function auditSvcCharge(req, action, before, after) {
+  db.prepare('INSERT INTO service_charge_audit (site_id, actor, action, before_json, after_json, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(SITE_ID, req.user ? req.user.name : '?', action, JSON.stringify(before ?? null),
+      JSON.stringify(after ?? null), JSON.stringify({ approver: (after && after.approver) || (req.user ? req.user.name : '?') }), nowIso());
+}
+
+function svcChargeCurrent() {
+  const cfg = getConfig();
+  return { service_charge_pct: cfg.service_charge_pct, service_charge_min_guests: cfg.service_charge_min_guests };
+}
+
+/** GET /api/admin/service-charge/config — current charge config + defaults. */
+app.get('/api/admin/service-charge/config', managerOnly(), (req, res) => {
+  const current = svcChargeCurrent();
+  res.json({
+    defaults: SVC_CHARGE_DEFAULTS,
+    current,
+    disabled: current.service_charge_min_guests === 0,
+    note: 'A mandatory service charge is restaurant revenue, not a tip. In CA it is part of the taxable sale (CDTFA Pub 22, Jan 2025). Confirm with your accountant.',
+  });
+});
+
+/** GET /api/admin/service-charge/audit?limit= — who changed the config, when. */
+app.get('/api/admin/service-charge/audit', managerOnly(), (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '100', 10) || 100, 1), 500);
+  res.json(db.prepare('SELECT id, actor, action, before_json, after_json, details, created_at FROM service_charge_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
+});
+
+/** PUT /api/admin/service-charge/config {key, value, manager_pin}
+ *  Change the charge percentage or guest threshold. Requires a manager
+ *  session AND a live manager PIN (point-of-action approval, like comps).
+ *  Every change is audit-logged with before/after values. */
+app.put('/api/admin/service-charge/config', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const { key, value } = b;
+  if (!['service_charge_pct', 'service_charge_min_guests'].includes(key)) {
+    return res.status(400).json({ error: 'key must be service_charge_pct or service_charge_min_guests' });
+  }
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) return res.status(403).json({ error: 'Manager PIN required to change the service charge' });
+  const before = { ...svcChargeCurrent(), changed_by: req.user ? req.user.name : '?', approver: mgr.name };
+  let next;
+  if (key === 'service_charge_pct') {
+    const n = parseFloat(value);
+    if (!Number.isFinite(n) || n < 0 || n > 0.5) {
+      return res.status(400).json({ error: 'service_charge_pct must be between 0 and 0.5 (0–50%)' });
+    }
+    next = n;
+  } else {
+    const n = value;
+    if (!Number.isInteger(n) || n < 0 || n > 99) {
+      return res.status(400).json({ error: 'service_charge_min_guests must be a whole number 0–99 (0 disables the charge)' });
+    }
+    next = n;
+  }
+  db.prepare('INSERT INTO site_config (site_id, key, value) VALUES (?, ?, ?) ON CONFLICT(site_id, key) DO UPDATE SET value = excluded.value')
+    .run(SITE_ID, key, String(next));
+  const after = { ...svcChargeCurrent(), changed_by: req.user ? req.user.name : '?', approver: mgr.name };
+  auditSvcCharge(req, 'config_change', before, after);
+  res.json({ key, value: next, current: svcChargeCurrent() });
 });
 
 /* ------------------------- employee records (phase 2) ------------------------ */

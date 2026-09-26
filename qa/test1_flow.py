@@ -36,12 +36,14 @@ def expect_status(method, path, token, body, want, name):
     ok(st == want, name, f"(got {st} {txt[:120]})")
     return st, txt
 
-# Money math helpers (mirror of the documented business rules — hand computed)
+# Money math helpers (mirror of the documented business rules — hand computed).
+# CA: the mandatory service charge IS part of the taxable sale (CDTFA Pub 22,
+# Jan 2025; Annotation 550.0740), so tax = round((sub + sur + svc) * 0.0775).
 def line(qty, unit, mods=()): return qty*unit + qty*sum(mods)
 def totals(sub, guests):
     sur = round(sub*0.05)
     svc = round(sub*0.18) if guests >= 8 else 0
-    tax = round((sub+sur)*0.0775)
+    tax = round((sub+sur+svc)*0.0775)
     return {"subtotal":sub,"surcharge":sur,"service_charge":svc,"tax":tax,"total":sub+sur+svc+tax}
 def assert_totals(check, exp, name, guests=0):
     ok(check["subtotal_cents"]==exp["subtotal"], name+" subtotal", f"got {check['subtotal_cents']} want {exp['subtotal']}")
@@ -155,7 +157,7 @@ ok(expMT["total"]+expMS["total"]==expC["total"], "move totals sum to original")
 print("== Test 1e: 8-top — service charge appears; split rejected ==")
 c8 = api("POST","/api/checks",ST,{"table_id":4,"guest_count":8,"tab_name":"QA 8-top"})
 api("POST", f"/api/checks/{c8['id']}/items", ST, {"menu_item_id":71,"seat":1,"qty":2,"modifiers":[]})  # Lava Slide 2x1400
-exp8 = totals(2800, 8)  # 2800+140+504+228 = 3672
+exp8 = totals(2800, 8)  # 2800+140+504+267 = 3711 (tax on sub+sur+svc per CDTFA)
 c8g = api("GET", f"/api/checks/{c8['id']}", ST)
 assert_totals(c8g, exp8, "8-top check")
 ok(c8g["service_charge_cents"]==504, "18% service charge present on 8-top")
@@ -201,9 +203,9 @@ ok(p["demo"]["approved"] is True, "move-target card approved")
 ok(p["payment"]["auth_code"].startswith("DEMO"), "payment row auth_code")
 move_target_pay_id = p["payment"]["id"]
 api("POST", f"/api/checks/{ncid}/close", ST)
-# 8-top card: 3672, tip 0
+# 8-top card: 3711, tip 0
 p = api("POST", f"/api/checks/{c8['id']}/payments", ST,
-        {"method":"card_demo","amount_cents":3672,"brand":"Visa","last4":"4242"})
+        {"method":"card_demo","amount_cents":3711,"brand":"Visa","last4":"4242"})
 api("POST", f"/api/checks/{c8['id']}/close", ST)
 print("MOVE_TARGET_CHECK=", ncid, " MOVE_TARGET_PAY=", move_target_pay_id)
 

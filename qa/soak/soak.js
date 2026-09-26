@@ -124,7 +124,7 @@ async function verifyCheckMath(checkId) {
   const sub = items.reduce((s, i) => s + i.qty * i.unit_price_cents, 0);
   const sur = Math.round(sub * 0.05);
   const sc = (data.guest_count || 0) >= 8 ? Math.round(sub * 0.18) : 0;
-  const tax = Math.round((sub + sur) * 0.0775);
+  const tax = Math.round((sub + sur + sc) * 0.0775); // CA: mandatory service charge is part of the taxable sale (CDTFA Pub 22)
   const total = sub + sur + sc + tax;
   metrics.invariant_checks += 5;
   if (t.subtotal !== sub) critical(`check ${checkId}: subtotal ${t.subtotal} != ${sub}`);

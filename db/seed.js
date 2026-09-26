@@ -260,10 +260,18 @@ const money = (subtotal, guests) => {
   const tax = Math.round((subtotal + sur + sc) * 0.0775);
   return { sc, sur, tax, total: subtotal + sur + sc + tax };
 };
-// Note: site formula is tax on (subtotal + surcharge); service-charge handling
-// for 8+ parties is included above for completeness.
+// Money formula mirrors server calcTotals: tax on (subtotal + surcharge +
+// mandatory service charge), because CA includes mandatory service charges
+// in taxable gross receipts (CDTFA Pub 22, Jan 2025; Annotation 550.0740).
 
-const Y = '2026-09-24'; // yesterday
+const Y = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' })
+  .format(new Date(Date.now() - 864e5)); // demo "yesterday", site-local — recomputed at seed time so fixtures never rot
+const LA_OFF = (() => { // site UTC offset on Y (PDT -07:00 / PST -08:00), so seeded timestamps bucket on Y
+  const tzName = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', timeZoneName: 'shortOffset' })
+    .formatToParts(new Date(Y + 'T12:00:00Z')).find((p) => p.type === 'timeZoneName').value;
+  const m = /GMT([+-])(\d+)/.exec(tzName) || [];
+  return (m[1] === '-' ? '-' : '+') + String(m[2] || '7').padStart(2, '0') + ':00';
+})();
 let authSeq = 483920;
 const auth = () => String(authSeq++);
 
@@ -272,13 +280,13 @@ function seedClosedCheck({ tableZone, tableLabel, guests, opened, closed, lines,
   const checkId = q.check.run(
     SITE, tid[tableZone + '|' + tableLabel], uid.server, null, guests, 'closed',
     sc, sur, tax, lines.reduce((s, l) => s + l.qty * itemPrice(l.name), 0), total,
-    Y + 'T' + opened + '-07:00', Y + 'T' + closed + '-07:00'
+    Y + 'T' + opened + LA_OFF, Y + 'T' + closed + LA_OFF
   ).lastInsertRowid;
 
   const tickets = {}; // station -> items[]
   lines.forEach((l, i) => {
     const mi = db.prepare('SELECT id, course, station FROM menu_items WHERE id = ?').get(itemId[l.name]);
-    const sentAt = Y + 'T' + opened + '-07:00';
+    const sentAt = Y + 'T' + opened + LA_OFF;
     q.checkItem.run(checkId, mi.id, l.seat, l.qty, itemPrice(l.name),
       JSON.stringify(l.mods || []), mi.course, 'fulfilled', sentAt, sentAt);
     (tickets[mi.station] = tickets[mi.station] || []).push({
@@ -286,7 +294,7 @@ function seedClosedCheck({ tableZone, tableLabel, guests, opened, closed, lines,
     });
   });
 
-  const created = Y + 'T' + closed + '-07:00';
+  const created = Y + 'T' + closed + LA_OFF;
   if (pay.refunded) {
     // double-charge corrected: first payment fully refunded, second completes the check
     q.payment.run(checkId, SITE, 'card_demo', total, 0, total, pay.refunded.brand, pay.refunded.last4, auth(), 'refunded', total, created);
@@ -298,7 +306,7 @@ function seedClosedCheck({ tableZone, tableLabel, guests, opened, closed, lines,
   const bumpedBy = 'Expo Kitchen';
   for (const [station, items] of Object.entries(tickets)) {
     q.kds.run(checkId, SITE, station, tableLabel, 'Daniel S', JSON.stringify(items), 'fulfilled',
-      Y + 'T' + opened + '-07:00', Y + 'T' + closed + '-07:00', bumpedBy);
+      Y + 'T' + opened + LA_OFF, Y + 'T' + closed + LA_OFF, bumpedBy);
   }
   return { checkId, total, tax, sur, sc };
 }
