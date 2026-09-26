@@ -1,0 +1,5 @@
+# Runtime site databases — each restaurant gets its own DB file.
+# Never commit live/demo data.
+db/sites/
+*.db-wal
+*.db-shm

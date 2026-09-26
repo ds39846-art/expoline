@@ -40,22 +40,30 @@ const { WebSocketServer } = require('ws');
 /* ------------------------------ boot: seed -------------------------------- */
 const ROOT = __dirname;
 const DB_DIR = path.join(ROOT, 'db');
-const DB_PATH = process.env.EXPOLINE_DB || path.join(DB_DIR, 'expoline.db');
+const SITES_DIR = path.join(DB_DIR, 'sites');
+// Multi-site isolation: each restaurant gets its own DB file so one site's
+// corruption/config/network failure cannot affect another.
+// EXPOLINE_SITE selects the site slug (default 'bali-hai').
+// EXPOLINE_DB overrides the path entirely (used by QA).
+const SITE_SLUG = process.env.EXPOLINE_SITE || 'bali-hai';
+const DB_PATH = process.env.EXPOLINE_DB
+  || path.join(SITES_DIR, `${SITE_SLUG}.db`);
 const PUBLIC_DIR = path.join(ROOT, 'public');
 
 fs.mkdirSync(DB_DIR, { recursive: true });
+fs.mkdirSync(SITES_DIR, { recursive: true });
 fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
 if (!fs.existsSync(DB_PATH)) {
   const seedJs = path.join(DB_DIR, 'seed.js');
   if (!fs.existsSync(seedJs)) {
-    console.error('FATAL: db/expoline.db is missing and db/seed.js was not found. Cannot boot.');
+    console.error(`FATAL: ${DB_PATH} is missing and db/seed.js was not found. Cannot boot.`);
     process.exit(1);
   }
-  console.log('[expoline] db/expoline.db not found — running db/seed.js …');
+  console.log(`[expoline] ${DB_PATH} not found — running db/seed.js …`);
   execFileSync(process.execPath, [seedJs], { stdio: 'inherit', cwd: ROOT });
   if (!fs.existsSync(DB_PATH)) {
-    console.error('FATAL: db/seed.js ran but db/expoline.db still missing. Cannot boot.');
+    console.error(`FATAL: db/seed.js ran but ${DB_PATH} still missing. Cannot boot.`);
     process.exit(1);
   }
 }
@@ -260,7 +268,7 @@ require('./routes/online').migrate(db);
 const PORT = parseInt(process.env.EXPOLINE_PORT || '4317', 10);
 const SITE_TZ = 'America/Los_Angeles'; // Bali Hai pilot site timezone for date bucketing
 const SITE_ID = (() => {
-  const r = db.prepare("SELECT id FROM sites WHERE slug = 'bali-hai'").get()
+  const r = db.prepare('SELECT id FROM sites WHERE slug = ?').get(SITE_SLUG)
     || db.prepare('SELECT id FROM sites LIMIT 1').get();
   if (!r) { console.error('FATAL: no site row in database.'); process.exit(1); }
   return r.id;
@@ -511,13 +519,15 @@ function issueToken(user) {
   return token;
 }
 
-/** 401 unless a valid Bearer token is present. Mounted on /api with two public paths. */
+/** 401 unless a valid Bearer token is present. Mounted on /api with public paths. */
 function authMiddleware(req, res, next) {
   if (req.path === '/health' || req.path === '/auth/login') return next();
   // Public online-ordering endpoints (customer's phone — no staff token).
   if (req.path === '/online/menu'
       || (req.path === '/online/orders' && req.method === 'POST')
       || req.path === '/online/last') return next();
+  // Public LAN brain discovery (devices find the brain before auth).
+  if (req.path === '/brain/status') return next();
   const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
   const user = m ? tokens.get(m[1]) : null;
   if (!user) return res.status(401).json({ error: 'Unauthorized: valid Bearer token required' });
@@ -636,7 +646,28 @@ app.use('/api', authMiddleware);
 
 /* ------------------------------- public routes ----------------------------- */
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, mode: 'demo', site: 'bali-hai' });
+  res.json({ ok: true, mode: 'demo', site: SITE_SLUG });
+});
+
+/* ------------------------- LAN site brain discovery -------------------------
+ * The site brain is the authoritative node on the restaurant LAN. Devices
+ * discover it via mDNS (_expoline._tcp.local) or via this HTTP endpoint when
+ * the IP is known (DHCP reservation recommended for the brain terminal).
+ * The brain holds the site DB, serves /api/sync to LAN clients, and owns
+ * the WAN upload queue. See offline-ladder/DESIGN.md §4 for the full design.
+ */
+app.get('/api/brain/status', (req, res) => {
+  res.json({
+    brain: true,
+    site_slug: SITE_SLUG,
+    site_id: SITE_ID,
+    version: '1.0',
+    // Heartbeat for election: priority 0 = preferred brain (wall terminal),
+    // higher = fallback (handhelds/tablets). See sync-engine/brain.js.
+    priority: parseInt(process.env.EXPOLINE_BRAIN_PRIORITY || '0', 10),
+    uptime_s: Math.floor(process.uptime()),
+    db_path: DB_PATH,
+  });
 });
 
 app.post('/api/auth/login', (req, res) => {

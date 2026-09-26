@@ -9,8 +9,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const DIR = __dirname;
-const DB_PATH = path.join(DIR, 'expoline.db');
+const SITES_DIR = path.join(DIR, 'sites');
+const SITE_SLUG = process.env.EXPOLINE_SITE || 'bali-hai';
+const DB_PATH = process.env.EXPOLINE_DB || path.join(SITES_DIR, `${SITE_SLUG}.db`);
 const SCHEMA_PATH = path.join(DIR, 'schema.sql');
+
+fs.mkdirSync(SITES_DIR, { recursive: true });
 
 // ---- idempotent: wipe any existing database (incl. WAL sidecars) ----
 for (const f of [DB_PATH, DB_PATH + '-wal', DB_PATH + '-shm']) {
@@ -95,7 +99,8 @@ const TABLES = {
   'Holiday SoPac': [
     ...range(130, 140).map(String),
     ...range(150, 155).map(String),
-    ...range(119, 128).map(String),
+    ...range(119, 128).map(String).filter(n => n !== '125'),
+    '125SP',
     'HV', 'Satellite', 'FIRE',
     ...range(69, 74).map(n => n + 'sp'),
     ...range(81, 84).map(n => n + 'sp'),
