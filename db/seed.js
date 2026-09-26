@@ -25,7 +25,10 @@ const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode=WAL;');
 db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
 
-const SITE = 'bali-hai';
+const SITE = SITE_SLUG; // site_id for every seeded row — matches the DB file's slug
+const SITE_NAME = SITE_SLUG === 'bali-hai'
+  ? 'Bali Hai Restaurant'
+  : SITE_SLUG.replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 
 // ---------------- helpers ----------------
 const q = {
@@ -54,7 +57,7 @@ const q = {
 
 // ---------------- site ----------------
 db.prepare("INSERT INTO sites (id, name, slug) VALUES (?, ?, ?)")
-  .run(SITE, 'Bali Hai Restaurant', 'bali-hai');
+  .run(SITE, SITE_NAME, SITE_SLUG);
 
 // ---------------- config ----------------
 const CONFIG = {

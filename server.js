@@ -54,6 +54,10 @@ const SITES_DIR = path.join(DB_DIR, 'sites');
 // EXPOLINE_SITE selects the site slug (default 'bali-hai').
 // EXPOLINE_DB overrides the path entirely (used by QA).
 const SITE_SLUG = process.env.EXPOLINE_SITE || 'bali-hai';
+if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(SITE_SLUG)) {
+  console.error(`FATAL: invalid EXPOLINE_SITE "${SITE_SLUG}" (must match ^[a-z0-9][a-z0-9-]{0,63}$).`);
+  process.exit(1);
+}
 const DB_PATH = process.env.EXPOLINE_DB
   || path.join(SITES_DIR, `${SITE_SLUG}.db`);
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -298,9 +302,8 @@ require('./routes/online').migrate(db);
 const PORT = parseInt(process.env.EXPOLINE_PORT || process.env.PORT || '4317', 10);
 const SITE_TZ = 'America/Los_Angeles'; // Bali Hai pilot site timezone for date bucketing
 const SITE_ID = (() => {
-  const r = db.prepare('SELECT id FROM sites WHERE slug = ?').get(SITE_SLUG)
-    || db.prepare('SELECT id FROM sites LIMIT 1').get();
-  if (!r) { console.error('FATAL: no site row in database.'); process.exit(1); }
+  const r = db.prepare('SELECT id FROM sites WHERE slug = ?').get(SITE_SLUG);
+  if (!r) { console.error(`FATAL: no sites row for slug "${SITE_SLUG}" in database. Refusing to bind to the wrong site.`); process.exit(1); }
   return r.id;
 })();
 
@@ -548,7 +551,7 @@ function itemView(it) {
 
 /** Full check payload: check + items[] + totals. */
 function checkResponse(checkId) {
-  const c = db.prepare('SELECT * FROM checks WHERE id = ?').get(checkId);
+  const c = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
   if (!c) return null;
   const t = persistTotals(checkId);
   const table = c.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(c.table_id) : null;
@@ -600,6 +603,7 @@ function canonStation(s) {
 function ticketView(row) {
   return {
     id: row.id,
+    uuid: row.uuid,
     check_id: row.check_id,
     station: row.station,
     table_label: row.table_label,
@@ -1329,7 +1333,7 @@ app.post('/api/checks', serverPlus(), (req, res) => {
 
 app.get('/api/checks/open', serverPlus(), (req, res) => {
   const rows = db.prepare(
-    `SELECT c.id, c.table_id, c.server_id, c.tab_name, c.guest_count, c.status, c.opened_at,
+    `SELECT c.id, c.uuid, c.table_id, c.server_id, c.tab_name, c.guest_count, c.status, c.opened_at,
             t.label AS table_label, u.name AS server_name,
             (SELECT COUNT(*) FROM check_items ci WHERE ci.check_id = c.id AND ci.state IN ${BILLABLE_STATES}) AS item_count
      FROM checks c
@@ -1341,7 +1345,7 @@ app.get('/api/checks/open', serverPlus(), (req, res) => {
   res.json(rows.map((c) => {
     const t = persistTotals(c.id);
     return {
-      id: c.id, table_id: c.table_id, table_label: c.table_label,
+      id: c.id, uuid: c.uuid, table_id: c.table_id, table_label: c.table_label,
       server_id: c.server_id, server_name: c.server_name,
       tab_name: c.tab_name, guest_count: c.guest_count, status: c.status,
       item_count: c.item_count, total_cents: t.total, opened_at: c.opened_at,
@@ -3834,5 +3838,5 @@ server.on('error', (err) => {
   process.exit(1);
 });
 server.listen(PORT, () => {
-  console.log(`[expoline] listening on http://localhost:${PORT} (site: bali-hai, mode: demo)`);
+  console.log(`[expoline] listening on http://localhost:${PORT} (site: ${SITE_SLUG}, mode: demo)`);
 });

@@ -285,7 +285,7 @@ function register(app, ctx) {
         );
         const row = db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid);
         tickets.push({
-          id: row.id, check_id: row.check_id, station: row.station,
+          id: row.id, uuid: row.uuid, check_id: row.check_id, station: row.station,
           table_label: row.table_label, server_name: row.server_name,
           items: ticketItems, status: row.status, created_at: row.created_at,
         });

@@ -295,7 +295,10 @@ function register(app, ctx) {
       for (const it of items) {
         const st = it.station || 'expediter';
         if (!byStation.has(st)) byStation.set(st, []);
-        byStation.get(st).push({ item_id: it.menu_item_id, name: it.name, qty: it.qty, modifiers: [] });
+        // NOTE: online tickets have no check/check_items rows — item_id here is a
+        // menu_items id (not a check_items id like dine-in/kiosk tickets).
+        // menu_item_id is explicit so consumers never mis-join it to check_items.
+        byStation.get(st).push({ item_id: it.menu_item_id, menu_item_id: it.menu_item_id, name: it.name, qty: it.qty, modifiers: [] });
       }
       const sentAt = nowIso();
       const label = 'ONLINE #' + o.id + (o.pickup_at
@@ -310,12 +313,12 @@ function register(app, ctx) {
           JSON.stringify(titems), sentAt
         );
         const row = db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid);
-        tickets.push(row.id);
+        tickets.push({ id: row.id, uuid: row.uuid });
         // Broadcast to KDS subscribers when the host wires it (optional ctx).
         if (ctx.broadcastTicket) {
           try {
             ctx.broadcastTicket({
-              id: row.id, check_id: null, online_order_id: o.id, station: row.station,
+              id: row.id, uuid: row.uuid, check_id: null, online_order_id: o.id, station: row.station,
               table_label: row.table_label, server_name: row.server_name,
               items: titems, status: row.status, created_at: row.created_at,
               bumped_at: null, bumped_by: null,
