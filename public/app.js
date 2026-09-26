@@ -92,7 +92,7 @@ function logout() {
 
 /* ---------------- api client ---------------- */
 class OfflineError extends Error { constructor(m) { super(m || 'offline'); this.offline = true; } }
-class ApiError extends Error { constructor(status, msg) { super(msg || ('HTTP ' + status)); this.status = status; } }
+class ApiError extends Error { constructor(status, msg, body) { super(msg || ('HTTP ' + status)); this.status = status; if (body !== undefined) this.body = body; } }
 
 const isOffline = () => localStorage.getItem('expoline.forceOffline') === '1' || !navigator.onLine;
 
@@ -106,12 +106,10 @@ async function rawApi(path, method, body) {
   } catch (e) {
     throw new OfflineError('network unreachable');
   }
-  if (res.status === 401) throw new ApiError(401, 'Unauthorized');
-  if (res.status === 403) throw new ApiError(403, 'Forbidden');
   if (!res.ok) {
-    let msg = 'Request failed (' + res.status + ')';
-    try { const j = await res.json(); msg = j.error || j.message || msg; } catch (e) { /* ignore */ }
-    throw new ApiError(res.status, msg);
+    let msg = 'Request failed (' + res.status + ')', body;
+    try { body = await res.json(); msg = body.error || body.message || msg; } catch (e) { /* ignore */ }
+    throw new ApiError(res.status, msg, body);
   }
   if (res.status === 204) return null;
   const ct = res.headers.get('content-type') || '';
@@ -599,6 +597,7 @@ async function getMenu() {
       is_drink: i.is_drink, tags: i.tags || [],
       modifiers: i.modifiers || i.modifier_options || [],
       station: i.station || i.kds_station || null,
+      daypart: i.daypart || null,
     })),
   }));
 }
@@ -889,11 +888,15 @@ function renderLogin(app) {
 async function renderFloor(app) {
   const role = state.user.role;
   if (role !== 'server' && role !== 'manager') { app.innerHTML = notAuthorized(); return; }
-  app.innerHTML = '<div class="view-head"><h1>Floor</h1><span class="spacer"></span><span class="muted small" id="floor-clock"></span></div>' +
+  app.innerHTML = '<div class="view-head"><h1>Floor</h1><span class="spacer"></span>' +
+    '<button class="btn btn-ghost btn-sm" id="floor-merge" title="One-tap merge: fold one party into another">Merge</button> ' +
+    '<button class="btn btn-ghost btn-sm" id="floor-move" title="Move a check to a different table">Move</button> ' +
+    '<span class="muted small" id="floor-clock"></span></div>' +
+    '<div id="floor-banner-slot"></div>' +
     '<div class="tabs" id="zone-tabs"></div><div class="zone-grid" id="zone-grid"></div>';
   const tick = () => { const c = $('#floor-clock'); if (c) c.textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); };
   tick(); const iv = setInterval(tick, 20000);
-  const cleanup = () => clearInterval(iv);
+  const cleanup = () => { clearInterval(iv); if (tmIv) clearInterval(tmIv); };
   app._cleanup = cleanup;
 
   let zones;
@@ -902,7 +905,45 @@ async function renderFloor(app) {
   if (!zones.length) { $('#zone-grid').innerHTML = '<div class="empty">No zones configured.</div>'; return; }
 
   let active = zones[0].id;
-  const tabs = $('#zone-tabs'), grid = $('#zone-grid');
+  const tabs = $('#zone-tabs'), grid = $('#zone-grid'), bannerSlot = $('#floor-banner-slot');
+  const PO2 = window.ParityOrders;
+  let timers = {}, floorMode = null, floorSel = null, tmIv = null;
+
+  /* Phase 3A: actionable turn-time badges on every open table. */
+  const loadTimers = async () => {
+    try { const rows = await api('/api/floor/timers'); timers = {}; (rows.timers || rows).forEach((r) => { timers[String(r.table_id)] = r; }); }
+    catch (e) { /* keep last-known */ }
+    drawGrid();
+  };
+  const drawGrid = () => {
+    const z = zones.find((x) => String(x.id) === String(active));
+    grid.innerHTML = z.tables.map((t) => {
+      const tm = timers[String(t.id)];
+      return '<button class="table-tile' + (t.open_check_id ? ' open' : '') + (tm && tm.turn_status === 'over' ? ' over' : '') +
+        (floorSel && String(floorSel) === String(t.id) ? ' pick-src' : '') + '" data-t="' + esc(String(t.id)) + '"' +
+        (floorMode === 'move' && t.open_check_id ? ' draggable="true"' : '') +
+        ' aria-label="Table ' + esc(t.label) + (t.open_check_id ? ', open' : ', available') + '">' +
+        '<span>' + esc(t.label) + '</span>' +
+        '<span class="sub">' + (t.open_check_id ? 'OPEN' : (t.seats ? t.seats + ' seats' : 'Available')) + '</span>' +
+        (tm ? PO2.timerChip(tm) : '') + '</button>';
+    }).join('');
+    $$('.table-tile', grid).forEach((b) => {
+      const t = z.tables.find((x) => String(x.id) === b.dataset.t);
+      if (floorMode === 'move' && t.open_check_id) {
+        b.ondragstart = (e) => { e.dataTransfer.setData('text/plain', JSON.stringify({ checkId: t.open_check_id, label: t.label })); e.dataTransfer.effectAllowed = 'move'; };
+      }
+      if (floorMode === 'move' && !t.open_check_id) {
+        b.ondragover = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
+        b.ondrop = (e) => { e.preventDefault(); try { const d = JSON.parse(e.dataTransfer.getData('text/plain')); doMove(d.checkId, d.label, t); } catch (err) {} };
+      }
+      b.onclick = () => {
+        if (floorMode) { handleModeTap(t); return; }
+        if (t.open_check_id) location.hash = '#/order/' + t.open_check_id;
+        else openCheckSheet(t);
+      };
+    });
+  };
+
   const drawTabs = () => {
     tabs.innerHTML = zones.map((z) => {
       const open = z.tables.filter((t) => t.open_check_id).length;
@@ -910,19 +951,67 @@ async function renderFloor(app) {
     }).join('');
     $$('.tab', tabs).forEach((b) => b.onclick = () => { active = b.dataset.z; drawTabs(); drawGrid(); });
   };
-  const drawGrid = () => {
-    const z = zones.find((x) => String(x.id) === String(active));
-    grid.innerHTML = z.tables.map((t) =>
-      '<button class="table-tile' + (t.open_check_id ? ' open' : '') + '" data-t="' + esc(String(t.id)) + '" aria-label="Table ' + esc(t.label) + (t.open_check_id ? ', open' : ', available') + '">' +
-      '<span>' + esc(t.label) + '</span>' +
-      '<span class="sub">' + (t.open_check_id ? 'OPEN' : (t.seats ? t.seats + ' seats' : 'Available')) + '</span></button>').join('');
-    $$('.table-tile', grid).forEach((b) => b.onclick = () => {
-      const t = z.tables.find((x) => String(x.id) === b.dataset.t);
-      if (t.open_check_id) location.hash = '#/order/' + t.open_check_id;
-      else openCheckSheet(t);
+
+  const drawBanner = () => {
+    if (!floorMode) { bannerSlot.innerHTML = ''; return; }
+    const hint = floorMode === 'merge'
+      ? (floorSel ? 'Tap the check to merge IN — seats remap automatically.' : 'Merge mode: tap the table to KEEP.')
+      : (floorSel ? 'Tap the free destination table.' : 'Move mode: tap the check’s table, or drag its tile.');
+    bannerSlot.innerHTML = '<div class="floor-banner"><span>' + (floorMode === 'merge' ? '🔀 Merge mode — ' : '📍 Move mode — ') + esc(hint) + '</span>' +
+      '<span class="spacer"></span><button class="btn btn-ghost btn-sm" id="floor-exit-mode">Exit</button></div>';
+    $('#floor-exit-mode').onclick = exitMode;
+  };
+  const exitMode = () => { floorMode = null; floorSel = null; $('#floor-merge').classList.remove('btn-primary'); $('#floor-move').classList.remove('btn-primary'); drawBanner(); drawGrid(); };
+
+  async function handleModeTap(t) {
+    const other = zones.flatMap((z) => z.tables).find((x) => String(x.id) === String(floorSel));
+    if (floorMode === 'merge') {
+      if (!t.open_check_id) { toast('Merge needs an occupied table', 'err'); return; }
+      if (!floorSel) { floorSel = t.id; drawBanner(); drawGrid(); return; }
+      if (String(floorSel) === String(t.id)) { floorSel = null; drawBanner(); drawGrid(); return; }
+      // one-action party merge: keep floorSel, fold t into it
+      const keep = other, absorb = t;
+      confirmDialog('Merge parties', 'Fold <b>Table ' + esc(absorb.label) + '</b> into <b>Table ' + esc(keep.label) + '</b>? Seats remap automatically and guest names survive.', 'Merge', async () => {
+        try {
+          const r = await api('/api/checks/' + encodeURIComponent(keep.open_check_id) + '/merge', 'POST', { source_check_ids: [absorb.open_check_id] });
+          toast('Merged — party of ' + (r.guest_count || '?') + ' on Table ' + keep.label, 'ok');
+          exitMode(); zones = await getZones(); drawTabs(); drawGrid(); loadTimers();
+        } catch (e) { handleApiError(e); }
+      });
+    } else { // move
+      if (!floorSel) {
+        if (!t.open_check_id) { toast('Move: tap the check’s current table first', 'err'); return; }
+        floorSel = t.id; drawBanner(); drawGrid(); return;
+      }
+      if (String(floorSel) === String(t.id)) { floorSel = null; drawBanner(); drawGrid(); return; }
+      if (t.open_check_id) { toast('That table is occupied — pick a free one', 'err'); return; }
+      doMove(other.open_check_id, other.label, t);
+    }
+  }
+  async function doMove(checkId, fromLabel, destTable) {
+    confirmDialog('Move check', 'Move the check from <b>Table ' + esc(fromLabel) + '</b> to <b>Table ' + esc(destTable.label) + '</b>? The KDS header updates itself.', 'Move', async () => {
+      try {
+        await api('/api/checks/' + encodeURIComponent(checkId) + '/move', 'POST', { table_id: destTable.id });
+        toast('Check moved to Table ' + destTable.label, 'ok');
+        exitMode(); zones = await getZones(); drawTabs(); drawGrid(); loadTimers();
+      } catch (e) { handleApiError(e); }
     });
+  }
+
+  $('#floor-merge').onclick = () => {
+    if (floorMode === 'merge') return exitMode();
+    floorMode = 'merge'; floorSel = null;
+    $('#floor-merge').classList.add('btn-primary'); $('#floor-move').classList.remove('btn-primary');
+    drawBanner(); drawGrid();
+  };
+  $('#floor-move').onclick = () => {
+    if (floorMode === 'move') return exitMode();
+    floorMode = 'move'; floorSel = null;
+    $('#floor-move').classList.add('btn-primary'); $('#floor-merge').classList.remove('btn-primary');
+    drawBanner(); drawGrid();
   };
   drawTabs(); drawGrid();
+  loadTimers(); tmIv = setInterval(loadTimers, 30000);
 
   function openCheckSheet(t) {
     let guests = 2, tabName = '';
@@ -1233,7 +1322,7 @@ async function renderOrder(app, checkId) {
   let view;
   try { view = await getCheckView(checkId); }
   catch (e) { if (handleApiError(e) === 'bounced') return; app.innerHTML = '<div class="card"><h2>Check not found</h2><p><a class="btn btn-ghost" href="#/floor">Back to floor</a></p></div>'; return; }
-  const check = view.check;
+  let check = view.check;
   const guests = check.guest_count || check.guests || 2;
   let seat = 1;
   let staged = loadStaged(checkId);
@@ -1241,40 +1330,75 @@ async function renderOrder(app, checkId) {
 
   try { menu = await getMenu(); } catch (e) { handleApiError(e); }
 
+  /* Phase 3A: daypart auto-switch. The menu follows the site clock with zero
+     taps; the pill is only a manual override. */
+  let dpInfo = null, dpOverride = null;
+  try { dpOverride = sessionStorage.getItem('expoline.daypartOverride') || 'auto'; } catch (e) { dpOverride = 'auto'; }
+  try { dpInfo = await api('/api/dayparts'); } catch (e) { /* offline: show everything */ }
+  const PO = window.ParityOrders;
+  const dpWindow = () => {
+    if (!dpInfo) return null;
+    if (dpOverride === 'all') return null;
+    if (dpOverride && dpOverride !== 'auto') return PO.windowForName(dpInfo.schedule, dpOverride) || dpInfo.window;
+    return dpInfo.window;
+  };
+  const visibleMenu = () => PO.filterMenuByDaypart(menu, dpWindow());
+  const dpLabel = () => {
+    const w = dpWindow();
+    if (dpOverride === 'all') return '🍽 All day';
+    if (w) return '🍽 ' + w.name + (dpOverride === 'auto' || !dpOverride ? ' · auto' : '');
+    return '🍽 All day' + (dpInfo && dpInfo.current ? '' : ' · auto');
+  };
+
   const totals = check.totals || {};
   app.innerHTML =
     '<div class="order-top">' +
     '<a class="btn btn-ghost" href="#/floor" aria-label="Back to floor">‹</a>' +
     '<span class="table-label">' + esc(check.table_label || check.table || ('Check ' + String(checkId).slice(-4))) + '</span>' +
     (check.tab_name ? '<span class="muted">· ' + esc(check.tab_name) + '</span>' : '') +
-    '<span class="muted small">' + guests + ' guests</span><span class="spacer"></span>' +
+    '<span class="muted small">' + guests + ' guests</span>' +
+    '<button class="icon-btn" id="check-settings" title="Check settings — guests, tab name, coursing, order note, void check" aria-label="Check settings">⚙</button>' +
+    '<span class="spacer"></span>' +
+    '<button class="pill dp-pill" id="dp-pill" title="Menu daypart — auto by clock, tap to override">' + esc(dpLabel()) + '</button>' +
     '<a class="btn btn-primary" href="#/pay/' + encodeURIComponent(checkId) + '">Pay · ' + fmt(totals.total) + '</a>' +
     '</div>' +
     (totals.estimated ? '<p class="small muted">Totals estimated while offline — final math comes from the server on sync.</p>' : '') +
-    '<h3 style="margin-bottom:4px">Seat <span class="muted small">— pick a seat first</span></h3>' +
+    '<h3 style="margin-bottom:4px">Seat <span class="muted small">— pick a seat first</span> ' +
+    '<button class="icon-btn" id="seat-rename" title="Rename guest at this seat" aria-label="Rename guest">✎</button></h3>' +
     '<div class="seat-row" id="seat-row" role="radiogroup" aria-label="Seat"></div>' +
     '<div class="tabs" id="cat-tabs"></div>' +
+    /* Phase 3A (NG-D): quick-pick row — one-tap popular items (SpotOn V3 1:05
+       "quick buttons for popular items"). Manager flags items as popular in
+       the menu editor; 86'd items never appear here. */
+    '<div class="quick-pick" id="quick-pick" style="display:none"></div>' +
     '<div class="order-layout"><div><div class="item-grid" id="item-grid"></div>' +
     '<div class="drinks-note">🍸 <b>Drinks</b> are tagged <span class="drink-tag">BAR</span> — they fire to the <b>bar</b> immediately on send, never holding up food.</div></div>' +
     '<div class="cart-panel"><div class="card"><h3>Order</h3><div id="cart-body"></div>' +
     '<div class="order-actions"><button class="btn btn-amber btn-big" id="btn-hold">HOLD</button>' +
-    '<button class="btn btn-green btn-big" id="btn-send">SEND</button></div>' +
+    '<button class="btn btn-green btn-big" id="btn-send">SEND</button>' +
+    /* Phase 3A (P0-4): one-tap send-now — staged items go straight to the
+       KDS, skipping the HOLD step (Toast "Send" parity). */
+    '<button class="btn btn-blue btn-big" id="btn-sendnow" title="Add staged items and fire them immediately">SEND NOW</button></div>' +
     '</div></div></div>';
 
   const seatRow = $('#seat-row'), catTabs = $('#cat-tabs'), itemGrid = $('#item-grid'), cartBody = $('#cart-body');
 
   const drawSeats = () => {
+    const names = check.seat_names || {};
     seatRow.innerHTML = Array.from({ length: guests }, (_, i) => i + 1).map((s) =>
-      '<button class="seat-chip' + (s === seat ? ' active' : '') + '" data-s="' + s + '" role="radio" aria-checked="' + (s === seat) + '">Seat ' + s + '</button>').join('');
+      '<button class="seat-chip' + (s === seat ? ' active' : '') + '" data-s="' + s + '" role="radio" aria-checked="' + (s === seat) + '">Seat ' + s +
+      (names[s] ? '<span class="guest-nm">' + esc(names[s]) + '</span>' : '') + '</button>').join('');
     $$('.seat-chip', seatRow).forEach((b) => b.onclick = () => { seat = Number(b.dataset.s); drawSeats(); drawCart(); });
   };
   const drawCats = () => {
-    catTabs.innerHTML = menu.map((c) =>
+    const vm = visibleMenu();
+    if (!vm.some((c) => String(c.id) === String(activeCat))) activeCat = vm.length ? vm[0].id : null;
+    catTabs.innerHTML = vm.map((c) =>
       '<button class="tab' + (c.id === activeCat ? ' active' : '') + '" data-c="' + esc(String(c.id)) + '">' + esc(c.name) + '</button>').join('');
     $$('.tab', catTabs).forEach((b) => b.onclick = () => { activeCat = b.dataset.c; drawCats(); drawItems(); });
   };
   const drawItems = () => {
-    const cat = menu.find((c) => String(c.id) === String(activeCat));
+    const cat = visibleMenu().find((c) => String(c.id) === String(activeCat));
     if (!cat) { itemGrid.innerHTML = '<div class="empty">No menu loaded.</div>'; return; }
     itemGrid.innerHTML = cat.items.map((i) => {
       const drink = isDrink(i, cat.name);
@@ -1288,33 +1412,127 @@ async function renderOrder(app, checkId) {
     });
   };
 
+  /* Phase 3A (P0-6/NG-E/P0-2): guided modifier flow — modifier GROUPS with
+     required/min/max, defaults pre-checked, 86'd options disabled, nested
+     groups revealed by their parent option; per-modifier notes ("light on
+     the cheese"); per-line special request + allergy flag. */
   function addItemFlow(item, catName) {
-    const mods = itemModifiers(item);
-    if (!mods.length) { stageItem(item, [], 1); return; }
-    // modifier picker modal: checkboxes with +$ amounts
+    const groups = Array.isArray(item.modifier_groups) && item.modifier_groups.length
+      ? item.modifier_groups : null;
+    const flatMods = groups ? [] : itemModifiers(item);
+    if (!groups && !flatMods.length) { stageItem(item, [], 1, {}); return; }
     let qty = 1;
+    const groupHint = (g) => {
+      const bits = [];
+      if (g.required) bits.push('required');
+      if (g.min_select > 1) bits.push('pick ≥ ' + g.min_select);
+      if (g.max_select > 0) bits.push('up to ' + g.max_select);
+      return bits.length ? ' <span class="muted small">· ' + bits.join(', ') + '</span>' : '';
+    };
+    const modRow = (o, gi, oi) =>
+      '<label class="mod-row' + (o.active === false ? ' mod-86' : '') + '">' +
+      '<input type="checkbox" data-g="' + gi + '" data-o="' + oi + '"' +
+      (o.is_default && o.active !== false ? ' checked' : '') +
+      (o.active === false ? ' disabled' : '') + '>' +
+      '<span class="mn">' + esc(o.name) + (o.active === false ? ' <span class="pill held">86</span>' : '') + '</span>' +
+      '<span class="mp">' + (o.price_delta_cents ? '+' + fmt(o.price_delta_cents) : 'incl.') + '</span></label>' +
+      '<input class="mod-note-in" data-mn="' + gi + ':' + oi + '" maxlength="60" placeholder="Note for ' + esc(o.name) + ' (optional)" style="display:none">';
+    const groupsHtml = groups ? groups.map((g, gi) =>
+      '<div class="mod-group" data-group="' + gi + '" data-parent-opt="' + (g.parent_option_id || '') + '">' +
+      '<h4>' + esc(g.name) + groupHint(g) + '</h4>' +
+      g.options.map((o, oi) => modRow(o, gi, oi)).join('') + '</div>').join('')
+      : '<h3>Modifiers</h3><div id="mod-list">' +
+        flatMods.map((m, i) => '<label class="mod-row"><input type="checkbox" data-mi="' + i + '"><span class="mn">' + esc(m.name) + '</span><span class="mp">+' + fmt(m.price_delta_cents) + '</span></label>' +
+          '<input class="mod-note-in" data-fmn="' + i + '" maxlength="60" placeholder="Note for ' + esc(m.name) + ' (optional)" style="display:none">').join('') + '</div>';
     const bd = openModal(
       '<h2>' + esc(item.name) + ' <span class="muted">· ' + fmt(item.price_cents) + '</span></h2>' +
       '<p class="muted small">Seat ' + seat + (isDrink(item, catName) ? ' · <span class="drink-tag">BAR</span> fires to bar on send' : '') + '</p>' +
       '<div class="field"><label>Quantity</label><div class="stepper"><button data-q="dec">−</button><span class="val" id="m-qty">1</span><button data-q="inc">+</button></div></div>' +
-      '<h3>Modifiers</h3><div id="mod-list">' +
-      mods.map((m, i) => '<label class="mod-row"><input type="checkbox" data-mi="' + i + '"><span class="mn">' + esc(m.name) + '</span><span class="mp">+' + fmt(m.price_delta_cents) + '</span></label>').join('') +
-      '</div><div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      groupsHtml +
+      '<div class="field"><label for="m-note">Special request <span class="muted small">(optional, prints on the KDS ticket)</span></label>' +
+      '<input type="text" id="m-note" maxlength="140" placeholder="e.g. no onions, dressing on side" autocomplete="off"></div>' +
+      '<div class="field"><label class="check-line"><input type="checkbox" id="m-allergy"> ⚠️ Allergy alert for this item</label>' +
+      '<input type="text" id="m-allergy-detail" maxlength="140" placeholder="Allergy detail (optional)" autocomplete="off" style="display:none;margin-top:6px"></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
       '<button class="btn btn-primary" data-x="add">Add to order</button></div>');
     $('[data-q="dec"]', bd).onclick = () => { qty = Math.max(1, qty - 1); $('#m-qty', bd).textContent = qty; };
     $('[data-q="inc"]', bd).onclick = () => { qty = Math.min(24, qty + 1); $('#m-qty', bd).textContent = qty; };
+    $('#m-allergy', bd).onchange = (e) => { $('#m-allergy-detail', bd).style.display = e.target.checked ? 'block' : 'none'; };
     $('[data-x="cancel"]', bd).onclick = closeModal;
+    // Show the per-modifier note field only while its modifier is checked;
+    // nested groups appear only when their parent option is picked.
+    const refreshModUI = () => {
+      const checkedOpts = new Set($$('#mod-list input:checked, .mod-group input:checked', bd).map((c) =>
+        c.dataset.g !== undefined ? 'g' + c.dataset.g + ':o' + c.dataset.o : 'f' + c.dataset.mi));
+      $$('.mod-note-in', bd).forEach((inp) => {
+        const key = inp.dataset.mn !== undefined ? 'g' + inp.dataset.mn.replace(':', ':o') : 'f' + inp.dataset.fmn;
+        inp.style.display = checkedOpts.has(key) ? 'block' : 'none';
+        if (inp.style.display === 'none') inp.value = '';
+      });
+      if (groups) {
+        const pickedOptIds = new Set($$('.mod-group input:checked', bd).map((c) => {
+          const g = groups[Number(c.dataset.g)];
+          return g && g.options[Number(c.dataset.o)] ? g.options[Number(c.dataset.o)].id : null;
+        }).filter(Boolean));
+        $$('.mod-group[data-parent-opt]', bd).forEach((el) => {
+          const pid = Number(el.dataset.parentOpt);
+          el.style.display = (!pid || pickedOptIds.has(pid)) ? 'block' : 'none';
+        });
+      }
+    };
+    bd.addEventListener('change', refreshModUI);
+    refreshModUI();
     $('[data-x="add"]', bd).onclick = () => {
-      const picked = $$('#mod-list input:checked', bd).map((c) => mods[Number(c.dataset.mi)]).map((m) => ({ name: m.name, price_delta_cents: m.price_delta_cents }));
+      let picked = [];
+      if (groups) {
+        // Validate required/min/max against VISIBLE (applicable) groups only.
+        const pickedByGroup = groups.map(() => []);
+        $$('.mod-group input:checked', bd).forEach((c) => {
+          const gi = Number(c.dataset.g), oi = Number(c.dataset.o);
+          const g = groups[gi], o = g.options[oi];
+          if ($('.mod-group[data-group="' + gi + '"]', bd).style.display === 'none') return;
+          const noteInp = $('.mod-note-in[data-mn="' + gi + ':' + oi + '"]', bd);
+          const m = { name: o.name, price_delta_cents: o.price_delta_cents, option_id: o.id };
+          const nt = noteInp && noteInp.value.trim();
+          if (nt) m.note = nt.slice(0, 60);
+          pickedByGroup[gi].push(m);
+        });
+        for (let gi = 0; gi < groups.length; gi++) {
+          const g = groups[gi];
+          if ($('.mod-group[data-group="' + gi + '"]', bd).style.display === 'none') continue;
+          const n = pickedByGroup[gi].length;
+          if (g.required && n === 0) { toast(g.name + ': please choose at least one', 'err'); return; }
+          if (g.min_select > 0 && n < g.min_select) { toast(g.name + ': pick at least ' + g.min_select, 'err'); return; }
+          if (g.max_select > 0 && n > g.max_select) { toast(g.name + ': at most ' + g.max_select, 'err'); return; }
+        }
+        picked = pickedByGroup.flat();
+      } else {
+        picked = $$('#mod-list input:checked', bd).map((c) => {
+          const m = flatMods[Number(c.dataset.mi)];
+          const o = { name: m.name, price_delta_cents: m.price_delta_cents };
+          const noteInp = $('.mod-note-in[data-fmn="' + c.dataset.mi + '"]', bd);
+          const nt = noteInp && noteInp.value.trim();
+          if (nt) o.note = nt.slice(0, 60);
+          return o;
+        });
+      }
+      const note = $('#m-note', bd).value.trim().slice(0, 140) || null;
+      const allergy = $('#m-allergy', bd).checked;
+      const allergyDetail = allergy ? ($('#m-allergy-detail', bd).value.trim().slice(0, 140) || null) : null;
       closeModal();
-      stageItem(item, picked, qty);
+      stageItem(item, picked, qty, { note, allergy, allergy_detail: allergyDetail });
     };
   }
 
-  function stageItem(item, modifiers, qty) {
+  function stageItem(item, modifiers, qty, extra) {
+    extra = extra || {};
     staged.push({
       temp_id: uid('st'), menu_item_id: item.id, name: item.name, price_cents: item.price_cents,
-      seat, qty, modifiers, drink: isDrink(item, (menu.find((c) => String(c.id) === String(activeCat)) || {}).name),
+      seat, qty, modifiers,
+      note: extra.note || null,
+      allergy: !!extra.allergy,
+      allergy_detail: extra.allergy_detail || null,
+      drink: isDrink(item, (menu.find((c) => String(c.id) === String(activeCat)) || {}).name),
     });
     saveStaged(checkId, staged);
     drawCart();
@@ -1323,18 +1541,29 @@ async function renderOrder(app, checkId) {
 
   function drawCart() {
     const bySeat = {};
+    const seatNames = check.seat_names || {};
     staged.forEach((s) => { (bySeat[s.seat] = bySeat[s.seat] || []).push({ kind: 'staged', ref: s }); });
     (check.items || []).forEach((i) => { (bySeat[i.seat || 0] = bySeat[i.seat || 0] || []).push({ kind: 'held', ref: i }); });
     const seats = Object.keys(bySeat).map(Number).sort((a, b) => a - b);
     if (!seats.length) { cartBody.innerHTML = '<p class="muted small">Nothing ordered yet — pick a seat, then tap items.</p>'; return; }
     cartBody.innerHTML = seats.map((s) =>
-      '<div class="seat-group"><div class="seat-name">' + (s ? 'Seat ' + s : 'Unseated') + '</div>' +
+      '<div class="seat-group"><div class="seat-name">' + (s ? 'Seat ' + s + (seatNames[s] ? ' · ' + esc(seatNames[s]) : '') : 'Unseated') + '</div>' +
       bySeat[s].map(({ kind, ref }) => {
         const pill = kind === 'staged' ? '<span class="pill staged">staged</span>'
           : ref.state === 'held' ? '<span class="pill held">held</span>' : '<span class="pill sent">sent</span>';
-        const mods = (ref.modifiers || []).map((m) => esc(m.name) + (m.price_delta_cents ? ' (+' + fmt(m.price_delta_cents) + ')' : '')).join(', ');
+        const mods = (ref.modifiers || []).map((m) => esc(m.name) + (m.price_delta_cents ? ' (+' + fmt(m.price_delta_cents) + ')' : '') +
+          (m.note ? ' <span class="mod-note">“' + esc(m.note) + '”</span>' : '')).join(', ');
         const unitCents = (ref.unit_price_cents != null ? ref.unit_price_cents : ref.price_cents) || 0;
         const lineTotal = unitCents * (ref.qty || 1) + (ref.modifiers || []).reduce((a, m) => a + (m.price_delta_cents || 0) * (ref.qty || 1), 0);
+        /* Phase 3A (P0-2/NG-E): special request + allergy ride the cart line. */
+        const noteHtml = ref.note ? '<span class="line-note">📝 ' + esc(ref.note) + '</span>' : '';
+        const allergyHtml = ref.allergy ? '<span class="pill allergy">⚠️ allergy' + (ref.allergy_detail ? ' · ' + esc(ref.allergy_detail) : '') + '</span>' : '';
+        /* Phase 3A (P0-3/NG-C): multi-select — held lines can be sent
+           selectively; staged + held lines can be bulk-assigned to a seat. */
+        const selKey = kind + ':' + (ref.temp_id || ref.id);
+        const selBox = (kind === 'staged' || ref.state === 'held')
+          ? '<input type="checkbox" class="line-sel" data-sel="' + esc(selKey) + '" aria-label="Select line">'
+          : '';
         const voidBtn = (kind === 'staged' || ref.state === 'held')
           ? '<button class="icon-btn" data-void="' + esc(String(ref.temp_id || ref.id)) + '" data-kind="' + kind + '" data-nm="' + esc(ref.name) + '" aria-label="Void item" title="Void">✕</button>'
           : (ref.state === 'sent'
@@ -1345,10 +1574,22 @@ async function renderOrder(app, checkId) {
         const refireBtn = (kind === 'held' && (ref.state === 'sent' || ref.state === 'fulfilled'))
           ? '<button class="icon-btn" data-refire="' + esc(String(ref.id)) + '" data-nm="' + esc(ref.name) + '" aria-label="Re-fire item to kitchen" title="Re-fire to kitchen">↻</button>'
           : '';
-        return '<div class="cart-line"><div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
-          (mods ? '<span class="mods">' + mods + '</span>' : '') + '</div>' + pill +
-          '<span class="pr">' + fmt(lineTotal) + '</span>' + refireBtn + voidBtn + '</div>';
-      }).join('') + '</div>').join('');
+        /* Phase 3A: edit held/fired items (fired need manager PIN) — the edit
+           is audit-logged and highlighted on KDS. */
+        const editBtn = (kind !== 'staged' && (ref.state === 'held' || ref.state === 'sent'))
+          ? '<button class="icon-btn" data-edit="' + esc(String(ref.id)) + '" aria-label="Edit item" title="Edit item (fired items need manager PIN)">✎</button>'
+          : '';
+        return '<div class="cart-line">' + selBox + '<div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
+          (mods ? '<span class="mods">' + mods + '</span>' : '') + noteHtml + allergyHtml + '</div>' + pill +
+          '<span class="pr">' + fmt(lineTotal) + '</span>' + editBtn + refireBtn + voidBtn + '</div>';
+      }).join('') + '</div>').join('') +
+      /* Phase 3A (P0-3/NG-C): selection action bar — send selected lines, or
+         bulk-assign staged/held lines to a seat (item-first guest assignment). */
+      '<div class="sel-bar" id="sel-bar" style="display:none">' +
+      '<span class="muted small" id="sel-count"></span>' +
+      '<button class="btn btn-sm" id="sel-send">Send selected</button>' +
+      '<button class="btn btn-sm" id="sel-seat">Assign seat…</button>' +
+      '<button class="btn btn-sm btn-ghost" id="sel-clear">Clear</button></div>';
     $$('[data-void]', cartBody).forEach((b) => b.onclick = () => {
       const id = b.dataset.void, kind = b.dataset.kind;
       if (kind === 'staged') {
@@ -1363,6 +1604,62 @@ async function renderOrder(app, checkId) {
     });
     /* Sent items: same manager-approval modal. */
     $$('[data-voidmgr]', cartBody).forEach((b) => b.onclick = () => openVoidApproval(b.dataset.voidmgr, b.dataset.nm));
+    /* Phase 3A: edit held/fired items — audit trail + highlighted KDS delta. */
+    $$('[data-edit]', cartBody).forEach((b) => b.onclick = async () => {
+      const it = (check.items || []).find((x) => String(x.id) === String(b.dataset.edit));
+      if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
+    });
+    /* Phase 3A (P0-3/NG-C): line selection — selective send + item-first
+       seat assignment ("start with the items and choose who it's for"). */
+    const selBar = $('#sel-bar', cartBody), selCount = $('#sel-count', cartBody);
+    const selectedKeys = () => $$('.line-sel:checked', cartBody).map((c) => c.dataset.sel);
+    const refreshSel = () => {
+      const n = selectedKeys().length;
+      selBar.style.display = n ? 'flex' : 'none';
+      selCount.textContent = n + ' selected';
+    };
+    $$('.line-sel', cartBody).forEach((c) => c.onchange = refreshSel);
+    $('#sel-clear', cartBody).onclick = () => { $$('.line-sel:checked', cartBody).forEach((c) => { c.checked = false; }); refreshSel(); };
+    $('#sel-send', cartBody).onclick = async () => {
+      const heldIds = selectedKeys().filter((k) => k.startsWith('held:')).map((k) => Number(k.slice(5)));
+      if (!heldIds.length) { toast('Select held lines to send (staged lines need HOLD first)', 'err'); return; }
+      try {
+        if (isOffline()) { toast('Selective send needs a connection — reconnect first', 'err'); return; }
+        const r = await api('/api/checks/' + realId(checkId) + '/send', 'POST', { item_ids: heldIds });
+        toast('Sent ' + (r.sent || 0) + ' line' + ((r.sent || 0) === 1 ? '' : 's'), 'ok');
+      } catch (e) { handleApiError(e); }
+      renderRoute(true);
+    };
+    $('#sel-seat', cartBody).onclick = () => {
+      const keys = selectedKeys();
+      if (!keys.length) return;
+      let toSeat = seat;
+      const bd = openModal('<h2>Assign seat</h2>' +
+        '<p class="muted">Move the ' + keys.length + ' selected line' + (keys.length === 1 ? '' : 's') + ' to a guest — item-first assignment, no re-keying.</p>' +
+        '<div class="field"><label>Seat</label><div class="stepper"><button data-as="dec">−</button><span class="val" id="as-seat">' + toSeat + '</span><button data-as="inc">+</button></div></div>' +
+        '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+        '<button class="btn btn-primary" data-x="go">Assign to seat</button></div>');
+      $('[data-as="dec"]', bd).onclick = () => { toSeat = Math.max(1, toSeat - 1); $('#as-seat', bd).textContent = toSeat; };
+      $('[data-as="inc"]', bd).onclick = () => { toSeat = Math.min(guests, toSeat + 1); $('#as-seat', bd).textContent = toSeat; };
+      $('[data-x="c"]', bd).onclick = closeModal;
+      $('[data-x="go"]', bd).onclick = async () => {
+        closeModal();
+        try {
+          for (const k of keys) {
+            const [kind, id] = k.split(':');
+            if (kind === 'staged') {
+              const s = staged.find((x) => String(x.temp_id) === id);
+              if (s) s.seat = toSeat;
+            } else {
+              await api('/api/checks/' + realId(checkId) + '/items/' + id, 'PATCH', { seat: toSeat });
+            }
+          }
+          saveStaged(checkId, staged);
+          toast(keys.length + ' line' + (keys.length === 1 ? '' : 's') + ' → Seat ' + toSeat, 'ok');
+        } catch (e) { handleApiError(e); }
+        renderRoute(true);
+      };
+    };
     /* Re-fire: confirm, then POST — the kitchen gets a flagged RE-FIRE ticket. */
     $$('[data-refire]', cartBody).forEach((b) => b.onclick = () => {
       confirmDialog('Re-fire item',
@@ -1436,13 +1733,15 @@ async function renderOrder(app, checkId) {
 
   $('#btn-hold').onclick = async () => {
     if (!staged.length) { toast('Nothing staged — tap menu items first'); return; }
-    const items = staged.map((s) => ({ temp_id: s.temp_id, menu_item_id: s.menu_item_id, name: s.name, price_cents: s.price_cents, seat: s.seat, qty: s.qty, modifiers: s.modifiers }));
+    const items = staged.map((s) => ({ temp_id: s.temp_id, menu_item_id: s.menu_item_id, name: s.name, price_cents: s.price_cents, seat: s.seat, qty: s.qty, modifiers: s.modifiers,
+      note: s.note || null, allergy: !!s.allergy, allergy_detail: s.allergy_detail || null }));
     staged = []; saveStaged(checkId, staged);
     try {
       if (isOffline()) {
         if (String(checkId).startsWith('tmp-')) {
           const d = JSON.parse(localStorage.getItem('expoline.draft:' + checkId));
-          items.forEach((it) => d.items.push({ id: it.temp_id, menu_item_id: it.menu_item_id, name: it.name, price_cents: it.price_cents, seat: it.seat, qty: it.qty, modifiers: it.modifiers, state: 'held' }));
+          items.forEach((it) => d.items.push({ id: it.temp_id, menu_item_id: it.menu_item_id, name: it.name, price_cents: it.price_cents, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
+            note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null, state: 'held' }));
           localStorage.setItem('expoline.draft:' + checkId, JSON.stringify(d));
         }
         await Outbox.enqueue('add_items', { check_id: realId(checkId), items });
@@ -1450,7 +1749,8 @@ async function renderOrder(app, checkId) {
       } else {
         const rid = realId(checkId);
         for (const it of items) {
-          await api('/api/checks/' + rid + '/items', 'POST', { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers });
+          await api('/api/checks/' + rid + '/items', 'POST', { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
+            note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null });
         }
         toast(items.length + (items.length === 1 ? ' item' : ' items') + ' held', 'ok');
       }
@@ -1462,20 +1762,60 @@ async function renderOrder(app, checkId) {
     if (staged.length) { toast('Tap HOLD first to add staged items', 'err'); return; }
     const heldCount = (check.items || []).filter((i) => i.state === 'held').length;
     if (!heldCount) { toast('Nothing held to send'); return; }
-    try {
-      if (isOffline()) {
-        if (String(checkId).startsWith('tmp-')) {
-          const d = JSON.parse(localStorage.getItem('expoline.draft:' + checkId));
-          d.items.forEach((i) => { if (i.state === 'held') i.state = 'sent'; });
-          localStorage.setItem('expoline.draft:' + checkId, JSON.stringify(d));
+    const doSend = async (extra) => {
+      try {
+        if (isOffline()) {
+          if (String(checkId).startsWith('tmp-')) {
+            const d = JSON.parse(localStorage.getItem('expoline.draft:' + checkId));
+            d.items.forEach((i) => { if (i.state === 'held') i.state = 'sent'; });
+            localStorage.setItem('expoline.draft:' + checkId, JSON.stringify(d));
+          }
+          await Outbox.enqueue('send', { check_id: realId(checkId) });
+          toast('Send queued — fires on reconnect', 'ok');
+        } else {
+          await api('/api/checks/' + realId(checkId) + '/send', 'POST', extra || undefined);
+          toast('Sent to kitchen & bar', 'ok');
         }
-        await Outbox.enqueue('send', { check_id: realId(checkId) });
-        toast('Send queued — fires on reconnect', 'ok');
-      } else {
-        await api('/api/checks/' + realId(checkId) + '/send', 'POST');
-        toast('Sent to kitchen & bar', 'ok');
+      } catch (e) {
+        /* Phase 3A (P0-7): coursing prompt — the check fires by course, so
+           ask which course(s) to fire (or all, when optional). */
+        if (e instanceof ApiError && e.status === 409 && e.body && e.body.need_course_selection) {
+          const courses = e.body.courses || [];
+          const bd = openModal('<h2>Fire by course</h2><p class="muted">This check fires one course at a time. Choose what to send now.</p>' +
+            '<div class="checkbox-list">' + courses.map((c) =>
+              '<label><input type="checkbox" data-sc="' + esc(c) + '" checked><span style="flex:1;text-transform:capitalize">' + esc(c) + '</span></label>').join('') + '</div>' +
+            '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+            (e.body.optional ? '<button class="btn" data-x="all">Send all</button>' : '') +
+            '<button class="btn btn-primary" data-x="go">Fire selected</button></div>');
+          $('[data-x="c"]', bd).onclick = closeModal;
+          const go = (list) => { closeModal(); doSend({ courses: list }); };
+          if (e.body.optional) $('[data-x="all"]', bd).onclick = () => go(['all']);
+          $('[data-x="go"]', bd).onclick = () => {
+            const sel = $$('[data-sc]:checked', bd).map((c) => c.dataset.sc);
+            if (!sel.length) { toast('Pick at least one course', 'err'); return; }
+            go(sel);
+          };
+          return;
+        }
+        handleApiError(e); return;
       }
-    } catch (e) { handleApiError(e); return; }
+      renderRoute(true);
+    };
+    await doSend();
+  };
+
+  /* Phase 3A (P0-4): SEND NOW — one-tap add+fire. Staged lines go on the
+     check and straight to the KDS in a single atomic call. */
+  $('#btn-sendnow').onclick = async () => {
+    if (!staged.length) { toast('Nothing staged — tap menu items first'); return; }
+    const items = staged.map((s) => ({ menu_item_id: s.menu_item_id, seat: s.seat, qty: s.qty, modifiers: s.modifiers,
+      note: s.note || null, allergy: !!s.allergy, allergy_detail: s.allergy_detail || null }));
+    staged = []; saveStaged(checkId, staged);
+    try {
+      if (isOffline()) { toast('Send-now needs a connection — reconnect first', 'err'); return; }
+      const r = await api('/api/checks/' + realId(checkId) + '/send-now', 'POST', { items });
+      toast('Sent now — ' + (r.sent || 0) + ' line' + ((r.sent || 0) === 1 ? '' : 's') + ' fired', 'ok');
+    } catch (e) { handleApiError(e); }
     renderRoute(true);
   };
 
@@ -1494,7 +1834,10 @@ async function renderOrder(app, checkId) {
       if (!msg || msg.type !== 'menu_updated') return;
       try {
         menu = await getMenu();
-        if (!menu.some((c) => String(c.id) === String(activeCat))) activeCat = menu.length ? menu[0].id : null;
+        if (!visibleMenu().some((c) => String(c.id) === String(activeCat))) {
+          const vmw = visibleMenu();
+          activeCat = vmw.length ? vmw[0].id : null;
+        }
         drawCats(); drawItems();
         toast('Menu updated', 'ok');
       } catch (e) { /* keep the old menu on screen */ }
@@ -1505,8 +1848,99 @@ async function renderOrder(app, checkId) {
   menuWatch();
   app._cleanup = () => { if (menuWs) { try { menuWs.close(); } catch (e) {} menuWs = null; } };
 
-  if (menu.length) { activeCat = menu[0].id; drawCats(); drawItems(); }
+  if (menu.length) { const vm0 = visibleMenu(); activeCat = vm0.length ? vm0[0].id : null; drawCats(); drawItems(); }
   drawSeats(); drawCart();
+  $('#dp-pill').onclick = () => PO.openDaypartPicker(dpInfo, dpOverride, (v) => {
+    dpOverride = v;
+    try { sessionStorage.setItem('expoline.daypartOverride', v); } catch (e) {}
+    renderRoute(true);
+  });
+  $('#seat-rename').onclick = async () => {
+    const names = check.seat_names || {};
+    const r = await PO.openRenameSeatModal(check.id, seat, names[seat] || '');
+    if (r === null) return; // cancelled
+    try {
+      const v = await getCheckView(checkId);
+      check = v.check; drawSeats(); drawCart();
+    } catch (e) { handleApiError(e); }
+  };
+  /* Phase 3A (NG-D): quick-pick row — one-tap popular items across all
+     visible categories. Hidden when nothing is flagged popular. */
+  const drawQuickPick = () => {
+    const qp = $('#quick-pick');
+    const picks = [];
+    visibleMenu().forEach((c) => (c.items || []).forEach((i) => { if (i.popular) picks.push({ item: i, cat: c.name }); }));
+    if (!picks.length) { qp.style.display = 'none'; qp.innerHTML = ''; return; }
+    qp.style.display = 'flex';
+    qp.innerHTML = '<span class="qp-label">★ Quick pick</span>' + picks.map((p) =>
+      '<button class="item-card qp-card" data-qp="' + esc(String(p.item.id)) + '">' +
+      '<span class="nm">' + esc(p.item.name) + '</span><span class="pr">' + fmt(p.item.price_cents) + '</span></button>').join('');
+    $$('.qp-card', qp).forEach((b) => b.onclick = () => {
+      const p = picks.find((x) => String(x.item.id) === b.dataset.qp);
+      if (p) addItemFlow(p.item, p.cat);
+    });
+  };
+  drawQuickPick();
+  /* Phase 3A (P1-3/NG-E/NG-B): check settings — guest count, tab name,
+     coursing mode, order-level note, and manager-gated full-check void. */
+  $('#check-settings').onclick = () => {
+    let gc = check.guest_count || 2, coursing = check.coursing || 'off';
+    const bd = openModal('<h2>Check settings</h2>' +
+      '<div class="field"><label>Guests</label><div class="stepper"><button data-gc="dec">−</button><span class="val" id="cs-gc">' + gc + '</span><button data-gc="inc">+</button></div></div>' +
+      '<div class="field"><label for="cs-tab">Tab name <span class="muted small">(optional)</span></label>' +
+      '<input type="text" id="cs-tab" maxlength="40" value="' + esc(check.tab_name || '') + '" placeholder="e.g. Daniel" autocomplete="off"></div>' +
+      '<div class="field"><label for="cs-coursing">Firing</label><select id="cs-coursing">' +
+      ['off', 'optional', 'required'].map((c) => '<option value="' + c + '"' + (coursing === c ? ' selected' : '') + '>' +
+        (c === 'off' ? 'Off — send fires everything' : c === 'optional' ? 'By course — prompt, can send all' : 'By course — must pick a course') + '</option>').join('') +
+      '</select></div>' +
+      '<div class="field"><label for="cs-note">Order note <span class="muted small">(whole check — prints on every KDS ticket)</span></label>' +
+      '<input type="text" id="cs-note" maxlength="500" value="' + esc(check.order_note || '') + '" placeholder="e.g. allergy table — confirm with server" autocomplete="off"></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+      '<button class="btn btn-danger" id="cs-void" title="Void the entire check — manager approval required">Void check…</button>' +
+      '<button class="btn btn-primary" data-x="go">Save</button></div>');
+    $('[data-gc="dec"]', bd).onclick = () => { gc = Math.max(1, gc - 1); $('#cs-gc', bd).textContent = gc; };
+    $('[data-gc="inc"]', bd).onclick = () => { gc = Math.min(24, gc + 1); $('#cs-gc', bd).textContent = gc; };
+    $('[data-x="c"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = async () => {
+      const body = { guest_count: gc, tab_name: $('#cs-tab', bd).value.trim() || null,
+        coursing: $('#cs-coursing', bd).value, order_note: $('#cs-note', bd).value.trim() || null };
+      try {
+        await api('/api/checks/' + realId(checkId), 'PATCH', body);
+        closeModal(); toast('Check updated', 'ok');
+      } catch (e) { handleApiError(e); return; }
+      renderRoute(true);
+    };
+    /* NG-B: full-check void — manager role direct, servers enter a PIN. */
+    $('#cs-void', bd).onclick = () => {
+      const needPin = state.user.role !== 'manager';
+      const b2 = openModal('<h2>Void entire check</h2>' +
+        '<p class="muted">Void <b>every line</b> on this check? Fired lines send cancellation notices to the KDS. This is audit-logged and cannot be undone.</p>' +
+        '<div class="field"><label for="vc-reason">Reason (required)</label>' +
+        '<input type="text" id="vc-reason" maxlength="120" placeholder="e.g. walked out" autocomplete="off"></div>' +
+        (needPin ? '<div class="field"><label for="vc-pin">Manager PIN</label>' +
+          '<input type="password" id="vc-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' : '') +
+        '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+        '<button class="btn btn-danger" data-x="go">Void check</button></div>');
+      $('[data-x="c"]', b2).onclick = () => { closeModal(); };
+      $('[data-x="go"]', b2).onclick = async () => {
+        const reason = $('#vc-reason', b2).value.trim();
+        if (!reason) { toast('A reason is required to void a check', 'err'); return; }
+        const body = { reason };
+        if (needPin) {
+          const pin = $('#vc-pin', b2).value.trim();
+          if (!/^\d{4}$/.test(pin)) { toast("Enter the manager's 4-digit PIN", 'err'); return; }
+          body.manager_pin = pin;
+        }
+        try {
+          if (isOffline()) { toast('Voiding a check needs a connection — reconnect first', 'err'); return; }
+          const r = await api('/api/checks/' + realId(checkId) + '/void', 'POST', body);
+          closeModal(); closeModal();
+          toast('Check voided — ' + r.voided_items + ' line(s) voided', 'ok');
+          location.hash = '#/floor';
+        } catch (e) { handleApiError(e); }
+      };
+    };
+  };
   if (!document.getElementById('order-layout-css')) {
     const layout = document.createElement('style');
     layout.id = 'order-layout-css';
@@ -1656,10 +2090,13 @@ async function renderKds(app) {
       const note = (i.note || i.notes)
         ? '<div class="t-note">✎ ' + esc(i.note || i.notes) + '</div>'
         : '';
+      const seatLbl = i.seat ? 'SEAT ' + i.seat + (i.guest_name ? ' · ' + String(i.guest_name).toUpperCase() : '') : '';
       return '<div class="t-item"><div class="row1"><span class="qty">' + (i.qty || 1) + '×</span>' +
         '<span class="inm">' + esc(i.name || 'Item') + '</span>' +
-        (i.seat ? '<span class="seat">SEAT ' + i.seat + '</span>' : '') + '</div>' + mods + allergy + note + '</div>';
+        (seatLbl ? '<span class="seat">' + esc(seatLbl) + '</span>' : '') + '</div>' + mods + allergy + note + '</div>';
     }).join('');
+    /* Phase 3A: highlighted edits — the kitchen sees the delta, not a reprint. */
+    const deltas = (t.deltas || []).map((d) => window.ParityOrders.deltaHtml(d)).join('');
     const status = (t.status || 'new').toLowerCase().replace(/ /g, '_');
     const next = status === 'new' ? 'in_progress' : status === 'in_progress' ? 'fulfilled' : null;
     const bumpLabel = status === 'new' ? 'Start' : status === 'in_progress' ? 'Bump ✓' : null;
@@ -1676,7 +2113,7 @@ async function renderKds(app) {
       '<span class="t-timer ' + timerCls + '" data-ts="' + esc(String(ts)) + '">' + el.mmss + '</span></div>' +
       banners +
       courseLine(t) +
-      items +
+      items + deltas +
       (bumpLabel && !state.kds.recall
         ? '<div class="bump-row"><button class="btn ' + (status === 'new' ? 'btn-amber' : 'btn-green') + '" data-bump="' + esc(String(t.id)) + '" data-next="' + next + '">' + bumpLabel + '</button></div>'
         : '<div class="small muted" style="margin-top:8px">' + esc(fmtDateTime(ts)) + '</div>') +
@@ -1874,8 +2311,11 @@ async function renderPay(app, checkId) {
     (t.service_charge ? '<p class="small" style="color:var(--red)">Splitting is unavailable — a ' + pctLabel(sc.service_charge_pct) + ' service charge is applied to this check.</p>'
       : '<div class="split-row"><button class="btn" id="split-even">Split evenly</button>' +
         '<button class="btn" id="split-seat">Split by seat</button>' +
-        '<button class="btn" id="split-move">Move items</button></div>') +
+        '<button class="btn" id="split-move">Move items</button>' +
+        '<button class="btn" id="split-visual">Visual split</button></div>') +
     '</div>' +
+    '<div class="card"><h2>Merge</h2>' +
+    '<button class="btn" id="merge-into">Merge into another check…</button></div>' +
 
     '<div class="card"><h2>Payment</h2>' +
     '<div class="field"><label>Tip</label><div class="tip-row" id="tip-row">' +
@@ -1933,8 +2373,35 @@ async function renderPay(app, checkId) {
       if (checks.length && checks[0].id) { location.hash = '#/pay/' + checks[0].id; return; }
       renderRoute(true);
     } catch (e) {
+      /* Phase 3A (P1-3): manager-PIN fallback — staff without the split
+         permission get a 403 need_manager_pin, enter the PIN, and retry. */
+      if (e instanceof ApiError && e.status === 403 && e.body && e.body.need_manager_pin) {
+        const bd = openModal('<h2>Manager approval</h2>' +
+          '<p class="muted">Splitting checks needs the split permission. A manager can approve with their PIN.</p>' +
+          '<div class="field"><label for="sp-pin">Manager PIN</label>' +
+          '<input type="password" id="sp-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' +
+          '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+          '<button class="btn btn-primary" data-x="go">Approve split</button></div>');
+        $('[data-x="c"]', bd).onclick = closeModal;
+        $('[data-x="go"]', bd).onclick = async () => {
+          const pin = $('#sp-pin', bd).value.trim();
+          if (!/^\d{4}$/.test(pin)) { toast("Enter the manager's 4-digit PIN", 'err'); return; }
+          closeModal();
+          await doSplit(Object.assign({}, body, { manager_pin: pin }));
+        };
+        return;
+      }
       if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e);
     }
+  };
+
+  const splitVisualBtn = $('#split-visual');
+  if (splitVisualBtn) splitVisualBtn.onclick = async () => {
+    if (await window.ParityOrders.openVisualSplit(realId(checkId))) renderRoute(true);
+  };
+  const mergeIntoBtn = $('#merge-into');
+  if (mergeIntoBtn) mergeIntoBtn.onclick = async () => {
+    if (await window.ParityOrders.openMergePicker(realId(checkId))) renderRoute(true);
   };
 
   const splitEvenBtn = $('#split-even');
@@ -1963,8 +2430,9 @@ async function renderPay(app, checkId) {
       '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Confirm split</button></div>');
     const draw = () => {
       $('#sg-val', bd).textContent = nGroups;
+      const seatNames = check.seat_names || {};
       $('#sg-list', bd).innerHTML = Array.from({ length: guests }, (_, i) => i + 1).map((s) =>
-        '<label><span style="min-width:70px;font-weight:700">Seat ' + s + '</span><div class="stepper"><button data-as="-1" data-s="' + s + '">−</button><span class="val" data-gv="' + s + '">' + assign[s] + '</span><button data-as="1" data-s="' + s + '">+</button></div></label>').join('');
+        '<label><span style="min-width:70px;font-weight:700">Seat ' + s + (seatNames[s] ? '<br><span class="muted small">' + esc(seatNames[s]) + '</span>' : '') + '</span><div class="stepper"><button data-as="-1" data-s="' + s + '">−</button><span class="val" data-gv="' + s + '">' + assign[s] + '</span><button data-as="1" data-s="' + s + '">+</button></div></label>').join('');
       $$('[data-as]', bd).forEach((b) => b.onclick = (e) => {
         e.preventDefault();
         const s = b.dataset.s;
@@ -1994,14 +2462,35 @@ async function renderPay(app, checkId) {
     if (!items.length) { toast('No items to move'); return; }
     const bd = openModal('<h2>Move items</h2><p class="muted">Select items to move onto a brand-new check.</p>' +
       '<div class="checkbox-list">' + items.map((i) =>
-        '<label><input type="checkbox" data-mv="' + esc(String(i.id)) + '"><span style="flex:1">' + (i.qty > 1 ? i.qty + '× ' : '') + esc(i.name) + ' <span class="muted small">Seat ' + (i.seat || '—') + '</span></span><span>' + fmt(((i.unit_price_cents != null ? i.unit_price_cents : i.price_cents) || 0) * (i.qty || 1)) + '</span></label>').join('') +
-      '</div><div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Move to new check</button></div>');
+        '<label><input type="checkbox" data-mv="' + esc(String(i.id)) + '" data-mvqty="' + (i.qty || 1) + '"><span style="flex:1">' + (i.qty > 1 ? i.qty + '× ' : '') + esc(i.name) + ' <span class="muted small">Seat ' + (i.seat || '—') + '</span></span><span>' + fmt(((i.unit_price_cents != null ? i.unit_price_cents : i.price_cents) || 0) * (i.qty || 1)) + '</span></label>').join('') +
+      '</div><div class="field" id="mv-qty-wrap" style="display:none"><label>How many to move? <span class="muted small">(split the line)</span></label>' +
+      '<div class="stepper"><button data-mq="dec">−</button><span class="val" id="mv-qty">1</span><button data-mq="inc">+</button></div></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Move to new check</button></div>');
+    let moveQty = 1, moveMax = 1;
+    const refreshQty = () => {
+      const checked = $$('[data-mv]:checked', bd);
+      if (checked.length === 1) {
+        moveMax = Number(checked[0].dataset.mvqty) || 1;
+        if (moveMax > 1) {
+          $('#mv-qty-wrap', bd).style.display = 'block';
+          moveQty = Math.min(moveQty, moveMax);
+          $('#mv-qty', bd).textContent = moveQty;
+          return;
+        }
+      }
+      $('#mv-qty-wrap', bd).style.display = 'none'; moveQty = 1;
+    };
+    $$('[data-mv]', bd).forEach((c) => c.onchange = refreshQty);
+    $('[data-mq="dec"]', bd).onclick = () => { moveQty = Math.max(1, moveQty - 1); $('#mv-qty', bd).textContent = moveQty; };
+    $('[data-mq="inc"]', bd).onclick = () => { moveQty = Math.min(moveMax, moveQty + 1); $('#mv-qty', bd).textContent = moveQty; };
     $('[data-x="c"]', bd).onclick = closeModal;
     $('[data-x="go"]', bd).onclick = async () => {
       const ids = $$('[data-mv]:checked', bd).map((c) => c.dataset.mv);
       if (!ids.length) { toast('Select at least one item', 'err'); return; }
       closeModal();
-      await doSplit({ mode: 'move', item_ids: ids, target: 'new' });
+      const body = { mode: 'move', item_ids: ids, target: 'new' };
+      if (ids.length === 1 && moveMax > 1 && moveQty < moveMax) body.qty = moveQty;
+      await doSplit(body);
     };
   };
 
@@ -2379,7 +2868,21 @@ async function renderManager(app) {
     '<div class="stat"><div class="k">Today sales</div><div class="v">' + fmt(sales) + '</div></div>' +
     '<div class="stat"><div class="k">Open checks</div><div class="v amber">' + open + '</div></div>' +
     '<div class="stat"><div class="k">Covers</div><div class="v">' + covers + '</div></div>' +
-    '</div><p class="muted small mt">Detailed reconciliation lives under Finance &amp; Payouts — every fee named, no “Other” bucket.</p>';
+    '</div><p class="muted small mt">Detailed reconciliation lives under Finance &amp; Payouts — every fee named, no “Other” bucket.</p>' +
+    '<div class="card mt"><h3>Service</h3><p class="muted small">Turn-time target drives the floor timer badges — <span class="pill">ok</span> under 75%, <span class="pill held">watch</span> 75–100%, <span class="pill sent">over</span> past target.</p>' +
+    '<div class="field"><label for="turn-target">Turn-time target (minutes)</label><input type="number" id="turn-target" min="15" max="240" style="max-width:140px"></div>' +
+    '<button class="btn btn-primary btn-sm" id="turn-save">Save</button></div>';
+
+  try {
+    const tt = await api('/api/admin/floor/config');
+    $('#turn-target').value = tt.turn_time_target_min != null ? tt.turn_time_target_min : 90;
+  } catch (e) { /* leave blank */ }
+  $('#turn-save').onclick = async () => {
+    const v = Number($('#turn-target').value);
+    if (!Number.isInteger(v) || v < 15 || v > 240) { toast('Enter 15–240 minutes', 'err'); return; }
+    try { await api('/api/admin/floor/config', 'PUT', { turn_time_target_min: v }); toast('Turn target saved', 'ok'); }
+    catch (e) { handleApiError(e); }
+  };
 }
 
 /* ============================================================
@@ -3299,6 +3802,13 @@ async function renderMenuViewer(app) {
     mgrNav('menu') +
     '<div class="tabs" id="me-tabs"></div>' +
     '<div class="me-toolbar"><span class="spacer"></span><button class="btn btn-primary" id="me-add-item">+ Item</button></div>' +
+    '<div class="card" id="dp-card"><div class="row" style="align-items:center"><h3 style="margin:0">Daypart schedule</h3><span class="spacer"></span>' +
+    '<button class="btn btn-ghost btn-sm" id="dp-toggle">Show</button></div>' +
+    '<div id="dp-body" class="hidden">' +
+    '<p class="muted small">Windows switch the order menu by the site clock. Times are in America/Los_Angeles. “Also includes” lists extra daypart tags shown during this window (comma-separated).</p>' +
+    '<div id="dp-rows"></div>' +
+    '<div class="row" style="gap:8px;margin-top:8px"><button class="btn btn-ghost btn-sm" id="dp-add">+ Window</button>' +
+    '<button class="btn btn-primary btn-sm" id="dp-save">Save dayparts</button></div></div></div>' +
     '<div id="me-list"><p class="muted">Loading…</p></div>' +
     '<div class="card hidden" id="me-audit-card"><h3>Recent changes</h3><div id="me-audit-list"><p class="muted">Loading…</p></div></div>';
 
@@ -3418,6 +3928,10 @@ async function renderMenuViewer(app) {
       '<div class="field"><label>Image URL</label><input id="mi-img" value="' + esc(it && it.image_url ? it.image_url : '') + '" placeholder="https://…" inputmode="url"></div></div>' +
       '<h3>Modifiers</h3><div id="mi-mods"></div>' +
       '<button class="btn btn-ghost btn-sm" id="mi-addmod" type="button">+ Modifier</button>' +
+      '<div class="frow" style="margin-top:10px"><div class="field"><label class="check-line"><input type="checkbox" id="mi-popular"' + (it && it.popular ? ' checked' : '') + '> ★ Popular — show in the order-screen quick-pick row</label></div></div>' +
+      (it ? '<h3>Modifier groups <span class="muted small">(rules: required, min/max, 86, nested)</span></h3>' +
+        '<div id="mi-groups"><p class="muted small">Loading groups…</p></div>' +
+        '<button class="btn btn-ghost btn-sm" id="mi-addgroup" type="button">+ Modifier group</button>' : '') +
       '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
       (it ? '<button class="btn btn-danger" data-x="del">Delete</button>' : '') +
       '<button class="btn btn-primary" data-x="save">' + (it ? 'Save' : 'Add item') + '</button></div>');
@@ -3439,6 +3953,71 @@ async function renderMenuViewer(app) {
     }
     $('#mi-addmod', bd).onclick = () => { syncMods(); mods.push({ name: '', price_delta_cents: 0 }); drawMods(); };
     drawMods();
+    /* Phase 3A (P0-6): modifier-group manager UI — groups with required/
+       min/max rules, 86 toggles, defaults, nested groups. */
+    if (it) {
+      const gBox = $('#mi-groups', bd);
+      const drawGroups = async () => {
+        let groups = [];
+        try { const r = await api('/api/admin/menu/items/' + it.id + '/modifier-groups'); groups = r.groups || []; }
+        catch (e) { gBox.innerHTML = '<p class="muted small">Could not load groups.</p>'; return; }
+        const allOpts = [];
+        groups.forEach((g) => (g.options || []).forEach((o) => allOpts.push({ id: o.id, name: g.name + ' › ' + o.name })));
+        gBox.innerHTML = groups.map((g) =>
+          '<div class="me-group" data-g="' + g.id + '">' +
+          '<div class="me-grow"><b>' + esc(g.name) + '</b> ' +
+          '<span class="muted small">' + (g.required ? 'required' : 'optional') +
+          (g.max_select ? ' · ' + (g.min_select || 0) + '–' + g.max_select : (g.min_select ? ' · min ' + g.min_select : '')) +
+          (g.parent_option_id ? ' · nested' : '') + '</span></div>' +
+          '<div class="me-gopts">' + (g.options || []).map((o) =>
+            '<div class="me-modrow' + (o.active ? '' : ' mod-86') + '">' +
+            '<span class="mn">' + esc(o.name) + (o.is_default ? ' <span class="muted small">· default</span>' : '') + (o.active ? '' : ' <span class="pill held">86</span>') + '</span>' +
+            '<span class="mp">' + (o.price_delta_cents ? '+' + fmt(o.price_delta_cents) : 'incl.') + '</span>' +
+            '<button class="btn btn-ghost btn-sm" data-go86="' + o.id + '" title="' + (o.active ? '86 this modifier' : 'Bring back') + '">' + (o.active ? '86' : '↩') + '</button>' +
+            '<button class="btn btn-ghost btn-sm" data-godel="' + o.id + '" aria-label="Delete option">✕</button></div>').join('') +
+          '</div>' +
+          '<div class="me-gopt-add"><input data-goname="' + g.id + '" placeholder="New option name" maxlength="80">' +
+          '<input data-goprice="' + g.id + '" type="number" min="0" step="0.01" placeholder="$" style="max-width:80px" aria-label="Option price">' +
+          '<label class="muted small"><input type="checkbox" data-godef="' + g.id + '"> default</label>' +
+          '<button class="btn btn-ghost btn-sm" data-goadd="' + g.id + '">+ Option</button>' +
+          '<button class="btn btn-ghost btn-sm" data-gdel="' + g.id + '" title="Delete group">Delete group</button></div>' +
+          '</div>').join('') || '<p class="muted small">No groups yet.</p>';
+        $$('[data-go86]', gBox).forEach((b) => b.onclick = async () => {
+          const o = groups.flatMap((g) => g.options).find((x) => String(x.id) === b.dataset.go86);
+          try { await api('/api/admin/menu/modifier-options/' + b.dataset.go86, 'PUT', { active: !(o && o.active) }); await drawGroups(); }
+          catch (e) { handleApiError(e); }
+        });
+        $$('[data-godel]', gBox).forEach((b) => b.onclick = async () => {
+          try { await api('/api/admin/menu/modifier-options/' + b.dataset.godel, 'DELETE'); await drawGroups(); }
+          catch (e) { handleApiError(e); }
+        });
+        $$('[data-goadd]', gBox).forEach((b) => b.onclick = async () => {
+          const gid = b.dataset.goadd;
+          const name = $('[data-goname="' + gid + '"]', gBox).value.trim();
+          if (!name) { toast('Option name is required', 'err'); return; }
+          const price = Math.round((parseFloat($('[data-goprice="' + gid + '"]', gBox).value) || 0) * 100);
+          const isDef = $('[data-godef="' + gid + '"]', gBox).checked;
+          try { await api('/api/admin/menu/modifier-groups/' + gid + '/options', 'POST', { name, price_delta_cents: price, is_default: isDef }); await drawGroups(); }
+          catch (e) { handleApiError(e); }
+        });
+        $$('[data-gdel]', gBox).forEach((b) => b.onclick = async () => {
+          try { await api('/api/admin/menu/modifier-groups/' + b.dataset.gdel, 'DELETE'); await drawGroups(); }
+          catch (e) { handleApiError(e); }
+        });
+      };
+      drawGroups();
+      $('#mi-addgroup', bd).onclick = async () => {
+        const name = prompt('Group name (e.g. Cheese, Protein, Toppings):');
+        if (!name || !name.trim()) return;
+        const req = confirm('Required group? (OK = required, Cancel = optional)');
+        const maxS = prompt('Max selections (0 = unlimited):', '0');
+        try {
+          await api('/api/admin/menu/items/' + it.id + '/modifier-groups', 'POST',
+            { name: name.trim(), required: req, min_select: req ? 1 : 0, max_select: Math.max(0, parseInt(maxS || '0', 10) || 0) });
+          await drawGroups();
+        } catch (e) { handleApiError(e); }
+      };
+    }
     $('[data-x="cancel"]', bd).onclick = closeModal;
     $('[data-x="save"]', bd).onclick = async () => {
       syncMods();
@@ -3456,8 +4035,15 @@ async function renderMenuViewer(app) {
         modifiers: mods.filter((m) => m.name.trim() !== ''),
       };
       try {
+        let savedId = it ? it.id : null;
         if (it) await api('/api/admin/menu/items/' + it.id, 'PUT', body);
-        else await api('/api/admin/menu/items', 'POST', body);
+        else { const r = await api('/api/admin/menu/items', 'POST', body); savedId = r && r.id; }
+        /* Phase 3A (NG-D): popular flag rides the dedicated endpoint so the
+           quick-pick row updates without touching the rest of the item. */
+        const popBox = $('#mi-popular', bd);
+        if (popBox && savedId && popBox.checked !== !!(it && it.popular)) {
+          await api('/api/admin/menu/items/' + savedId + '/popular', 'PUT', { popular: popBox.checked });
+        }
         closeModal(); toast(it ? 'Item saved' : 'Item added', 'ok');
         me.activeCat = String(body.category_id);
         await refresh();
@@ -3490,6 +4076,41 @@ async function renderMenuViewer(app) {
   $('#me-add-cat').onclick = () => openCatModal(null);
   $('#me-add-item').onclick = () => { if (!me.cats.length) { toast('Add a category first', 'err'); return; } openItemModal(null); };
   $('#me-audit-toggle').onclick = toggleAudit;
+
+  /* Phase 3A: clock-driven daypart schedule (manager-only). */
+  let dpSchedule = [];
+  const dpRows = () => $('#dp-rows');
+  function drawDpRows() {
+    dpRows().innerHTML = dpSchedule.map((w, i) =>
+      '<div class="row" data-dpr="' + i + '" style="gap:8px;margin-bottom:8px;align-items:end">' +
+      '<div class="field" style="flex:2"><label>Name</label><input data-dpf="name" value="' + esc(w.name) + '" maxlength="40"></div>' +
+      '<div class="field" style="flex:1"><label>Start</label><input data-dpf="start" type="time" value="' + esc(w.start) + '"></div>' +
+      '<div class="field" style="flex:1"><label>End</label><input data-dpf="end" type="time" value="' + esc(w.end) + '"></div>' +
+      '<div class="field" style="flex:2"><label>Also includes</label><input data-dpf="also" value="' + esc((w.also || []).join(', ')) + '" placeholder="HH, BRUNCH"></div>' +
+      '<button class="icon-btn" data-dpdel="' + i + '" title="Remove window" aria-label="Remove window">✕</button></div>').join('') ||
+      '<p class="muted small">No windows — the whole menu shows all day.</p>';
+    $$('[data-dpdel]', dpRows()).forEach((b) => b.onclick = () => { dpSchedule.splice(Number(b.dataset.dpdel), 1); drawDpRows(); });
+  }
+  async function loadDp() {
+    try { const r = await api('/api/admin/dayparts'); dpSchedule = (r.schedule || []).map((w) => ({ name: w.name, start: w.start, end: w.end, also: w.also || [] })); }
+    catch (e) { handleApiError(e); return; }
+    drawDpRows();
+  }
+  $('#dp-toggle').onclick = () => { const b = $('#dp-body'); b.classList.toggle('hidden'); $('#dp-toggle').textContent = b.classList.contains('hidden') ? 'Show' : 'Hide'; };
+  $('#dp-add').onclick = () => { dpSchedule.push({ name: 'NEW', start: '08:00', end: '22:00', also: [] }); drawDpRows(); };
+  $('#dp-save').onclick = async () => {
+    const rows = $$('[data-dpr]', dpRows());
+    const schedule = rows.map((r) => {
+      const v = (f) => $('[data-dpf="' + f + '"]', r).value.trim();
+      return { name: v('name').toUpperCase(), start: v('start'), end: v('end'), also: v('also').split(',').map((x) => x.trim().toUpperCase()).filter(Boolean) };
+    });
+    try {
+      await api('/api/admin/dayparts', 'PUT', { schedule });
+      toast('Daypart schedule saved', 'ok');
+      await loadDp();
+    } catch (e) { handleApiError(e); }
+  };
+  loadDp();
   await refresh();
 }
 
@@ -3833,6 +4454,45 @@ async function renderTimeClock(app) {
 
   $('#tc-date').onchange = load;
   await load();
+}
+
+/* Phase 3A: visual split — drag items into new checks (simplified: checkbox picker). */
+function openVisualSplit(checkId, check) {
+  const items = (check.items || []).filter((i) => i.state !== 'void');
+  if (!items.length) { toast('No items to split'); return; }
+  const bd = openModal('<h2>Visual split</h2><p class="muted">Pick items for the new check — the rest stay here.</p>' +
+    '<div class="checkbox-list">' + items.map((i) =>
+      '<label><input type="checkbox" data-vs="' + esc(String(i.id)) + '"><span style="flex:1">' + (i.qty > 1 ? i.qty + '× ' : '') + esc(i.name) + '</span></label>').join('') +
+    '</div><div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Split selected</button></div>');
+  $('[data-x="c"]', bd).onclick = closeModal;
+  $('[data-x="go"]', bd).onclick = async () => {
+    const ids = $$('[data-vs]:checked', bd).map((c) => Number(c.dataset.vs));
+    closeModal();
+    if (!ids.length) { toast('Select at least one item'); return; }
+    try {
+      const r = await api('/api/checks/' + realId(checkId) + '/split', 'POST', { mode: 'move', item_ids: ids });
+      toast('Check split', 'ok');
+      renderRoute(true);
+    } catch (e) { handleApiError(e); }
+  };
+}
+
+/* Phase 3A: merge picker — merge this check into another open check. */
+function openMergePicker(checkId) {
+  const bd = openModal('<h2>Merge check</h2><p class="muted">Merge this check into another open check.</p>' +
+    '<div class="field"><label>Target check ID</label><input id="merge-target" type="number" min="1" placeholder="Check #"></div>' +
+    '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Merge</button></div>');
+  $('[data-x="c"]', bd).onclick = closeModal;
+  $('[data-x="go"]', bd).onclick = async () => {
+    const target = Number($('#merge-target', bd).value);
+    closeModal();
+    if (!target) { toast('Enter a target check ID'); return; }
+    try {
+      await api('/api/checks/' + realId(checkId) + '/merge', 'POST', { target_check_id: target });
+      toast('Checks merged', 'ok');
+      renderRoute(true);
+    } catch (e) { handleApiError(e); }
+  };
 }
 
 document.addEventListener('DOMContentLoaded', init);

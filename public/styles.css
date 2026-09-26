@@ -585,6 +585,30 @@ button, input, select, textarea { font-family: var(--sans); font-size: 1rem; col
 .stepper button { width: 44px; height: 44px; border-radius: 10px; border: 1px solid var(--line); background: var(--ink-2); color: var(--text); font-size: 1.3rem; }
 .stepper .val { min-width: 64px; text-align: center; font-size: 1.1rem; font-weight: 700; }
 
+/* ---- Phase 3A parity: order & check flow ---- */
+.timer-chip { display: inline-block; font-size: .72rem; font-weight: 700; border-radius: 999px; padding: 2px 8px; margin-top: 4px; background: var(--ink-3); color: var(--text-dim); border: 1px solid var(--line); white-space: nowrap; }
+.timer-chip.watch { background: var(--amber-dim); color: var(--amber); border-color: var(--amber); }
+.timer-chip.over { background: var(--red-dim); color: var(--red); border-color: var(--red); }
+.table-tile.over { border-color: var(--red); box-shadow: 0 0 0 2px var(--red-dim); }
+.table-tile.pick-src { outline: 3px solid var(--brass-hi); outline-offset: 2px; }
+.floor-banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 12px; background: var(--amber-dim); border: 1px solid var(--amber); margin-bottom: 12px; font-weight: 600; }
+.floor-banner .spacer { flex: 1; }
+.t-delta { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--amber-dim); border: 1px dashed var(--amber); }
+.t-delta .row1 { display: flex; align-items: baseline; gap: 8px; }
+.t-delta .qty { font-weight: 800; color: var(--amber); }
+.t-delta .inm { font-weight: 700; }
+.vs-cols { display: flex; gap: 10px; overflow-x: auto; padding: 4px 0 12px; }
+.vs-col { min-width: 210px; max-width: 260px; flex: 1; border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: var(--ink-2); }
+.vs-col.drop-hi { border-color: var(--brass-hi); box-shadow: 0 0 0 2px var(--brass-hi); }
+.vs-col-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; gap: 6px; }
+.vs-card { display: flex; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; background: var(--ink-3); cursor: grab; }
+.vs-card:active { cursor: grabbing; }
+.vs-card.sel { border-color: var(--brass-hi); box-shadow: 0 0 0 2px var(--brass-hi); }
+.vs-card .nm { flex: 1; min-width: 0; font-weight: 600; }
+.vs-card .pr { font-variant-numeric: tabular-nums; }
+.dp-pill { cursor: pointer; }
+.seat-chip .guest-nm { display: block; font-size: .68rem; font-weight: 600; color: var(--brass-hi); max-width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ---- receipt printing (NG-F): print CSS only, real data from the check ---- */
 #print-area { display: none; }
 .receipt { font-family: ui-monospace, Menlo, Consolas, monospace; color: #000; max-width: 320px; margin: 0 auto; }

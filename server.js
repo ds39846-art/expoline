@@ -56,6 +56,7 @@ const { DatabaseSync } = require('node:sqlite');
 
 const express = require('express');
 const { WebSocketServer } = require('ws');
+const parityOrders = require('./routes/parity_orders');
 
 /* ------------------------------ boot: seed -------------------------------- */
 const ROOT = __dirname;
@@ -272,6 +273,7 @@ require('./routes/giftcards').migrate(db);
 require('./routes/loyalty').migrate(db);
 require('./routes/kiosk').migrate(db);
 require('./routes/online').migrate(db);
+require('./routes/parity_orders').migrate(db);
 require('./routes/parity_kds_pay').migrate(db);
 
 /* Seed employees from existing users once SITE_ID is known (see below,
@@ -469,6 +471,7 @@ function getConfig() {
     stripe_demo_rate: parseFloat(m.stripe_demo_rate ?? '0.026'),
     stripe_demo_fixed_cents: parseInt(m.stripe_demo_fixed_cents ?? '15', 10),
     payout_lag_days: parseInt(m.payout_lag_days ?? '2', 10),
+    turn_time_target_min: parseInt(m.turn_time_target_min ?? '90', 10),
     drawer_close_role: m.drawer_close_role === 'server' ? 'server' : 'manager',
     site_tz: SITE_TZ,
     site_date: todaySite(),
@@ -638,10 +641,22 @@ function lineTotal(it) {
   const qty = it.qty || 0;
   let t = qty * (it.unit_price_cents || 0);
   for (const mod of mods) t += qty * (mod.price_delta_cents || 0);
+  // P0-1: item-level discounts reduce the line; a 100% discount zeroes it,
+  // never drives it negative.
+  return Math.max(0, t - (it.discount_cents || 0));
+}
+
+/** Pre-discount line value — gross vs net reporting (P0-1). */
+function lineGross(it) {
+  const mods = parseJson(it.modifiers_json, []);
+  const qty = it.qty || 0;
+  let t = qty * (it.unit_price_cents || 0);
+  for (const mod of mods) t += qty * (mod.price_delta_cents || 0);
   return t;
 }
 
-/** Recompute every money field for a check; returns totals {subtotal, surcharge, service_charge, tax, total, paid, balance}. */
+/** Recompute every money field for a check; returns totals {subtotal, gross_subtotal,
+ *  item_discount_cents, surcharge, service_charge, tax, total, paid, balance, comp}. */
 // Billable = every non-void line. Held + sent + fulfilled are all owed;
 // only 'void'/'cancelled' are excluded. (KDS send uses state='held' only.)
 const BILLABLE_STATES = "('held','sent','fulfilled')";
@@ -652,7 +667,10 @@ function calcTotals(checkId) {
   const items = db.prepare(
     `SELECT * FROM check_items WHERE check_id = ? AND state IN ${BILLABLE_STATES}`
   ).all(checkId);
+  const gross = items.reduce((s, it) => s + lineGross(it), 0);
   const subtotal = items.reduce((s, it) => s + lineTotal(it), 0);
+  // P0-1: gross − item discounts = net subtotal. Surcharges/tax apply to net.
+  const itemDiscounts = gross - subtotal;
   const surcharge = Math.round(subtotal * cfg.surcharge_pct);
   const check = db.prepare('SELECT guest_count, COALESCE(comp_cents, 0) AS comp_cents FROM checks WHERE id = ?').get(checkId);
   const guests = check ? (check.guest_count || 0) : 0;
@@ -671,7 +689,8 @@ function calcTotals(checkId) {
   ).get(checkId);
   const paid = (pay.amt || 0) - (pay.ref || 0);
   const balance = total - paid;
-  return { subtotal, surcharge, service_charge: serviceCharge, tax, total, paid, balance, comp };
+  return { subtotal, surcharge, service_charge: serviceCharge, tax, total, paid, balance, comp,
+    gross_subtotal: gross, item_discount_cents: itemDiscounts };
 }
 
 /** Recompute + persist the money columns on the checks row. Call on every mutation. */
@@ -704,6 +723,12 @@ function itemView(it) {
     sent_at: it.sent_at,
     added_at: it.added_at,
     line_total_cents: lineTotal(it),
+    // P0-1/P0-2: per-line discount + special request / allergy flag.
+    note: it.note || null,
+    allergy: it.allergy ? true : false,
+    allergy_detail: it.allergy_detail || null,
+    discount_cents: it.discount_cents || 0,
+    discount_reason: it.discount_reason || null,
   };
 }
 
@@ -717,6 +742,14 @@ function checkResponse(checkId) {
   const items = db.prepare(
     'SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? ORDER BY ci.added_at, ci.id'
   ).all(checkId);
+  // Seat-level guest names (phase 3A): attach once, follow the guest across
+  // splits and merges.
+  const seatNames = {};
+  try {
+    for (const r of db.prepare('SELECT seat, guest_name FROM check_seats WHERE site_id = ? AND check_id = ?').all(SITE_ID, checkId)) {
+      seatNames[r.seat] = r.guest_name;
+    }
+  } catch { /* table created by parity_orders migrate; absent on ancient DBs */ }
   return {
     id: c.id,
     uuid: c.uuid,
@@ -728,11 +761,17 @@ function checkResponse(checkId) {
     tab_name: c.tab_name,
     guest_count: c.guest_count,
     status: c.status,
+    coursing: c.coursing || 'off',
+    order_note: c.order_note || null,
+    seat_names: seatNames,
+    merged_from: parseJson(c.merged_from_json, []),
     subtotal_cents: t.subtotal,
     surcharge_cents: t.surcharge,
     service_charge_cents: t.service_charge,
     tax_cents: t.tax,
     comp_cents: t.comp,
+    gross_subtotal_cents: t.gross_subtotal,
+    item_discount_cents: t.item_discount_cents,
     total_cents: t.total,
     opened_at: c.opened_at,
     closed_at: c.closed_at,
@@ -807,6 +846,13 @@ function ticketView(row) {
   const chk = row.check_id
     ? db.prepare('SELECT channel, source FROM checks WHERE id = ?').get(row.check_id)
     : null;
+  // Phase 3A (NG-E): the check-level order note rides every ticket so the
+  // kitchen sees whole-order notes ("allergy table — confirm w/ server").
+  let orderNote = null;
+  try {
+    const c = db.prepare('SELECT order_note FROM checks WHERE id = ?').get(row.check_id);
+    orderNote = (c && c.order_note) || null;
+  } catch { /* checks.order_note owned by parity_orders migrate */ }
   const items = parseJson(row.items_json, []);
   return {
     id: row.id,
@@ -815,7 +861,11 @@ function ticketView(row) {
     station: row.station,
     table_label: row.table_label,
     server_name: row.server_name,
+    order_note: orderNote,
     items,
+    // Phase 3A: post-fire edit deltas — the kitchen sees the delta
+    // highlighted on the live ticket, not a reprinted ticket.
+    deltas: parseJson(row.deltas_json, []),
     status: row.status,
     created_at: row.created_at,
     bumped_at: row.bumped_at,
@@ -864,7 +914,7 @@ const TOKEN_TTL_MS = 12 * 3600 * 1000;
 
 function issueToken(user) {
   const token = crypto.randomBytes(16).toString('hex');
-  tokens.set(token, { id: user.id, name: user.name, role: user.role, expires_at: Date.now() + TOKEN_TTL_MS });
+  tokens.set(token, { id: user.id, name: user.name, role: user.role, expires_at: Date.now() + TOKEN_TTL_MS, split_allowed: user.split_allowed == null ? 1 : user.split_allowed });
   return token;
 }
 
@@ -972,12 +1022,12 @@ function authMiddleware(req, res, next) {
   // A token must not outlive the account behind it. Re-read the live user row
   // on every request: a deactivated staffer's token stops working immediately,
   // and a role change (promote/demote) applies to the live session at once.
-  const live = db.prepare('SELECT id, name, role FROM users WHERE id = ? AND COALESCE(active, 1) = 1').get(sess.id);
+  const live = db.prepare('SELECT id, name, role, COALESCE(split_allowed, 1) AS split_allowed FROM users WHERE id = ? AND COALESCE(active, 1) = 1').get(sess.id);
   if (!live) {
     tokens.delete(m[1]);
     return res.status(401).json({ error: 'Unauthorized: this account is no longer active' });
   }
-  req.user = { id: live.id, name: live.name, role: live.role };
+  req.user = { id: live.id, name: live.name, role: live.role, split_allowed: live.split_allowed };
   next();
 }
 
@@ -1180,7 +1230,7 @@ app.post('/api/auth/login', (req, res) => {
   const pin = req.body && req.body.pin != null ? String(req.body.pin) : '';
   if (!pin) { recordLoginAttempt(ip, false); return res.status(401).json({ error: 'PIN required' }); }
   // PINs compared as strings. Deactivated staff cannot log in.
-  const user = db.prepare('SELECT id, name, role FROM users WHERE pin = ? AND site_id = ? AND COALESCE(active, 1) = 1').get(pin, SITE_ID);
+  const user = db.prepare('SELECT id, name, role, COALESCE(split_allowed, 1) AS split_allowed FROM users WHERE pin = ? AND site_id = ? AND COALESCE(active, 1) = 1').get(pin, SITE_ID);
   if (!user) { recordLoginAttempt(ip, false); return res.status(401).json({ error: 'Invalid PIN' }); }
   recordLoginAttempt(ip, true);
   const token = issueToken(user);
@@ -1228,7 +1278,7 @@ app.get('/api/menu', (req, res) => {
     'SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id'
   ).all(SITE_ID);
   const itemStmt = db.prepare(
-    'SELECT id, name, description, price_cents, item_type, station, course, price_note FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
+    'SELECT id, name, description, price_cents, item_type, station, course, price_note, daypart, popular FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
   );
   const modStmt = db.prepare(
     'SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id'
@@ -1247,11 +1297,112 @@ app.get('/api/menu', (req, res) => {
       station: it.station,
       course: it.course,
       price_note: it.price_note,
+      // Effective daypart for clock-based auto-switching: item-level override
+      // wins, then the category's daypart parent, else all-day (null).
+      daypart: it.daypart || c.parent || null,
+      // Phase 3A (NG-D): popular flag — quick-pick row on the order screen
+      // (SpotOn V3 1:05 "quick buttons for popular items").
+      popular: it.popular ? true : false,
       modifiers: modStmt.all(it.id),
+      // Phase 3A (P0-6): modifier groups with required/min/max/nesting.
+      modifier_groups: getModifierGroups(it.id),
     })),
   }))));
 });
 // Menu admin lives under /api/admin/menu/* (manager only) — see below.
+
+/* --------------------- modifier groups (P0-6, Toast parity) ---------------- */
+/** Load an item's modifier groups with their options, in display order. */
+function getModifierGroups(menuItemId) {
+  const groups = db.prepare(
+    'SELECT * FROM menu_modifier_groups WHERE menu_item_id = ? ORDER BY sort_order, id'
+  ).all(menuItemId);
+  const optStmt = db.prepare('SELECT * FROM menu_modifier_options WHERE group_id = ? ORDER BY sort_order, id');
+  return groups.map((g) => ({
+    id: g.id, name: g.name, min_select: g.min_select, max_select: g.max_select,
+    required: g.required ? true : false, parent_group_id: g.parent_group_id,
+    parent_option_id: g.parent_option_id, sort_order: g.sort_order,
+    options: optStmt.all(g.id).map((o) => ({
+      id: o.id, name: o.name, price_delta_cents: o.price_delta_cents,
+      is_default: o.is_default ? true : false, active: o.active ? true : false,
+      sort_order: o.sort_order,
+    })),
+  }));
+}
+
+/** Validate + normalize client modifiers for a menu item.
+ *  Returns { error } or { modifiers: [{name, price_delta_cents, option_id?}] }.
+ *  - Items WITH groups: every selection must match an option of an applicable
+ *    group (nested groups apply only when their parent option is selected);
+ *    required/min/max enforced; prices come from the menu option, never the
+ *    client; 86'd (inactive) options rejected.
+ *  - Items without groups: legacy shape check (backward compatible). */
+function resolveModifiers(menuItemId, modifiers) {
+  const sel = Array.isArray(modifiers) ? modifiers : [];
+  /* Phase 3A (NG-E): per-modifier notes ("light on the cheese") — a short
+     string (≤60) that rides the modifier into KDS. */
+  const modNote = (m) => {
+    if (m.note === undefined || m.note === null || m.note === '') return undefined;
+    if (typeof m.note !== 'string' || m.note.length > 60) return { error: 'modifier note must be a string of at most 60 characters' };
+    return m.note.trim() || undefined;
+  };
+  const groups = getModifierGroups(menuItemId);
+  if (!groups.length) {
+    /* Phase 1B money audit: modifiers are NEVER trusted from the client.
+       Each modifier must exist on this menu item (matched by name); the
+       canonical price_delta_cents from menu_modifiers is used. */
+    const modStmt = db.prepare('SELECT price_delta_cents FROM menu_modifiers WHERE item_id = ? AND name = ?');
+    const priced = [];
+    for (const m of sel) {
+      if (!m || typeof m.name !== 'string' || !m.name.trim()) {
+        return { error: 'Each modifier needs a name' };
+      }
+      const row = modStmt.get(menuItemId, m.name.trim());
+      if (!row) {
+        return { error: `Unknown modifier "${m.name.trim()}" — modifiers must come from the menu` };
+      }
+      const n = modNote(m);
+      if (n && n.error) return n;
+      const o = { name: m.name.trim().slice(0, 80), price_delta_cents: row.price_delta_cents };
+      if (n) o.note = n;
+      priced.push(o);
+    }
+    return { modifiers: priced };
+  }
+  const optById = new Map();
+  const optByName = new Map();
+  for (const g of groups) for (const o of g.options) {
+    optById.set(o.id, { opt: o, group: g });
+    if (!optByName.has(o.name)) optByName.set(o.name, { opt: o, group: g });
+  }
+  const matched = [];
+  for (const m of sel) {
+    if (!m || typeof m.name !== 'string') return { error: 'Each modifier needs {name}' };
+    let hit = null;
+    if (m.option_id != null) hit = optById.get(Number(m.option_id)) || null;
+    if (!hit) hit = optByName.get(m.name.trim()) || null;
+    if (!hit) return { error: `Modifier "${m.name}" is not offered for this item` };
+    if (!hit.opt.active) return { error: `Modifier "${hit.opt.name}" is 86'd` };
+    const n = modNote(m);
+    if (n && n.error) return n;
+    matched.push({ hit, note: n || undefined });
+  }
+  // Nested groups apply only when their parent option is selected.
+  const selectedOptIds = new Set(matched.map((x) => x.hit.opt.id));
+  const applicable = groups.filter((g) =>
+    !g.parent_group_id || (g.parent_option_id && selectedOptIds.has(g.parent_option_id)));
+  for (const g of applicable) {
+    const n = matched.filter((x) => x.hit.group.id === g.id).length;
+    if (g.required && n === 0) return { error: `${g.name}: please choose at least one` };
+    if (g.min_select > 0 && n < g.min_select) return { error: `${g.name}: pick at least ${g.min_select}` };
+    if (g.max_select > 0 && n > g.max_select) return { error: `${g.name}: at most ${g.max_select}` };
+  }
+  return { modifiers: matched.map((x) => {
+    const o = { name: x.hit.opt.name, price_delta_cents: x.hit.opt.price_delta_cents, option_id: x.hit.opt.id };
+    if (x.note) o.note = x.note;
+    return o;
+  }) };
+}
 
 /* ---------------------------------- zones ---------------------------------- */
 app.get('/api/zones', (req, res) => {
@@ -1567,6 +1718,20 @@ app.post('/api/admin/menu/86/:id', managerOnly(), (req, res) => {
   res.json({ id: it.id, name: it.name, active, eightysixed: active === 0 });
 });
 
+/* Phase 3A (NG-D): popular / quick-pick flag — the order screen's quick-pick
+ * row (SpotOn V3 1:05 "quick buttons for popular items"). Manager-only;
+ * 86'd items never appear in the quick-pick row even when flagged. */
+app.put('/api/admin/menu/items/:id/popular', managerOnly(), (req, res) => {
+  const it = menuItemById(req.params.id);
+  if (!it) return res.status(404).json({ error: 'Menu item not found' });
+  const popular = (req.body || {}).popular;
+  if (typeof popular !== 'boolean') return res.status(400).json({ error: 'popular must be a boolean' });
+  db.prepare('UPDATE menu_items SET popular = ? WHERE id = ?').run(popular ? 1 : 0, it.id);
+  auditMenu(req, popular ? 'item.popular_on' : 'item.popular_off', { item_id: it.id, category_id: it.category_id }, { name: it.name, popular });
+  broadcastMenuUpdated();
+  res.json({ id: it.id, name: it.name, popular });
+});
+
 app.get('/api/admin/menu/audit', managerOnly(), (req, res) => {
   const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '50', 10) || 50));
   const rows = db.prepare('SELECT id, actor, action, item_id, category_id, details, created_at FROM menu_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit);
@@ -1621,6 +1786,66 @@ app.get('/api/checks/:id', serverPlus(), (req, res) => {
   res.json(check);
 });
 
+/* Phase 3A (P1): editable check metadata — guest count, tab name, coursing.
+ * Shrinking guest_count is blocked when billable lines or seat names sit
+ * beyond the new count (re-seat or split first). */
+app.patch('/api/checks/:id', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot edit a ${check.status} check` });
+  const patch = {};
+  if (b.tab_name !== undefined) {
+    if (b.tab_name !== null && (typeof b.tab_name !== 'string' || b.tab_name.length > 40)) {
+      return res.status(400).json({ error: 'tab_name must be a string of at most 40 characters' });
+    }
+    patch.tab_name = b.tab_name === null ? null : b.tab_name.trim() || null;
+  }
+  if (b.guest_count !== undefined) {
+    if (!isInt(b.guest_count) || b.guest_count < 1 || b.guest_count > 24) {
+      return res.status(400).json({ error: 'guest_count must be an integer between 1 and 24' });
+    }
+    if (b.guest_count < check.guest_count) {
+      const beyond = db.prepare(
+        `SELECT COUNT(*) AS n FROM check_items WHERE check_id = ? AND state IN ${BILLABLE_STATES} AND seat > ?`
+      ).get(check.id, b.guest_count).n;
+      let named = 0;
+      try {
+        named = db.prepare('SELECT COUNT(*) AS n FROM check_seats WHERE site_id = ? AND check_id = ? AND seat > ?')
+          .get(SITE_ID, check.id, b.guest_count).n;
+      } catch { /* table owned by parity_orders migrate */ }
+      if (beyond > 0 || named > 0) {
+        return res.status(400).json({ error: `Seat(s) beyond ${b.guest_count} still have items or guest names — re-seat first` });
+      }
+    }
+    patch.guest_count = b.guest_count;
+  }
+  if (b.coursing !== undefined) {
+    if (!['off', 'optional', 'required'].includes(b.coursing)) {
+      return res.status(400).json({ error: "coursing must be one of off|optional|required" });
+    }
+    patch.coursing = b.coursing;
+  }
+  /* Phase 3A (NG-E): order-level notes (SpotOn V3 1:55 — "add notes to the
+     entire order"). ≤500 chars, clearable with null; flows to KDS tickets. */
+  if (b.order_note !== undefined) {
+    if (b.order_note !== null && (typeof b.order_note !== 'string' || b.order_note.length > 500)) {
+      return res.status(400).json({ error: 'order_note must be a string of at most 500 characters' });
+    }
+    patch.order_note = b.order_note === null ? null : b.order_note.trim() || null;
+  }
+  if (!Object.keys(patch).length) {
+    return res.status(400).json({ error: 'Nothing to update — send guest_count, tab_name, coursing, or order_note' });
+  }
+  const before = { guest_count: check.guest_count, tab_name: check.tab_name, coursing: check.coursing || 'off', order_note: check.order_note || null };
+  const sets = Object.keys(patch).map((k) => `${k} = ?`).join(', ');
+  db.prepare(`UPDATE checks SET ${sets} WHERE id = ?`).run(...Object.values(patch), check.id);
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  auditApproval(req, 'edit_check', { check_id: check.id }, { before, after: Object.assign({}, before, patch) });
+  res.json(Object.assign(checkResponse(check.id), { totals: t }));
+});
+
 app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
@@ -1636,22 +1861,28 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
   }
   if (!isInt(qty) || qty < 1 || qty > 999) return res.status(400).json({ error: 'qty must be a positive integer (max 999)' });
   if (!Array.isArray(modifiers)) return res.status(400).json({ error: 'modifiers must be an array' });
-  // Phase 1B money audit: modifiers are NEVER trusted from the client.
-  // Each modifier must exist on this menu item (matched by name); the
-  // canonical price_delta_cents from menu_modifiers is used and any
-  // client-supplied price_delta_cents is ignored. This closes the
-  // arbitrary-discount hole (e.g. a client-invented -$50.00 modifier).
-  const modStmt = db.prepare('SELECT price_delta_cents FROM menu_modifiers WHERE item_id = ? AND name = ?');
-  const pricedMods = [];
-  for (const m of modifiers) {
-    if (!m || typeof m.name !== 'string' || !m.name.trim()) {
-      return res.status(400).json({ error: 'Each modifier needs a name' });
+  // Phase 3A (P0-6): group-aware modifier validation — required/min/max
+  // enforced, 86'd options rejected, prices taken from the menu option.
+  // (Phase 1B money audit preserved: client prices are never trusted.)
+  const rmod = resolveModifiers(menuItem.id, modifiers);
+  if (rmod.error) return res.status(400).json({ error: rmod.error });
+  const cleanMods = rmod.modifiers;
+  // Phase 3A (P0-2): per-line special request + allergy flag.
+  const b = req.body || {};
+  let note = null;
+  if (b.note !== undefined && b.note !== null) {
+    if (typeof b.note !== 'string' || b.note.length > 140) {
+      return res.status(400).json({ error: 'note must be a string of at most 140 characters' });
     }
-    const row = modStmt.get(menuItem.id, m.name.trim());
-    if (!row) {
-      return res.status(400).json({ error: `Unknown modifier "${m.name.trim()}" for "${menuItem.name}" — modifiers must come from the menu` });
+    note = b.note.trim() || null;
+  }
+  const allergy = b.allergy ? 1 : 0;
+  let allergyDetail = null;
+  if (b.allergy_detail !== undefined && b.allergy_detail !== null) {
+    if (typeof b.allergy_detail !== 'string' || b.allergy_detail.length > 140) {
+      return res.status(400).json({ error: 'allergy_detail must be a string of at most 140 characters' });
     }
-    pricedMods.push({ name: m.name.trim(), price_delta_cents: row.price_delta_cents });
+    allergyDetail = b.allergy_detail.trim() || null;
   }
   // MP (market price) items: price_cents = 0 requires a manager-entered price.
   // Fixed-price items ALWAYS use the menu price — a request-supplied
@@ -1684,8 +1915,10 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
       return res.status(400).json({ error: 'That item was just 86\'d — please reorder' });
     }
     const r = db.prepare(
-      "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
-    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(pricedMods), menuItem.course, nowIso());
+      `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
+         note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
+    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(cleanMods), menuItem.course, nowIso(),
+      note, allergy, allergyDetail);
     item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
     persistTotals(check.id);
     db.exec('COMMIT');
@@ -1772,14 +2005,95 @@ app.post('/api/checks/:id/void-item', serverPlus(), (req, res) => {
   res.json({ voided: item.id, state: 'cancelled', approved_by: mgr.name, totals: t });
 });
 
+
 /**
- * PATCH /api/checks/:id/items/:item_id {qty?, modifiers?, manager_pin?, manager_pin_hash?, approval_nonce?}
+ * POST /api/checks/:id/void {manager_pin?, reason}
+ * Phase 3A (NG-B): full-check void — Toast overflow → "Void order" parity.
+ * - Manager role approves directly; a server must supply a manager PIN
+ *   (verifyManagerPin) — the void is always manager-gated and audit-logged.
+ * - reason is required (≤120 chars).
+ * - Rejected when the check has any payments (route to refund instead).
+ * - Voids every billable line (held/sent/fulfilled → cancelled) in one
+ *   transaction, pushes KDS cancellation deltas for fired lines, marks the
+ *   check 'void', and broadcasts.
+ */
+app.post('/api/checks/:id/void', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const checkId = Number(req.params.id);
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot void a ${check.status} check` });
+  const reason = cleanLabel(b.reason);
+  if (!reason) return res.status(400).json({ error: 'A void reason is required' });
+  if (reason.length > 120) return res.status(400).json({ error: 'reason must be at most 120 characters' });
+  let mgr = null;
+  if (req.user.role === 'manager') {
+    mgr = { id: req.user.id, name: req.user.name };
+  } else {
+    mgr = verifyManagerPin(b.manager_pin);
+    if (!mgr) {
+      return res.status(403).json({ error: "Voiding a whole check needs a manager's approval", need_manager_pin: true });
+    }
+  }
+  const payCount = db.prepare('SELECT COUNT(*) AS n FROM payments WHERE check_id = ?').get(check.id).n;
+  if (payCount > 0) {
+    return res.status(400).json({ error: 'This check has payments — use refund instead of void', route_to_refund: true });
+  }
+  const billable = db.prepare(
+    `SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id
+     WHERE ci.check_id = ? AND ci.state IN ${BILLABLE_STATES} ORDER BY ci.id`
+  ).all(check.id);
+  const voidedIds = billable.map((i) => i.id);
+  const firedIds = new Set(billable.filter((i) => i.state !== 'held').map((i) => i.id));
+  let kdsDeltas = 0;
+  const at = nowIso();
+  withTransaction(() => {
+    if (voidedIds.length) {
+      db.prepare(`UPDATE check_items SET state = 'cancelled' WHERE id IN (${voidedIds.map(() => '?').join(',')})`)
+        .run(...voidedIds);
+    }
+    // KDS cancellation notices for lines the kitchen already fired.
+    const tickets = db.prepare('SELECT * FROM kds_tickets WHERE check_id = ?').all(check.id);
+    for (const t of tickets) {
+      const lines = parseJson(t.items_json, []);
+      const hit = lines.filter((l) => firedIds.has(l.item_id));
+      if (!hit.length) continue;
+      const deltas = parseJson(t.deltas_json, []);
+      for (const l of hit) {
+        deltas.push({ type: 'void', item_id: l.item_id, name: l.name, qty: l.qty, seat: l.seat,
+          actor: req.user ? req.user.name : '?', manager: mgr.name, reason, voided_at: at });
+        kdsDeltas += 1;
+      }
+      db.prepare('UPDATE kds_tickets SET deltas_json = ? WHERE id = ?').run(JSON.stringify(deltas), t.id);
+      broadcastTicketUpdated(ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(t.id)));
+    }
+    db.prepare("UPDATE checks SET status = 'void', closed_at = ? WHERE id = ?").run(at, check.id);
+  });
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  auditApproval(req, 'void_check', { check_id: check.id },
+    { approver: mgr.name, approver_id: mgr.id,
+      before: { status: 'open', billable_items: voidedIds.length },
+      after: { status: 'void' }, reason, voided_items: voidedIds.length, kds_deltas: kdsDeltas });
+  res.json({ voided: check.id, status: 'void', voided_items: voidedIds.length,
+    approved_by: mgr.name, kds_deltas: kdsDeltas, totals: t });
+});
+
+
+/**
+ * PATCH /api/checks/:id/items/:item_id {qty?, modifiers?, seat?, course?, note?, allergy?, allergy_detail?,
+ *   manager_pin?, manager_pin_hash?, approval_nonce?}
  * Edit an item on an open check: change qty and/or modifiers.
+ * (Daniel's hotfix — kept verbatim; the "Phase 3A ext" blocks below extend it
+ * with seat reassignment, course change, and per-line special-request /
+ * allergy flags for Toast/SpotOn parity. When merging upstream, keep the
+ * hotfix and apply only the marked extension blocks.)
  * - held items: the server/kitchen can edit directly (nothing fired yet).
  * - sent/fulfilled items: the kitchen already fired — requires manager
  *   approval (same live-PIN or offline hash+nonce mechanism as void-item),
  *   and the change is audit-logged with before/after.
- * Modifier validation mirrors POST /items. Fixed-price items keep the menu
+ * Modifier validation mirrors POST /items (now group-aware: required/min/max
+ * and 86'd options enforced server-side). Fixed-price items keep the menu
  * price; market-price items keep their manager-entered price (price itself
  * is never editable here — void and re-add instead).
  */
@@ -1805,15 +2119,44 @@ app.patch('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
   }
   if (b.modifiers !== undefined) {
     if (!Array.isArray(b.modifiers)) return res.status(400).json({ error: 'modifiers must be an array' });
-    for (const m of b.modifiers) {
-      if (!m || typeof m.name !== 'string' || !isInt(m.price_delta_cents)) {
-        return res.status(400).json({ error: 'Each modifier needs {name, price_delta_cents}' });
-      }
-    }
-    patch.modifiers = b.modifiers.map((m) => ({ name: m.name.trim().slice(0, 80), price_delta_cents: m.price_delta_cents }));
+    /* Phase 3A ext: group-aware validation — required/min/max enforced, 86'd
+       options rejected, prices taken from the menu option (never the client). */
+    const rmod = resolveModifiers(item.menu_item_id, b.modifiers);
+    if (rmod.error) return res.status(400).json({ error: rmod.error });
+    patch.modifiers = rmod.modifiers;
   }
-  if (!('qty' in patch) && !('modifiers' in patch)) {
-    return res.status(400).json({ error: 'Nothing to update — send qty and/or modifiers' });
+  /* Phase 3A ext: seat reassignment (Toast Order-by-Seat parity), course change,
+     per-line special request + allergy flag (SpotOn parity). */
+  if (b.seat !== undefined) {
+    if (!isInt(b.seat) || b.seat < 1 || b.seat > check.guest_count) {
+      return res.status(400).json({ error: `seat must be an integer between 1 and ${check.guest_count}` });
+    }
+    patch.seat = b.seat;
+  }
+  if (b.course !== undefined) {
+    const COURSES = ['drink', 'appetizer', 'entree', 'dessert'];
+    if (b.course !== null && !COURSES.includes(b.course)) {
+      return res.status(400).json({ error: 'course must be one of drink|appetizer|entree|dessert' });
+    }
+    patch.course = b.course;
+  }
+  if (b.note !== undefined) {
+    if (b.note !== null && (typeof b.note !== 'string' || b.note.length > 140)) {
+      return res.status(400).json({ error: 'note must be a string of at most 140 characters' });
+    }
+    patch.note = b.note === null ? null : b.note.trim();
+  }
+  if (b.allergy !== undefined) patch.allergy = b.allergy ? 1 : 0;
+  if (b.allergy_detail !== undefined) {
+    if (b.allergy_detail !== null && (typeof b.allergy_detail !== 'string' || b.allergy_detail.length > 140)) {
+      return res.status(400).json({ error: 'allergy_detail must be a string of at most 140 characters' });
+    }
+    patch.allergy_detail = b.allergy_detail === null ? null : b.allergy_detail.trim();
+  } else if (b.allergy === false) {
+    patch.allergy_detail = null; // clearing the flag clears the detail
+  }
+  if (!Object.keys(patch).length) {
+    return res.status(400).json({ error: 'Nothing to update — send qty, modifiers, seat, course, note, or allergy' });
   }
   let approval = null;
   if (item.state !== 'held') {
@@ -1822,12 +2165,41 @@ app.patch('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
     if (approval.offline && approval.replay) {
       // Idempotent retry after a dropped response — the edit already applied.
       const cur = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(item.id);
-      return res.json(Object.assign(itemView(cur), { already_applied: true, approved_by: approval.mgr.name }));
+      /* Phase 3A ext: wrap the hotfix's flat itemView in {item, fired} for
+         test21/UI compatibility — hotfix data (itemView, approved_by) kept. */
+      return res.json({ item: itemView(cur), fired: item.state !== 'held',
+        already_applied: true, approved_by: approval.mgr.name, kds_deltas: 0 });
     }
   }
-  const before = { qty: item.qty, modifiers: parseJson(item.modifiers_json, []) };
+  const before = { qty: item.qty, modifiers: parseJson(item.modifiers_json, []),
+    seat: item.seat, course: item.course, note: item.note || null,
+    allergy: !!item.allergy, allergy_detail: item.allergy_detail || null };
+  /* Phase 3A ext: no-change edit is a 400 (matches the hotfix-era contract
+     test21 asserts) — compare the would-be after against before, with
+     modifiers normalized so key order can't fake a change. */
+  const normMods = (arr) => (arr || []).map((m) => [m.name, m.price_delta_cents || 0, m.option_id || null, m.note || null].join('|')).sort();
+  const after = Object.assign({}, before);
+  if (patch.qty !== undefined) after.qty = patch.qty;
+  if (patch.modifiers !== undefined) after.modifiers = patch.modifiers;
+  if (patch.seat !== undefined) after.seat = patch.seat;
+  if (patch.course !== undefined) after.course = patch.course;
+  if (patch.note !== undefined) after.note = patch.note;
+  if (patch.allergy !== undefined) after.allergy = !!patch.allergy;
+  if (patch.allergy_detail !== undefined) after.allergy_detail = patch.allergy_detail;
+  const same = after.qty === before.qty && after.seat === before.seat && after.course === before.course &&
+    after.note === before.note && after.allergy === before.allergy && after.allergy_detail === before.allergy_detail &&
+    JSON.stringify(normMods(after.modifiers)) === JSON.stringify(normMods(before.modifiers));
+  if (same) {
+    return res.status(400).json({ error: 'No changes — the item already has these values' });
+  }
   if (patch.qty !== undefined) db.prepare('UPDATE check_items SET qty = ? WHERE id = ?').run(patch.qty, item.id);
   if (patch.modifiers !== undefined) db.prepare('UPDATE check_items SET modifiers_json = ? WHERE id = ?').run(JSON.stringify(patch.modifiers), item.id);
+  /* Phase 3A ext */
+  if (patch.seat !== undefined) db.prepare('UPDATE check_items SET seat = ? WHERE id = ?').run(patch.seat, item.id);
+  if (patch.course !== undefined) db.prepare('UPDATE check_items SET course = ? WHERE id = ?').run(patch.course, item.id);
+  if (patch.note !== undefined) db.prepare('UPDATE check_items SET note = ? WHERE id = ?').run(patch.note, item.id);
+  if (patch.allergy !== undefined) db.prepare('UPDATE check_items SET allergy = ? WHERE id = ?').run(patch.allergy, item.id);
+  if (patch.allergy_detail !== undefined) db.prepare('UPDATE check_items SET allergy_detail = ? WHERE id = ?').run(patch.allergy_detail, item.id);
   if (approval && approval.offline && !approval.replay) consumeOfflineApproval(approval.nonce, check.id, item.id, approval.mgr);
   const t = persistTotals(check.id);
   broadcastCheckUpdated(check.id);
@@ -1835,11 +2207,134 @@ app.patch('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
   if (approval) {
     auditApproval(req, 'edit_item', { check_id: check.id, item_id: item.id },
       { approver: approval.mgr.name, approver_id: approval.mgr.id,
-        before, after: { qty: updated.qty, modifiers: parseJson(updated.modifiers_json, []) },
+        before, after: { qty: updated.qty, modifiers: parseJson(updated.modifiers_json, []),
+        seat: updated.seat, course: updated.course, note: updated.note || null,
+        allergy: !!updated.allergy, allergy_detail: updated.allergy_detail || null },
         offline: approval.offline || undefined, approval_nonce: approval.offline ? approval.nonce : undefined });
   }
-  res.json(Object.assign(itemView(updated), approval ? { approved_by: approval.mgr.name } : {}, { totals: t }));
+  /* Phase 3A ext: post-fire edits land highlighted on the kitchen's open
+     tickets (deltas), not as a reprint. Held-item edits never fired. */
+  let kdsDeltas = 0;
+  if (item.state !== 'held') {
+    try {
+      const tickets = db.prepare("SELECT * FROM kds_tickets WHERE check_id = ? AND site_id = ? AND status IN ('new','in_progress')").all(check.id, SITE_ID);
+      const delta = { type: 'edit', item_id: item.id, name: item.name,
+        before, after: { qty: updated.qty, modifiers: parseJson(updated.modifiers_json, []),
+          seat: updated.seat, course: updated.course, note: updated.note || null,
+          allergy: !!updated.allergy, allergy_detail: updated.allergy_detail || null },
+        actor: req.user ? req.user.name : '?', manager: approval ? approval.mgr.name : null,
+        edited_at: new Date().toISOString() };
+      for (const t of tickets) {
+        const lines = parseJson(t.items_json, []);
+        if (!lines.some((l) => l.item_id === item.id)) continue;
+        const deltas = parseJson(t.deltas_json, []);
+        deltas.push(delta);
+        db.prepare('UPDATE kds_tickets SET deltas_json = ? WHERE id = ?').run(JSON.stringify(deltas), t.id);
+        kdsDeltas += 1;
+        broadcastTicketUpdated(ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(t.id)));
+      }
+    } catch { /* deltas_json owned by parity_orders migrate */ }
+  }
+  /* Phase 3A ext: wrap the hotfix's flat itemView in {item, fired} for
+     test21/UI compatibility — hotfix data (itemView, totals, approved_by,
+     kds_deltas) kept. */
+  res.json(Object.assign({ item: itemView(updated), fired: item.state !== 'held' },
+    approval ? { approved_by: approval.mgr.name } : {}, { totals: t, kds_deltas: kdsDeltas }));
 });
+/**
+ * POST /api/checks/:id/items/:item_id/discount {amount_cents? | percent?, reason, manager_pin?}
+ * Item-level discount / comp (Toast/SpotOn parity, P0-1).
+ * - amount_cents XOR percent (percent is round-half-up of the pre-discount line).
+ * - 0 < discount <= line gross: a 100% discount zeroes the line, never negative.
+ * - reason required (audit). Held lines: server+ may discount (audit-logged).
+ *   Sent/fulfilled lines: manager PIN required (same mechanism as void-item).
+ * - Replaces any existing line discount (single discount per line); the
+ *   before/after is audit-logged. Discounts survive splits (prorated).
+ */
+app.post('/api/checks/:id/items/:item_id/discount', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const checkId = Number(req.params.id);
+  const itemId = Number(req.params.item_id);
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot discount items on a ${check.status} check` });
+  const item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ? AND ci.check_id = ?')
+    .get(itemId, check.id);
+  if (!item) return res.status(404).json({ error: 'Item not found on this check' });
+  if (item.state === 'cancelled') return res.status(400).json({ error: 'Cannot discount a voided item' });
+  const gross = lineGross(item);
+  if (gross <= 0) return res.status(400).json({ error: 'Cannot discount a zero-value line' });
+  let discount;
+  if (b.amount_cents !== undefined && b.percent !== undefined) {
+    return res.status(400).json({ error: 'Send amount_cents or percent, not both' });
+  } else if (b.amount_cents !== undefined) {
+    if (!isInt(b.amount_cents) || b.amount_cents <= 0) {
+      return res.status(400).json({ error: 'amount_cents must be a positive integer' });
+    }
+    discount = b.amount_cents;
+  } else if (b.percent !== undefined) {
+    if (typeof b.percent !== 'number' || !(b.percent > 0) || b.percent > 100) {
+      return res.status(400).json({ error: 'percent must be a number between 0 (exclusive) and 100' });
+    }
+    discount = Math.round(gross * b.percent / 100);
+  } else {
+    return res.status(400).json({ error: 'amount_cents or percent is required' });
+  }
+  if (discount <= 0) return res.status(400).json({ error: 'Discount must be greater than zero' });
+  if (discount > gross) {
+    return res.status(400).json({ error: `Discount ${discount}¢ exceeds the line value of ${gross}¢` });
+  }
+  const reason = typeof b.reason === 'string' ? b.reason.trim().slice(0, 120) : '';
+  if (!reason) return res.status(400).json({ error: 'reason is required' });
+
+  // Sent/fulfilled lines need manager approval (money out the door).
+  let approval = null;
+  if (item.state !== 'held') {
+    approval = resolveVoidApproval(req, b, check.id, item.id, res);
+    if (!approval) return;
+  }
+  const before = { discount_cents: item.discount_cents || 0, discount_reason: item.discount_reason || null };
+  db.prepare('UPDATE check_items SET discount_cents = ?, discount_reason = ? WHERE id = ?')
+    .run(discount, reason, item.id);
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  auditApproval(req, 'item_discount', { check_id: check.id, item_id: item.id },
+    Object.assign({
+      approver: approval ? approval.mgr.name : (req.user ? req.user.name : '?'),
+      approver_id: approval ? approval.mgr.id : (req.user ? req.user.id : null),
+      before, after: { discount_cents: discount, discount_reason: reason }, reason,
+    }, approval && approval.offline ? { offline: true, approval_nonce: approval.nonce } : {}));
+  const updated = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(item.id);
+  res.json(Object.assign(itemView(updated), { totals: t },
+    approval ? { approved_by: approval.mgr.name } : {}));
+});
+
+/**
+ * POST /api/checks/:id/items/:item_id/duplicate
+ * Duplicate a line (Toast/SpotOn parity) — copies qty, modifiers, seat, course,
+ * note, allergy. The duplicate starts as 'held' (not fired).
+ */
+app.post('/api/checks/:id/items/:item_id/duplicate', serverPlus(), (req, res) => {
+  const checkId = Number(req.params.id);
+  const itemId = Number(req.params.item_id);
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot duplicate items on a ${check.status} check` });
+  const item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ? AND ci.check_id = ?')
+    .get(itemId, check.id);
+  if (!item) return res.status(404).json({ error: 'Item not found on this check' });
+  if (item.state === 'cancelled') return res.status(400).json({ error: 'Cannot duplicate a voided item' });
+  const r = db.prepare(
+    `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
+       note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
+  ).run(crypto.randomUUID(), check.id, item.menu_item_id, item.seat, item.qty, item.unit_price_cents,
+    item.modifiers_json, item.course, nowIso(), item.note, item.allergy, item.allergy_detail);
+  const dup = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  res.status(201).json(Object.assign(itemView(dup), { totals: t }));
+});
+/**
+ * POST /api/checks/:id/items/:item_id/duplicate — repeat-item action (P1).
 
 /**
  * POST /api/checks/:id/comp {amount_cents | percent, manager_pin, reason}
@@ -1897,11 +2392,39 @@ app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot send items on a ${check.status} check` });
+  const b = req.body || {};
 
-  const held = db.prepare(
+  let held = db.prepare(
     "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? AND ci.state = 'held' ORDER BY ci.added_at, ci.id"
   ).all(check.id);
+  // Phase 3A: selective send — item_ids and/or courses filters
+  if (b.item_ids !== undefined) {
+    if (!Array.isArray(b.item_ids)) return res.status(400).json({ error: 'item_ids must be an array' });
+    const ids = new Set(b.item_ids);
+    held = held.filter((it) => ids.has(it.id));
+  }
+  if (b.courses !== undefined) {
+    if (!Array.isArray(b.courses)) return res.status(400).json({ error: 'courses must be an array' });
+    if (!b.courses.map((c) => String(c).toLowerCase()).includes('all')) {
+      const want = new Set(b.courses.map((c) => String(c).toLowerCase()));
+      held = held.filter((it) => want.has(String(it.course || '').toLowerCase()));
+    }
+  }
   if (held.length === 0) return res.json({ sent: 0, tickets: [] });
+
+  /* Phase 3A (P0-7): coursing. When the check requires coursing and the send
+     doesn't name items/courses, held items spanning 2+ courses get a 409
+     course-selection prompt instead of firing everything. */
+  const coursing = check.coursing || 'off';
+  if ((coursing === 'required' || coursing === 'optional') && b.item_ids === undefined && b.courses === undefined) {
+    const courses = [...new Set(held.map((it) => it.course || 'other'))];
+    if (courses.length > 1) {
+      return res.status(409).json({
+        error: `This check fires by course — choose which course${coursing === 'optional' ? ' (or send all)' : ''} to fire`,
+        need_course_selection: true, optional: coursing === 'optional', courses,
+      });
+    }
+  }
 
   const sentAt = nowIso();
   const table = check.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(check.table_id) : null;
@@ -1950,6 +2473,98 @@ app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
   res.json({ sent: held.length, tickets });
+});
+
+/* Phase 3A (P0 send-now): one-tap add+fire — items go on the check and straight to KDS. */
+app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot send items on a ${check.status} check` });
+  const items = (req.body || {}).items;
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({ error: 'items must be a non-empty array of order lines' });
+  }
+  if (items.length > 50) return res.status(400).json({ error: 'At most 50 lines per send-now' });
+  // Validate and insert each item (same rules as POST /items)
+  const insertedIds = [];
+  for (const line of items) {
+    const { menu_item_id, seat, qty = 1, modifiers = [], unit_price_cents, note, allergy, allergy_detail } = line || {};
+    const menuItem = menu_item_id != null
+      ? db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ? AND active = 1').get(menu_item_id, SITE_ID)
+      : null;
+    if (!menuItem) return res.status(400).json({ error: 'Valid active menu_item_id is required' });
+    if (!isInt(seat) || seat < 1 || seat > check.guest_count) {
+      return res.status(400).json({ error: `seat must be an integer between 1 and ${check.guest_count}` });
+    }
+    if (!isInt(qty) || qty < 1) return res.status(400).json({ error: 'qty must be a positive integer' });
+    const rmod = resolveModifiers(menuItem.id, modifiers);
+    if (rmod.error) return res.status(400).json({ error: rmod.error });
+    let unitPrice = menuItem.price_cents;
+    if (menuItem.price_cents === 0) {
+      if (req.user.role !== 'manager') return res.status(403).json({ error: 'Market-price items must be priced by a manager' });
+      if (unit_price_cents == null) return res.status(400).json({ error: 'Market-price item requires unit_price_cents' });
+      unitPrice = unit_price_cents;
+    }
+    let ln = null;
+    if (note !== undefined && note !== null) {
+      if (typeof note !== 'string' || note.length > 140) return res.status(400).json({ error: 'note must be ≤140 chars' });
+      ln = note.trim() || null;
+    }
+    const alg = allergy ? 1 : 0;
+    let algD = null;
+    if (allergy_detail !== undefined && allergy_detail !== null) {
+      if (typeof allergy_detail !== 'string' || allergy_detail.length > 140) return res.status(400).json({ error: 'allergy_detail must be ≤140 chars' });
+      algD = allergy_detail.trim() || null;
+    }
+    const r = db.prepare(
+      `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
+         note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
+    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(rmod.modifiers), menuItem.course, nowIso(), ln, alg, algD);
+    insertedIds.push(r.lastInsertRowid);
+  }
+  // Now fire them via the standard send logic
+  const held = db.prepare(
+    "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id IN (" + insertedIds.map(() => '?').join(',') + ") ORDER BY ci.id"
+  ).all(...insertedIds);
+  // Reuse send route logic by temporarily marking and firing
+  const sentAt = nowIso();
+  const table = check.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(check.table_id) : null;
+  const serverUser = check.server_id ? db.prepare('SELECT name FROM users WHERE id = ?').get(check.server_id) : null;
+  const byStation = new Map();
+  const markSent = db.prepare("UPDATE check_items SET state = 'sent', sent_at = ? WHERE id = ?");
+  let seatNames = {};
+  try {
+    for (const r of db.prepare('SELECT seat, guest_name FROM check_seats WHERE site_id = ? AND check_id = ?').all(SITE_ID, check.id)) {
+      seatNames[r.seat] = r.guest_name;
+    }
+  } catch { /* parity_orders migrate owns this table */ }
+  for (const it of held) {
+    markSent.run(sentAt, it.id);
+    const station = it.station || 'expediter';
+    if (!byStation.has(station)) byStation.set(station, []);
+    byStation.get(station).push({
+      item_id: it.id, name: it.name, seat: it.seat, guest_name: seatNames[it.seat] || null,
+      qty: it.qty, modifiers: parseJson(it.modifiers_json, []), course: it.course || null,
+      note: it.note || null, allergy: it.allergy ? true : false, allergy_detail: it.allergy_detail || null,
+    });
+  }
+  const tickets = [];
+  const newTicket = db.prepare(
+    `INSERT INTO kds_tickets (uuid, site_id, check_id, station, table_label, server_name, items_json, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)`
+  );
+  for (const [station, items] of byStation) {
+    const r = newTicket.run(crypto.randomUUID(), SITE_ID, check.id, station,
+      table ? table.label : null, serverUser ? serverUser.name : null,
+      JSON.stringify(items), sentAt);
+    const ticket = ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid));
+    tickets.push(ticket);
+    broadcastTicket(ticket);
+  }
+  persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  const outItems = insertedIds.map((id) => itemView(db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(id)));
+  res.status(201).json({ sent: held.length, tickets, items: outItems });
 });
 
 /* Item re-fire / reprint kitchen ticket (Toast overflow parity:
@@ -2020,6 +2635,16 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
   if (payCount > 0) {
     return res.status(400).json({ error: 'Cannot split a check that already has payments' });
   }
+  // Phase 3A (P1 split permission, Toast 1.20 model): managers always; staff
+  // with split_allowed; anyone else needs a manager PIN fallback.
+  let splitApprovedBy = null;
+  if (req.user.role !== 'manager' && !req.user.split_allowed) {
+    const mgr = verifyManagerPin((req.body || {}).manager_pin);
+    if (!mgr) {
+      return res.status(403).json({ error: 'Splitting checks needs the split permission — ask a manager', need_manager_pin: true });
+    }
+    splitApprovedBy = mgr.name;
+  }
 
   const items = billableItems(check.id);
   if (items.length === 0) return res.status(400).json({ error: 'Nothing to split: no billable items' });
@@ -2045,7 +2670,7 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
       .filter((g) => g.length > 0);
     if (groups.length === 0) return res.status(400).json({ error: 'No items match the requested seat groups' });
   } else if (mode === 'move') {
-    const { item_ids, target } = req.body;
+    const { item_ids, target, qty } = req.body;
     if (!Array.isArray(item_ids) || item_ids.length === 0) {
       return res.status(400).json({ error: "mode 'move' requires item_ids: [...]" });
     }
@@ -2053,6 +2678,17 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
     const picked = withTotals.filter((w) => ids.has(w.it.id)).map((w) => w.it);
     if (picked.length !== ids.size) {
       return res.status(400).json({ error: 'One or more item_ids not found as billable items on this check' });
+    }
+    // Phase 3A (P1): quantity division — split one line across the two checks.
+    if (qty !== undefined) {
+      if (picked.length !== 1) {
+        return res.status(400).json({ error: 'qty division applies to a single item — pass exactly one item_id' });
+      }
+      const it = picked[0];
+      if (!isInt(qty) || qty < 1 || qty >= it.qty) {
+        return res.status(400).json({ error: `qty must be an integer between 1 and ${it.qty - 1} to divide the line` });
+      }
+      req._moveQty = qty;
     }
     groups = [picked];
     req._moveTarget = target;
@@ -2062,30 +2698,54 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
 
   const now = nowIso();
   const createdIds = [];
+  const nameMoves = []; // guest names follow their seats onto the new checks
+  /* Move one line onto targetCheckId. Whole-line moves keep the row; a
+     qty-divided move splits the line and prorates any item discount exactly. */
+  const moveStmt = db.prepare('UPDATE check_items SET check_id = ? WHERE id = ?');
+  function transferItem(it, targetCheckId, qtyToMove) {
+    const q = qtyToMove == null ? it.qty : qtyToMove;
+    if (q >= it.qty) { moveStmt.run(targetCheckId, it.id); return; }
+    const movedDisc = Math.round((it.discount_cents || 0) * q / it.qty);
+    db.prepare('UPDATE check_items SET qty = qty - ?, discount_cents = discount_cents - ? WHERE id = ?')
+      .run(q, movedDisc, it.id);
+    db.prepare(`INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents,
+        modifiers_json, course, state, sent_at, added_at, note, allergy, allergy_detail,
+        discount_cents, discount_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(crypto.randomUUID(), targetCheckId, it.menu_item_id, it.seat, q, it.unit_price_cents,
+        it.modifiers_json, it.course, it.state, it.sent_at, nowIso(),
+        it.note, it.allergy, it.allergy_detail, movedDisc, it.discount_reason);
+  }
   const doSplit = () => {
     if (mode === 'move' && req._moveTarget !== 'new' && req._moveTarget != null) {
       const targetCheck = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req._moveTarget, SITE_ID);
       if (!targetCheck) throw Object.assign(new Error('Target check not found'), { status: 404 });
       if (targetCheck.status !== 'open') throw Object.assign(new Error('Target check is not open'), { status: 400 });
       if (targetCheck.id === check.id) throw Object.assign(new Error('Target check must differ from source'), { status: 400 });
-      const moveStmt = db.prepare('UPDATE check_items SET check_id = ? WHERE id = ?');
-      for (const it of groups[0]) moveStmt.run(targetCheck.id, it.id);
+      for (const it of groups[0]) transferItem(it, targetCheck.id, req._moveQty);
       createdIds.push(targetCheck.id);
+      for (const s of new Set(groups[0].map((it) => it.seat))) {
+        nameMoves.push({ check_id: targetCheck.id, from_seat: s, to_seat: s });
+      }
       persistTotals(targetCheck.id);
       broadcastCheckUpdated(targetCheck.id);
     } else {
       const insCheck = db.prepare(
         "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
       );
-      const moveStmt = db.prepare('UPDATE check_items SET check_id = ? WHERE id = ?');
       groups.forEach((g, i) => {
         const seats = [...new Set(g.map((it) => it.seat))];
         const label = check.tab_name ? `${check.tab_name} · split ${i + 1}` : `Split ${i + 1}`;
-        const r = insCheck.run(crypto.randomUUID(), SITE_ID, check.table_id, check.server_id, label, Math.max(1, seats.length), now);
-        for (const it of g) moveStmt.run(r.lastInsertRowid, it.id);
+        // Phase 3A fix: guest_count is the MAX retained seat number, not the
+        // distinct-seat count — a retained seat 2 stays valid when seat 1 moved.
+        const r = insCheck.run(crypto.randomUUID(), SITE_ID, check.table_id, check.server_id, label, Math.max(...seats), now);
+        for (const it of g) {
+          transferItem(it, r.lastInsertRowid, mode === 'move' && g.length === 1 ? req._moveQty : null);
+        }
         persistTotals(r.lastInsertRowid);
         broadcastCheckUpdated(r.lastInsertRowid);
         createdIds.push(Number(r.lastInsertRowid));
+        for (const s of seats) nameMoves.push({ check_id: Number(r.lastInsertRowid), from_seat: s, to_seat: s });
       });
     }
     // If the source check is now empty (no billable items, no payments), close it.
@@ -2104,6 +2764,10 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
   } catch (e) {
     return res.status(e.status || 500).json({ error: e.message || 'Split failed' });
   }
+  // Guest names follow their seats onto the new / target checks.
+  try { parityOrders.copySeatNames(db, SITE_ID, check.id, nameMoves, nowIso()); } catch { /* table owned by parity_orders migrate */ }
+  auditApproval(req, 'split_check', { check_id: check.id },
+    { mode, checks: createdIds, approved_by: splitApprovedBy });
   res.json({ split_from: check.id, checks: createdIds });
 });
 
@@ -5244,6 +5908,15 @@ require('./routes/online').register(app, {
 require('./routes/parity_kds_pay').registerStaff(app, {
   db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
   persistTotals, checkResponse, broadcastCheckUpdated, broadcastTicket, ticketView,
+});
+/* Phase 3A competitor parity: order & check flow (dayparts, timers, guest
+   names, fired-item edits, merge, move). */
+parityOrders.register(app, {
+  db, SITE_ID, SITE_TZ, managerOnly, serverPlus, nowIso, crypto,
+  persistTotals, checkResponse, itemView, ticketView, broadcastCheckUpdated,
+  broadcastTicketUpdated, auditApproval, getConfig, parseJson, isInt,
+  withTransaction, verifyManagerPin, cleanLabel, validateModifiers,
+  actorName: (req) => (req.user && req.user.name) || '?',
 });
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
