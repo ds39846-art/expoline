@@ -1848,7 +1848,22 @@ async function renderOrder(app, checkId) {
   menuWatch();
   app._cleanup = () => { if (menuWs) { try { menuWs.close(); } catch (e) {} menuWs = null; } };
 
-  if (menu.length) { const vm0 = visibleMenu(); activeCat = vm0.length ? vm0[0].id : null; drawCats(); drawItems(); }
+  /* Menu must ALWAYS render — even if the API failed, show the empty state
+     with a retry button instead of a blank screen (2026-09-26: Daniel caught
+     a blank menu on the public demo that API-only QA never caught). */
+  const vm0 = visibleMenu();
+  activeCat = vm0.length ? vm0[0].id : null;
+  drawCats(); drawItems();
+  if (!menu.length) {
+    itemGrid.innerHTML = '<div class="empty"><p>No menu loaded.</p>' +
+      '<button class="btn btn-primary" id="menu-retry">Retry loading menu</button></div>';
+    $('#menu-retry').onclick = async () => {
+      try { menu = await getMenu(); } catch (e) { handleApiError(e); return; }
+      const vm = visibleMenu();
+      activeCat = vm.length ? vm[0].id : null;
+      drawCats(); drawItems();
+    };
+  }
   drawSeats(); drawCart();
   $('#dp-pill').onclick = () => PO.openDaypartPicker(dpInfo, dpOverride, (v) => {
     dpOverride = v;
