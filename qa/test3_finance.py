@@ -77,9 +77,9 @@ ok(mt2["fee_cents"]==fee(1000), "refunded payment fee recomputed on net 1000", f
 print("-- shift report yesterday (seeded) --")
 s = api("GET","/api/finance/shift?date=2026-09-24",MT)
 ok(s["checks_closed"]==3, "checks_closed 3", str(s["checks_closed"]))
-# DEFECT A: seeded checks' items are state='fulfilled', but calcTotals only counts
-# held/sent -> persistTotals recomputes and persists subtotal 0 on every read.
-ok(s["subtotal_cents"]==0, "DEFECT A: seeded subtotal recomputed to 0 (expected 33200)",
+# DEFECT A was fixed in QA round 1 ('fulfilled' is now a billable state):
+# seeded checks' fulfilled items correctly total to the hand-computed 33200.
+ok(s["subtotal_cents"]==33200, "seeded subtotal (fulfilled items billable)",
    f"{s['subtotal_cents']} vs hand-computed 33200")
 ok(s["tips_cents"]==7000, "tips", str(s["tips_cents"]))
 ok(s["card_brand_breakdown"]=={"Visa":13237,"Mastercard":15274,"Amex":9051}, "brand breakdown",
@@ -87,7 +87,7 @@ ok(s["card_brand_breakdown"]=={"Visa":13237,"Mastercard":15274,"Amex":9051}, "br
 ok(s["cash_sales_cents"]==0, "cash 0")
 ok(s["cash_owed_to_server_cents"]==7000, "cash owed (card tips)", str(s["cash_owed_to_server_cents"]))
 
-print("-- shift report today (after refund; DEFECT B keeps move-target 'closed' w/ balance 471) --")
+print("-- shift report today (after refund; closed checks stay closed — refunds are recorded, not reopened) --")
 t = api("GET","/api/finance/shift?date=2026-09-25",MT)
 # closed: g0-even(6300 cash,tip1000), g1-even(4300 Visa tip800), s0(4600 cash tip500), s1(3500 Visa tip700),
 #         move-source(2500 cash), move-target(1300 Visa tip300, status closed despite balance 471),

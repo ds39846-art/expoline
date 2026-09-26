@@ -12,7 +12,8 @@ CREATE TABLE users (
   site_id TEXT,
   name TEXT,
   role TEXT CHECK(role IN ('server','kitchen','manager')),
-  pin TEXT
+  pin TEXT,
+  hourly_rate_cents INTEGER
 );
 
 CREATE TABLE zones (
@@ -27,7 +28,10 @@ CREATE TABLE tables (
   site_id TEXT,
   zone_id INTEGER,
   label TEXT,
-  seats INTEGER DEFAULT 4
+  seats INTEGER DEFAULT 4,
+  x REAL,
+  y REAL,
+  shape TEXT DEFAULT 'square'
 );
 
 CREATE TABLE menu_categories (
@@ -49,7 +53,20 @@ CREATE TABLE menu_items (
   station TEXT CHECK(station IN ('bar','expediter','garde_manger','dessert')),
   course TEXT CHECK(course IN ('drink','appetizer','entree','dessert')),
   active INTEGER DEFAULT 1,
-  price_note TEXT
+  price_note TEXT,
+  image_url TEXT,
+  daypart TEXT
+);
+
+CREATE TABLE menu_audit (
+  id INTEGER PRIMARY KEY,
+  site_id TEXT,
+  actor TEXT,
+  action TEXT,
+  item_id INTEGER,
+  category_id INTEGER,
+  details TEXT,
+  created_at TEXT
 );
 
 CREATE TABLE menu_modifiers (
@@ -61,6 +78,7 @@ CREATE TABLE menu_modifiers (
 
 CREATE TABLE checks (
   id INTEGER PRIMARY KEY,
+  uuid TEXT,
   site_id TEXT,
   table_id INTEGER,
   server_id INTEGER,
@@ -78,6 +96,7 @@ CREATE TABLE checks (
 
 CREATE TABLE check_items (
   id INTEGER PRIMARY KEY,
+  uuid TEXT,
   check_id INTEGER,
   menu_item_id INTEGER,
   seat INTEGER,
@@ -92,6 +111,7 @@ CREATE TABLE check_items (
 
 CREATE TABLE payments (
   id INTEGER PRIMARY KEY,
+  uuid TEXT,
   check_id INTEGER,
   site_id TEXT,
   method TEXT CHECK(method IN ('cash','card_demo')),
@@ -108,6 +128,7 @@ CREATE TABLE payments (
 
 CREATE TABLE kds_tickets (
   id INTEGER PRIMARY KEY,
+  uuid TEXT,
   check_id INTEGER,
   site_id TEXT,
   station TEXT,
@@ -126,3 +147,39 @@ CREATE TABLE site_config (
   value TEXT,
   PRIMARY KEY (site_id, key)
 );
+
+-- Time clock (California meal/rest-break compliance)
+CREATE TABLE clock_shifts (
+  id INTEGER PRIMARY KEY,
+  uuid TEXT,
+  site_id TEXT,
+  user_id INTEGER,
+  employee_name TEXT,
+  role TEXT,
+  regular_rate_cents INTEGER DEFAULT 0,
+  clock_in TEXT,
+  clock_out TEXT,
+  created_at TEXT
+);
+CREATE TABLE clock_breaks (
+  id INTEGER PRIMARY KEY,
+  uuid TEXT,
+  shift_id INTEGER,
+  type TEXT CHECK(type IN ('meal','rest')),
+  meal_seq INTEGER,
+  start_at TEXT,
+  end_at TEXT,
+  waived INTEGER DEFAULT 0,
+  duty_free INTEGER DEFAULT 0,
+  created_at TEXT
+);
+CREATE TABLE clock_audit (
+  id INTEGER PRIMARY KEY,
+  site_id TEXT,
+  actor TEXT,
+  action TEXT,
+  shift_id INTEGER,
+  details TEXT,
+  created_at TEXT
+);
+CREATE INDEX idx_clock_shifts_user ON clock_shifts(site_id, user_id, clock_out);

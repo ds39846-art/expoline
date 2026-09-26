@@ -40,7 +40,7 @@ const { WebSocketServer } = require('ws');
 /* ------------------------------ boot: seed -------------------------------- */
 const ROOT = __dirname;
 const DB_DIR = path.join(ROOT, 'db');
-const DB_PATH = path.join(DB_DIR, 'expoline.db');
+const DB_PATH = process.env.EXPOLINE_DB || path.join(DB_DIR, 'expoline.db');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 
 fs.mkdirSync(DB_DIR, { recursive: true });
@@ -64,8 +64,155 @@ const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode=WAL;');
 db.exec('PRAGMA foreign_keys=ON;');
 
+/* Floor-plan editor migration (phase 2): position + shape columns on tables.
+   Runs on every boot; ALTER TABLE is a no-op-safe guard via PRAGMA table_info. */
+(() => {
+  const cols = new Set(db.prepare('PRAGMA table_info(tables)').all().map((c) => c.name));
+  if (!cols.has('x')) db.exec('ALTER TABLE tables ADD COLUMN x REAL');
+  if (!cols.has('y')) db.exec('ALTER TABLE tables ADD COLUMN y REAL');
+  if (!cols.has('shape')) db.exec("ALTER TABLE tables ADD COLUMN shape TEXT DEFAULT 'square'");
+  db.exec("UPDATE tables SET shape = 'square' WHERE shape IS NULL OR shape NOT IN ('square','round')");
+})();
+
+/* Menu editor migration (phase 2): image + daypart columns on menu_items,
+   plus the menu_audit log table. Runs on every boot; guards via PRAGMA. */
+(() => {
+  const cols = new Set(db.prepare('PRAGMA table_info(menu_items)').all().map((c) => c.name));
+  if (!cols.has('image_url')) db.exec('ALTER TABLE menu_items ADD COLUMN image_url TEXT');
+  if (!cols.has('daypart')) db.exec('ALTER TABLE menu_items ADD COLUMN daypart TEXT');
+  db.exec(`CREATE TABLE IF NOT EXISTS menu_audit (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    actor TEXT,
+    action TEXT,
+    item_id INTEGER,
+    category_id INTEGER,
+    details TEXT,
+    created_at TEXT
+  )`);
+})();
+
+/* Time clock + CA break-compliance migration (phase 2). Runs on every boot;
+   guards via PRAGMA / CREATE TABLE IF NOT EXISTS. Demo wage defaults are
+   applied once (only where no rate is set); the manager sets real rates in
+   the Time clock view. */
+(() => {
+  const ucols = new Set(db.prepare('PRAGMA table_info(users)').all().map((c) => c.name));
+  if (!ucols.has('hourly_rate_cents')) db.exec('ALTER TABLE users ADD COLUMN hourly_rate_cents INTEGER DEFAULT 0');
+  db.exec(`CREATE TABLE IF NOT EXISTS clock_shifts (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    user_id INTEGER,
+    employee_name TEXT,
+    role TEXT,
+    regular_rate_cents INTEGER DEFAULT 0,
+    clock_in TEXT,
+    clock_out TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS clock_breaks (
+    id INTEGER PRIMARY KEY,
+    shift_id INTEGER,
+    type TEXT CHECK(type IN ('meal','rest')),
+    meal_seq INTEGER,
+    start_at TEXT,
+    end_at TEXT,
+    waived INTEGER DEFAULT 0,
+    duty_free INTEGER DEFAULT 0,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS clock_audit (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    actor TEXT,
+    action TEXT,
+    shift_id INTEGER,
+    details TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_clock_shifts_user ON clock_shifts(site_id, user_id, clock_out)`);
+})();
+
+/* Employee records + manager approvals (phase 2). Runs on every boot.
+   employees is the canonical staff record; a users row is kept in sync so
+   PIN login keeps working. Demo PINs 1111/2222/2580 are seeded as
+   employees 101/102/100 on first boot. */
+(() => {
+  db.exec(`CREATE TABLE IF NOT EXISTS employees (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    employee_number INTEGER UNIQUE,
+    user_id INTEGER UNIQUE,
+    name TEXT,
+    role TEXT CHECK(role IN ('server','kitchen','manager')),
+    pin TEXT UNIQUE,
+    wage_rate_cents INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS approval_audit (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    actor TEXT,
+    approver TEXT,
+    action TEXT,
+    check_id INTEGER,
+    item_id INTEGER,
+    shift_id INTEGER,
+    before_json TEXT,
+    after_json TEXT,
+    details TEXT,
+    created_at TEXT
+  )`);
+  /* One-time offline manager approvals. When a void is queued offline, the
+     client stores sha256(manager PIN) + a random nonce — NEVER the raw PIN.
+     The nonce is bound to (check, item) on first use; replays and retargets
+     are rejected. */
+  db.exec(`CREATE TABLE IF NOT EXISTS offline_approvals (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    nonce TEXT,
+    check_id INTEGER,
+    item_id INTEGER,
+    manager_id INTEGER,
+    manager_name TEXT,
+    used INTEGER DEFAULT 0,
+    created_at TEXT,
+    UNIQUE(site_id, nonce)
+  )`);
+  const ccols = new Set(db.prepare('PRAGMA table_info(checks)').all().map((c) => c.name));
+  if (!ccols.has('comp_cents')) db.exec('ALTER TABLE checks ADD COLUMN comp_cents INTEGER DEFAULT 0');
+  const scols = new Set(db.prepare('PRAGMA table_info(clock_shifts)').all().map((c) => c.name));
+  if (!scols.has('employee_id')) db.exec('ALTER TABLE clock_shifts ADD COLUMN employee_id INTEGER');
+  const ucols = new Set(db.prepare('PRAGMA table_info(users)').all().map((c) => c.name));
+  if (!ucols.has('active')) db.exec('ALTER TABLE users ADD COLUMN active INTEGER DEFAULT 1');
+})();
+
+/* Sync-identity migration (offline ladder). The offline-ladder prototype proved
+   integer PKs break the moment a second engine (LAN brain, cloud mirror,
+   Bluetooth proxy) applies ops — autoincrement ids diverge across engines.
+   uuid is the cross-engine sync identity; integer PKs stay for local speed.
+   Ops reference uuids; each engine resolves uuid → local id at apply time.
+   Runs on every boot; guarded via PRAGMA + IF NOT EXISTS. */
+(() => {
+  const SYNC_TABLES = ['checks', 'check_items', 'payments', 'kds_tickets', 'clock_shifts', 'clock_breaks'];
+  for (const t of SYNC_TABLES) {
+    const cols = new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name));
+    if (!cols.has('uuid')) db.exec(`ALTER TABLE ${t} ADD COLUMN uuid TEXT`);
+    const missing = db.prepare(`SELECT id FROM ${t} WHERE uuid IS NULL`).all();
+    if (missing.length) {
+      const upd = db.prepare(`UPDATE ${t} SET uuid = ? WHERE id = ?`);
+      for (const r of missing) upd.run(crypto.randomUUID(), r.id);
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${t}_uuid ON ${t}(uuid)`);
+  }
+})();
+
+/* Seed employees from existing users once SITE_ID is known (see below,
+   after the config section — migrations above run before SITE_ID exists). */
+
 /* --------------------------------- config --------------------------------- */
-const PORT = 4317;
+const PORT = parseInt(process.env.EXPOLINE_PORT || '4317', 10);
 const SITE_TZ = 'America/Los_Angeles'; // Bali Hai pilot site timezone for date bucketing
 const SITE_ID = (() => {
   const r = db.prepare("SELECT id FROM sites WHERE slug = 'bali-hai'").get()
@@ -89,6 +236,31 @@ function getConfig() {
     site_date: todaySite(),
   };
 }
+
+/* Demo wage defaults for the time clock (phase 2): applied once, only where
+   no rate is set. The manager sets real rates in the Time clock view. */
+(() => {
+  const rateByRole = { server: 1800, kitchen: 2000, manager: 3000 };
+  const upd = db.prepare('UPDATE users SET hourly_rate_cents = ? WHERE site_id = ? AND role = ? AND (hourly_rate_cents IS NULL OR hourly_rate_cents = 0)');
+  for (const [role, rate] of Object.entries(rateByRole)) upd.run(rate, SITE_ID, role);
+})();
+
+/* Seed employee records from existing users (phase 2). Idempotent: runs only
+   when no employees exist yet for this site. Demo PINs 1111/2222/2580 become
+   employees 101/102/100. */
+(() => {
+  const n = db.prepare('SELECT COUNT(*) AS n FROM employees WHERE site_id = ?').get(SITE_ID).n;
+  if (n !== 0) return;
+  const users = db.prepare('SELECT id, name, role, pin, COALESCE(hourly_rate_cents,0) AS w FROM users WHERE site_id = ?').all(SITE_ID);
+  const numFor = { manager: 100, server: 101, kitchen: 102 };
+  const ins = db.prepare('INSERT INTO employees (site_id, employee_number, user_id, name, role, pin, wage_rate_cents, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)');
+  const now = new Date().toISOString();
+  users.forEach((u, i) => {
+    try { ins.run(SITE_ID, numFor[u.role] != null ? numFor[u.role] : 200 + i, u.id, u.name, u.role, u.pin, u.w, now); }
+    catch (e) { /* duplicate pin/number — leave existing row */ }
+  });
+  db.exec('UPDATE clock_shifts SET employee_id = (SELECT id FROM employees WHERE employees.user_id = clock_shifts.user_id) WHERE employee_id IS NULL');
+})();
 
 /* --------------------------------- helpers -------------------------------- */
 const nowIso = () => new Date().toISOString();
@@ -149,20 +321,22 @@ function calcTotals(checkId) {
   ).all(checkId);
   const subtotal = items.reduce((s, it) => s + lineTotal(it), 0);
   const surcharge = Math.round(subtotal * cfg.surcharge_pct);
-  const check = db.prepare('SELECT guest_count FROM checks WHERE id = ?').get(checkId);
+  const check = db.prepare('SELECT guest_count, COALESCE(comp_cents, 0) AS comp_cents FROM checks WHERE id = ?').get(checkId);
   const guests = check ? (check.guest_count || 0) : 0;
+  const comp = check ? (check.comp_cents || 0) : 0;
   const serviceCharge = guests >= cfg.service_charge_min_guests
     ? Math.round(subtotal * cfg.service_charge_pct) : 0;
   // Taxable base: subtotal + surcharge. Tips NEVER taxed; service charge not taxed (demo).
+  // Manager-approved comps reduce the amount owed (never below zero).
   const taxable = subtotal + surcharge;
   const tax = Math.round(taxable * cfg.tax_rate);
-  const total = subtotal + surcharge + serviceCharge + tax;
+  const total = Math.max(0, subtotal + surcharge + serviceCharge + tax - comp);
   const pay = db.prepare(
     'SELECT COALESCE(SUM(amount_cents),0) AS amt, COALESCE(SUM(refunded_cents),0) AS ref FROM payments WHERE check_id = ?'
   ).get(checkId);
   const paid = (pay.amt || 0) - (pay.ref || 0);
   const balance = total - paid;
-  return { subtotal, surcharge, service_charge: serviceCharge, tax, total, paid, balance };
+  return { subtotal, surcharge, service_charge: serviceCharge, tax, total, paid, balance, comp };
 }
 
 /** Recompute + persist the money columns on the checks row. Call on every mutation. */
@@ -183,6 +357,7 @@ function billableItems(checkId) {
 function itemView(it) {
   return {
     id: it.id,
+    uuid: it.uuid,
     menu_item_id: it.menu_item_id,
     name: it.name,
     seat: it.seat,
@@ -209,6 +384,7 @@ function checkResponse(checkId) {
   ).all(checkId);
   return {
     id: c.id,
+    uuid: c.uuid,
     site_id: c.site_id,
     table_id: c.table_id,
     table_label: table ? table.label : null,
@@ -221,6 +397,7 @@ function checkResponse(checkId) {
     surcharge_cents: t.surcharge,
     service_charge_cents: t.service_charge,
     tax_cents: t.tax,
+    comp_cents: t.comp,
     total_cents: t.total,
     opened_at: c.opened_at,
     closed_at: c.closed_at,
@@ -230,6 +407,7 @@ function checkResponse(checkId) {
       surcharge: t.surcharge,
       service_charge: t.service_charge,
       tax: t.tax,
+      comp: t.comp,
       total: t.total,
       paid: t.paid,
       balance: t.balance,
@@ -263,6 +441,7 @@ function ticketView(row) {
 function paymentView(p) {
   return {
     id: p.id,
+    uuid: p.uuid,
     check_id: p.check_id,
     method: p.method,
     amount_cents: p.amount_cents,
@@ -299,9 +478,8 @@ function authMiddleware(req, res, next) {
 
 /**
  * Role enforcement (server-side). Usage: app.get('/x', requireRole('manager'), handler).
- * - kitchen: blocked from /api/finance/* and /api/menu/admin* (no menu-admin
- *   routes exist in MVP v0.1, so the restriction is vacuous but documented);
- *   CAN bump KDS.
+ * - kitchen: blocked from /api/finance/* and /api/menu/admin* (no menu editing
+ *   for kitchen or servers — manager only); CAN bump KDS.
  * - server: blocked from KDS bump; CAN do checks/items/send/split/pay.
  * - manager: everything, including refunds.
  */
@@ -317,6 +495,72 @@ function requireRole(...roles) {
 const serverPlus = () => requireRole('server', 'manager');   // checks / items / send / split / pay / close
 const kitchenPlus = () => requireRole('kitchen', 'manager'); // KDS read + bump
 const managerOnly = () => requireRole('manager');            // finance / refunds / overview
+
+/**
+ * Manager PIN verification for point-of-action approvals (voids, comps,
+ * time-clock adjustments). Returns the manager user row or null. A valid
+ * login token alone is NOT enough on the floor — the manager physically
+ * enters their PIN at the device.
+ */
+function verifyManagerPin(pin) {
+  const p = pin != null ? String(pin).trim() : '';
+  if (!/^\d{4}$/.test(p)) return null;
+  return db.prepare("SELECT id, name, role, pin FROM users WHERE pin = ? AND site_id = ? AND role = 'manager' AND COALESCE(active, 1) = 1").get(p, SITE_ID) || null;
+}
+
+/* Offline-approval verification for queued voids (fix 5). The client stores
+   sha256(manager PIN) + a random nonce — never the raw PIN. The server finds
+   the active manager whose PIN hashes to the given value, then binds the
+   nonce to (check, item) on first use. Replays (nonce already used) and
+   retargets (same nonce, different check/item) are rejected. A retry of the
+   exact same action after a dropped response is treated as a replay-success
+   so the outbox flush stays idempotent. */
+function verifyOfflineApproval(nonce, pinHash, checkId, itemId) {
+  const n = nonce != null ? String(nonce).trim() : '';
+  const h = pinHash != null ? String(pinHash).trim().toLowerCase() : '';
+  if (!/^[0-9a-f]{32,}$/.test(n) || !/^[0-9a-f]{64}$/.test(h)) return null;
+  const mgrs = db.prepare("SELECT id, name, pin FROM users WHERE site_id = ? AND role = 'manager' AND COALESCE(active, 1) = 1").all(SITE_ID);
+  const mgr = mgrs.find((m) => crypto.createHash('sha256').update(String(m.pin)).digest('hex') === h);
+  if (!mgr) return null;
+  const row = db.prepare('SELECT * FROM offline_approvals WHERE site_id = ? AND nonce = ?').get(SITE_ID, n);
+  if (row && row.used) {
+    if (row.check_id === checkId && row.item_id === itemId && row.manager_id === mgr.id) return { mgr, replay: true, nonce: n };
+    return null; // replay for a different action or a different manager: forged
+  }
+  return { mgr, replay: false, nonce: n };
+}
+function consumeOfflineApproval(nonce, checkId, itemId, mgr) {
+  db.prepare(`INSERT INTO offline_approvals (site_id, nonce, check_id, item_id, manager_id, manager_name, used, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+    ON CONFLICT(site_id, nonce) DO UPDATE SET used = 1, check_id = excluded.check_id, item_id = excluded.item_id,
+      manager_id = excluded.manager_id, manager_name = excluded.manager_name`)
+    .run(SITE_ID, nonce, checkId, itemId, mgr.id, mgr.name, new Date().toISOString());
+}
+/* Resolve a void approval from either the online path (raw manager PIN,
+   verified live) or the offline path (PIN hash + one-time nonce). Returns
+   { mgr, offline, replay, nonce } or sends 403 and returns null. */
+function resolveVoidApproval(b, checkId, itemId, res) {
+  if (b.approval_nonce !== undefined || b.manager_pin_hash !== undefined) {
+    const v = verifyOfflineApproval(b.approval_nonce, b.manager_pin_hash, checkId, itemId);
+    if (!v) { res.status(403).json({ error: 'Invalid or already-used offline approval — re-void from the check with a manager PIN' }); return null; }
+    return { mgr: v.mgr, offline: true, replay: v.replay, nonce: v.nonce };
+  }
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) { res.status(403).json({ error: 'Manager PIN required to void an item' }); return null; }
+  return { mgr, offline: false, replay: false, nonce: null };
+}
+
+/** Audit row for manager approvals: who acted, which manager approved, what changed. */
+function auditApproval(req, action, ids, details) {
+  const d = details || {};
+  db.prepare(`INSERT INTO approval_audit (site_id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(SITE_ID, req.user ? req.user.name : '?', d.approver || (req.user ? req.user.name : '?'),
+      action, ids.check_id ?? null, ids.item_id ?? null, ids.shift_id ?? null,
+      JSON.stringify(d.before !== undefined ? d.before : null),
+      JSON.stringify(d.after !== undefined ? d.after : null),
+      JSON.stringify(d), new Date().toISOString());
+}
 
 /* ---------------------------------- app ----------------------------------- */
 const app = express();
@@ -342,8 +586,8 @@ app.get('/api/health', (req, res) => {
 app.post('/api/auth/login', (req, res) => {
   const pin = req.body && req.body.pin != null ? String(req.body.pin) : '';
   if (!pin) return res.status(401).json({ error: 'PIN required' });
-  // PINs compared as strings.
-  const user = db.prepare('SELECT id, name, role FROM users WHERE pin = ? AND site_id = ?').get(pin, SITE_ID);
+  // PINs compared as strings. Deactivated staff cannot log in.
+  const user = db.prepare('SELECT id, name, role FROM users WHERE pin = ? AND site_id = ? AND COALESCE(active, 1) = 1').get(pin, SITE_ID);
   if (!user) return res.status(401).json({ error: 'Invalid PIN' });
   const token = issueToken(user);
   res.json({ token, user: { id: user.id, name: user.name, role: user.role } });
@@ -353,6 +597,27 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/config', (req, res) => {
   res.json(getConfig());
 });
+
+/* Merge same-named categories (e.g. LUNCH "Pupus" + DINNER "Pupus") into one
+ * tab with the union of items, deduped by name+price. Servers think in
+ * categories, not dayparts; the DB keeps daypart parents for reporting. */
+function mergeCats(cats) {
+  const byName = new Map();
+  const merged = [];
+  for (const c of cats) {
+    if (byName.has(c.name)) {
+      const ex = byName.get(c.name);
+      const seen = new Set(ex.items.map((i) => i.name + '|' + i.price_cents));
+      for (const it of c.items) {
+        if (!seen.has(it.name + '|' + it.price_cents)) { seen.add(it.name + '|' + it.price_cents); ex.items.push(it); }
+      }
+    } else {
+      byName.set(c.name, c);
+      merged.push(c);
+    }
+  }
+  return merged;
+}
 
 /* ---------------------------------- menu ----------------------------------- */
 app.get('/api/menu', (req, res) => {
@@ -365,7 +630,7 @@ app.get('/api/menu', (req, res) => {
   const modStmt = db.prepare(
     'SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id'
   );
-  res.json(cats.map((c) => ({
+  res.json(mergeCats(cats.map((c) => ({
     id: c.id,
     name: c.name,
     parent: c.parent,
@@ -381,24 +646,320 @@ app.get('/api/menu', (req, res) => {
       price_note: it.price_note,
       modifiers: modStmt.all(it.id),
     })),
-  })));
+  }))));
 });
-// NOTE: /api/menu/admin* does not exist in MVP v0.1 (no menu editing); kitchen
-// restriction on it is therefore vacuous.
+// Menu admin lives under /api/admin/menu/* (manager only) — see below.
 
 /* ---------------------------------- zones ---------------------------------- */
 app.get('/api/zones', (req, res) => {
   const zones = db.prepare('SELECT id, name FROM zones WHERE site_id = ? ORDER BY sort, id').all(SITE_ID);
-  const tblStmt = db.prepare('SELECT id, label, seats FROM tables WHERE zone_id = ? ORDER BY id');
+  const tblStmt = db.prepare('SELECT id, label, seats, x, y, shape FROM tables WHERE zone_id = ? ORDER BY id');
   const openStmt = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1");
   res.json(zones.map((z) => ({
     id: z.id,
     name: z.name,
     tables: tblStmt.all(z.id).map((t) => {
       const open = openStmt.get(t.id);
-      return { id: t.id, label: t.label, seats: t.seats, open_check_id: open ? open.id : null };
+      return { id: t.id, label: t.label, seats: t.seats, x: t.x, y: t.y, shape: t.shape || 'square', open_check_id: open ? open.id : null };
     }),
   })));
+});
+
+/* ------------------------- floor-plan admin (manager) -------------------------
+   Manager portal floor-plan editor: zones and tables CRUD. Read is manager-only
+   (keeps x/y/shape together); writes validate labels, seats, shapes, coords. */
+const SHAPES = new Set(['square', 'round']);
+function zoneById(id) {
+  return db.prepare('SELECT id, name FROM zones WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+function tableById(id) {
+  return db.prepare('SELECT id, site_id, zone_id, label, seats, x, y, shape FROM tables WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+function cleanLabel(v) { return typeof v === 'string' ? v.trim() : ''; }
+function labelTaken(label, excludeId) {
+  return !!db.prepare('SELECT id FROM tables WHERE site_id = ? AND LOWER(label) = LOWER(?) AND id != ?')
+    .get(SITE_ID, label, excludeId == null ? -1 : excludeId);
+}
+function validSeats(v) { return isInt(v) && v >= 1 && v <= 20; }
+function validCoord(v) { return v == null || (typeof v === 'number' && Number.isFinite(v)); }
+
+app.get('/api/admin/zones', managerOnly(), (req, res) => {
+  const zones = db.prepare('SELECT id, name FROM zones WHERE site_id = ? ORDER BY sort, id').all(SITE_ID);
+  const tblStmt = db.prepare('SELECT id, label, seats, x, y, shape FROM tables WHERE zone_id = ? ORDER BY id');
+  res.json(zones.map((z) => ({
+    id: z.id, name: z.name,
+    tables: tblStmt.all(z.id).map((t) => ({ id: t.id, label: t.label, seats: t.seats, x: t.x, y: t.y, shape: t.shape || 'square' })),
+  })));
+});
+
+app.post('/api/admin/zones', managerOnly(), (req, res) => {
+  const name = cleanLabel(req.body && req.body.name);
+  if (!name) return res.status(400).json({ error: 'Zone name is required' });
+  if (db.prepare('SELECT id FROM zones WHERE site_id = ? AND LOWER(name) = LOWER(?)').get(SITE_ID, name)) {
+    return res.status(400).json({ error: 'A zone with that name already exists' });
+  }
+  const maxSort = db.prepare('SELECT COALESCE(MAX(sort), -1) AS m FROM zones WHERE site_id = ?').get(SITE_ID).m;
+  const r = db.prepare('INSERT INTO zones (site_id, name, sort) VALUES (?, ?, ?)').run(SITE_ID, name, maxSort + 1);
+  res.status(201).json({ id: r.lastInsertRowid, name, tables: [] });
+});
+
+app.put('/api/admin/zones/:id', managerOnly(), (req, res) => {
+  const z = zoneById(req.params.id);
+  if (!z) return res.status(404).json({ error: 'Zone not found' });
+  const name = cleanLabel(req.body && req.body.name);
+  if (!name) return res.status(400).json({ error: 'Zone name is required' });
+  if (db.prepare('SELECT id FROM zones WHERE site_id = ? AND LOWER(name) = LOWER(?) AND id != ?').get(SITE_ID, name, z.id)) {
+    return res.status(400).json({ error: 'A zone with that name already exists' });
+  }
+  db.prepare('UPDATE zones SET name = ? WHERE id = ?').run(name, z.id);
+  res.json({ id: z.id, name });
+});
+
+app.delete('/api/admin/zones/:id', managerOnly(), (req, res) => {
+  const z = zoneById(req.params.id);
+  if (!z) return res.status(404).json({ error: 'Zone not found' });
+  const n = db.prepare('SELECT COUNT(*) AS n FROM tables WHERE zone_id = ?').get(z.id).n;
+  if (n > 0) return res.status(400).json({ error: `Zone has ${n} table${n === 1 ? '' : 's'} — move or delete them first` });
+  db.prepare('DELETE FROM zones WHERE id = ?').run(z.id);
+  res.json({ deleted: z.id });
+});
+
+app.post('/api/admin/tables', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const z = zoneById(b.zone_id);
+  if (!z) return res.status(400).json({ error: 'Valid zone_id is required' });
+  const label = cleanLabel(b.label);
+  if (!label) return res.status(400).json({ error: 'Table label is required' });
+  if (labelTaken(label)) return res.status(400).json({ error: `Table "${label}" already exists` });
+  if (!validSeats(b.seats)) return res.status(400).json({ error: 'Seats must be a whole number from 1 to 20' });
+  if (!validCoord(b.x) || !validCoord(b.y)) return res.status(400).json({ error: 'x and y must be numbers' });
+  if (b.shape != null && !SHAPES.has(b.shape)) return res.status(400).json({ error: 'shape must be "square" or "round"' });
+  const r = db.prepare('INSERT INTO tables (site_id, zone_id, label, seats, x, y, shape) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(SITE_ID, z.id, label, b.seats, b.x ?? null, b.y ?? null, b.shape || 'square');
+  res.status(201).json({ id: r.lastInsertRowid, zone_id: z.id, label, seats: b.seats, x: b.x ?? null, y: b.y ?? null, shape: b.shape || 'square' });
+});
+
+app.put('/api/admin/tables/:id', managerOnly(), (req, res) => {
+  const t = tableById(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Table not found' });
+  const b = req.body || {};
+  const label = b.label === undefined ? t.label : cleanLabel(b.label);
+  if (!label) return res.status(400).json({ error: 'Table label is required' });
+  if (labelTaken(label, t.id)) return res.status(400).json({ error: `Table "${label}" already exists` });
+  const seats = b.seats === undefined ? t.seats : b.seats;
+  if (!validSeats(seats)) return res.status(400).json({ error: 'Seats must be a whole number from 1 to 20' });
+  const zoneId = b.zone_id === undefined ? t.zone_id : b.zone_id;
+  if (!zoneById(zoneId)) return res.status(400).json({ error: 'Valid zone_id is required' });
+  const x = b.x === undefined ? t.x : b.x;
+  const y = b.y === undefined ? t.y : b.y;
+  if (!validCoord(x) || !validCoord(y)) return res.status(400).json({ error: 'x and y must be numbers' });
+  const shape = b.shape === undefined ? (t.shape || 'square') : b.shape;
+  if (!SHAPES.has(shape)) return res.status(400).json({ error: 'shape must be "square" or "round"' });
+  db.prepare('UPDATE tables SET label = ?, seats = ?, zone_id = ?, x = ?, y = ?, shape = ? WHERE id = ?')
+    .run(label, seats, zoneId, x, y, shape, t.id);
+  res.json({ id: t.id, zone_id: zoneId, label, seats, x, y, shape });
+});
+
+app.delete('/api/admin/tables/:id', managerOnly(), (req, res) => {
+  const t = tableById(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Table not found' });
+  const open = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1").get(t.id);
+  if (open) return res.status(400).json({ error: 'Table has an open check — close it first' });
+  db.prepare('DELETE FROM tables WHERE id = ?').run(t.id);
+  res.json({ deleted: t.id });
+});
+
+/* ------------------------------- menu admin -------------------------------- */
+/* Manager-only menu editor (phase 2). Every mutation writes a menu_audit row
+   and broadcasts {type:'menu_updated'} so every connected device refreshes
+   its menu instantly (including the one-tap 86 toggle). */
+
+const COURSES = new Set(['drink', 'appetizer', 'entree', 'dessert']);
+const ITEM_TYPES = new Set(['drink', 'food', 'dessert']);
+
+function menuCategoryById(id) {
+  return db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+function menuItemById(id) {
+  return db.prepare('SELECT id, site_id, category_id, name, description, price_cents, item_type, station, course, active, price_note, image_url, daypart FROM menu_items WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+function auditMenu(req, action, ids, details) {
+  db.prepare('INSERT INTO menu_audit (site_id, actor, action, item_id, category_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(SITE_ID, req.user ? req.user.name : '?', action, ids.item_id ?? null, ids.category_id ?? null, JSON.stringify(details || {}), nowIso());
+}
+function validPriceCents(v) { return isInt(v) && v >= 0; }
+function cleanOpt(v) { const s = cleanLabel(v); return s ? s : null; }
+function validCourse(v) { return typeof v === 'string' && COURSES.has(v.trim().toLowerCase()); }
+function validItemType(v) { return typeof v === 'string' && ITEM_TYPES.has(v.trim().toLowerCase()); }
+function validateModifiers(mods) {
+  if (mods === undefined) return null;
+  if (!Array.isArray(mods)) return 'modifiers must be an array';
+  for (const m of mods) {
+    if (!m || typeof m !== 'object' || !cleanLabel(m.name)) return 'each modifier needs a name';
+    if (!validPriceCents(m.price_delta_cents)) return 'modifier price must be a whole number of cents ≥ 0';
+  }
+  return null;
+}
+function saveModifiers(itemId, mods) {
+  db.prepare('DELETE FROM menu_modifiers WHERE item_id = ?').run(itemId);
+  const ins = db.prepare('INSERT INTO menu_modifiers (item_id, name, price_delta_cents) VALUES (?, ?, ?)');
+  for (const m of mods) ins.run(itemId, cleanLabel(m.name), m.price_delta_cents);
+}
+function itemAdminView(it) {
+  const mods = db.prepare('SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id').all(it.id);
+  return {
+    id: it.id, category_id: it.category_id, name: it.name, description: it.description,
+    price_cents: it.price_cents, item_type: it.item_type, station: it.station, course: it.course,
+    active: it.active, price_note: it.price_note, image_url: it.image_url, daypart: it.daypart,
+    modifiers: mods,
+  };
+}
+
+/* Full menu for the editor — includes 86'd (inactive) items the public
+   /api/menu deliberately hides. */
+app.get('/api/admin/menu', managerOnly(), (req, res) => {
+  const cats = db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id').all(SITE_ID);
+  const itemStmt = db.prepare('SELECT id, site_id, category_id, name, description, price_cents, item_type, station, course, active, price_note, image_url, daypart FROM menu_items WHERE category_id = ? ORDER BY id');
+  res.json(cats.map((c) => ({
+    id: c.id, name: c.name, parent: c.parent, sort: c.sort,
+    items: itemStmt.all(c.id).map(itemAdminView),
+  })));
+});
+
+app.post('/api/admin/menu/categories', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const name = cleanLabel(b.name);
+  if (!name) return res.status(400).json({ error: 'Category name is required' });
+  if (db.prepare('SELECT id FROM menu_categories WHERE site_id = ? AND LOWER(name) = LOWER(?)').get(SITE_ID, name)) {
+    return res.status(400).json({ error: 'A category with that name already exists' });
+  }
+  const parent = cleanOpt(b.parent) || 'ALL DAY';
+  const maxSort = db.prepare('SELECT COALESCE(MAX(sort), 0) AS m FROM menu_categories WHERE site_id = ?').get(SITE_ID).m;
+  const sort = b.sort === undefined ? maxSort + 10 : b.sort;
+  if (!isInt(sort)) return res.status(400).json({ error: 'sort must be a whole number' });
+  const r = db.prepare('INSERT INTO menu_categories (site_id, name, parent, sort) VALUES (?, ?, ?, ?)').run(SITE_ID, name, parent, sort);
+  auditMenu(req, 'category.create', { category_id: r.lastInsertRowid }, { name, parent, sort });
+  broadcastMenuUpdated();
+  res.status(201).json({ id: r.lastInsertRowid, name, parent, sort, items: [] });
+});
+
+app.put('/api/admin/menu/categories/:id', managerOnly(), (req, res) => {
+  const c = menuCategoryById(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Category not found' });
+  const b = req.body || {};
+  const name = b.name === undefined ? c.name : cleanLabel(b.name);
+  if (!name) return res.status(400).json({ error: 'Category name is required' });
+  if (db.prepare('SELECT id FROM menu_categories WHERE site_id = ? AND LOWER(name) = LOWER(?) AND id != ?').get(SITE_ID, name, c.id)) {
+    return res.status(400).json({ error: 'A category with that name already exists' });
+  }
+  const parent = b.parent === undefined ? c.parent : (cleanOpt(b.parent) || 'ALL DAY');
+  const sort = b.sort === undefined ? c.sort : b.sort;
+  if (!isInt(sort)) return res.status(400).json({ error: 'sort must be a whole number' });
+  db.prepare('UPDATE menu_categories SET name = ?, parent = ?, sort = ? WHERE id = ?').run(name, parent, sort, c.id);
+  auditMenu(req, 'category.update', { category_id: c.id }, { name, parent, sort });
+  broadcastMenuUpdated();
+  res.json({ id: c.id, name, parent, sort });
+});
+
+app.delete('/api/admin/menu/categories/:id', managerOnly(), (req, res) => {
+  const c = menuCategoryById(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Category not found' });
+  const n = db.prepare('SELECT COUNT(*) AS n FROM menu_items WHERE category_id = ?').get(c.id).n;
+  if (n > 0) return res.status(400).json({ error: `Category has ${n} item${n === 1 ? '' : 's'} — move or delete them first` });
+  db.prepare('DELETE FROM menu_categories WHERE id = ?').run(c.id);
+  auditMenu(req, 'category.delete', { category_id: c.id }, { name: c.name });
+  broadcastMenuUpdated();
+  res.json({ deleted: c.id });
+});
+
+app.post('/api/admin/menu/items', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const cat = menuCategoryById(b.category_id);
+  if (!cat) return res.status(400).json({ error: 'Valid category_id is required' });
+  const name = cleanLabel(b.name);
+  if (!name) return res.status(400).json({ error: 'Item name is required' });
+  if (!validPriceCents(b.price_cents)) return res.status(400).json({ error: 'price_cents must be a whole number of cents ≥ 0' });
+  const station = canonStation(b.station);
+  if (!station) return res.status(400).json({ error: 'station must be one of: bar, expediter, garde_manger, dessert' });
+  if (!validCourse(b.course)) return res.status(400).json({ error: 'course must be one of: drink, appetizer, entree, dessert' });
+  const course = b.course.trim().toLowerCase();
+  const item_type = b.item_type === undefined ? (station === 'bar' ? 'drink' : 'food') : b.item_type.trim().toLowerCase();
+  if (!ITEM_TYPES.has(item_type)) return res.status(400).json({ error: 'item_type must be one of: drink, food, dessert' });
+  const modErr = validateModifiers(b.modifiers);
+  if (modErr) return res.status(400).json({ error: modErr });
+  const r = db.prepare(`INSERT INTO menu_items
+    (site_id, category_id, name, description, price_cents, item_type, station, course, active, price_note, image_url, daypart)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`)
+    .run(SITE_ID, cat.id, name, cleanOpt(b.description), b.price_cents, item_type, station, course,
+      cleanOpt(b.price_note), cleanOpt(b.image_url), cleanOpt(b.daypart));
+  const id = r.lastInsertRowid;
+  if (b.modifiers) saveModifiers(id, b.modifiers);
+  auditMenu(req, 'item.create', { item_id: id, category_id: cat.id }, { name, price_cents: b.price_cents, station, course });
+  broadcastMenuUpdated();
+  res.status(201).json(itemAdminView(menuItemById(id)));
+});
+
+app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
+  const it = menuItemById(req.params.id);
+  if (!it) return res.status(404).json({ error: 'Menu item not found' });
+  const b = req.body || {};
+  const name = b.name === undefined ? it.name : cleanLabel(b.name);
+  if (!name) return res.status(400).json({ error: 'Item name is required' });
+  const price_cents = b.price_cents === undefined ? it.price_cents : b.price_cents;
+  if (!validPriceCents(price_cents)) return res.status(400).json({ error: 'price_cents must be a whole number of cents ≥ 0' });
+  const station = b.station === undefined ? it.station : canonStation(b.station);
+  if (!station) return res.status(400).json({ error: 'station must be one of: bar, expediter, garde_manger, dessert' });
+  const course = b.course === undefined ? it.course : b.course.trim().toLowerCase();
+  if (!COURSES.has(course)) return res.status(400).json({ error: 'course must be one of: drink, appetizer, entree, dessert' });
+  const item_type = b.item_type === undefined ? it.item_type : b.item_type.trim().toLowerCase();
+  if (!ITEM_TYPES.has(item_type)) return res.status(400).json({ error: 'item_type must be one of: drink, food, dessert' });
+  const category_id = b.category_id === undefined ? it.category_id : b.category_id;
+  if (!menuCategoryById(category_id)) return res.status(400).json({ error: 'Valid category_id is required' });
+  const modErr = validateModifiers(b.modifiers);
+  if (modErr) return res.status(400).json({ error: modErr });
+  db.prepare(`UPDATE menu_items SET category_id = ?, name = ?, description = ?, price_cents = ?,
+    item_type = ?, station = ?, course = ?, price_note = ?, image_url = ?, daypart = ? WHERE id = ?`)
+    .run(category_id, name, b.description === undefined ? it.description : cleanOpt(b.description),
+      price_cents, item_type, station, course,
+      b.price_note === undefined ? it.price_note : cleanOpt(b.price_note),
+      b.image_url === undefined ? it.image_url : cleanOpt(b.image_url),
+      b.daypart === undefined ? it.daypart : cleanOpt(b.daypart), it.id);
+  if (b.modifiers !== undefined) saveModifiers(it.id, b.modifiers);
+  auditMenu(req, 'item.update', { item_id: it.id, category_id }, { name, price_cents, station, course });
+  broadcastMenuUpdated();
+  res.json(itemAdminView(menuItemById(it.id)));
+});
+
+app.delete('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
+  const it = menuItemById(req.params.id);
+  if (!it) return res.status(404).json({ error: 'Menu item not found' });
+  const refs = db.prepare('SELECT COUNT(*) AS n FROM check_items WHERE menu_item_id = ?').get(it.id).n;
+  if (refs > 0) {
+    return res.status(400).json({ error: `“${it.name}” has order history — 86 it to hide it instead of deleting` });
+  }
+  db.prepare('DELETE FROM menu_modifiers WHERE item_id = ?').run(it.id);
+  db.prepare('DELETE FROM menu_items WHERE id = ?').run(it.id);
+  auditMenu(req, 'item.delete', { item_id: it.id, category_id: it.category_id }, { name: it.name });
+  broadcastMenuUpdated();
+  res.json({ deleted: it.id });
+});
+
+/* One-tap 86: flips active 1↔0. Kept deliberately tiny — this is the button a
+   manager hammers mid-rush, so it does one UPDATE, one audit row, one push. */
+app.post('/api/admin/menu/86/:id', managerOnly(), (req, res) => {
+  const it = menuItemById(req.params.id);
+  if (!it) return res.status(404).json({ error: 'Menu item not found' });
+  const active = it.active ? 0 : 1;
+  db.prepare('UPDATE menu_items SET active = ? WHERE id = ?').run(active, it.id);
+  auditMenu(req, active ? 'item.un86' : 'item.86', { item_id: it.id, category_id: it.category_id }, { name: it.name, active });
+  broadcastMenuUpdated();
+  res.json({ id: it.id, name: it.name, active, eightysixed: active === 0 });
+});
+
+app.get('/api/admin/menu/audit', managerOnly(), (req, res) => {
+  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '50', 10) || 50));
+  const rows = db.prepare('SELECT id, actor, action, item_id, category_id, details, created_at FROM menu_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit);
+  res.json(rows.map((r) => ({ id: r.id, actor: r.actor, action: r.action, item_id: r.item_id, category_id: r.category_id, details: parseJson(r.details, {}), created_at: r.created_at })));
 });
 
 /* --------------------------------- checks ---------------------------------- */
@@ -414,8 +975,8 @@ app.post('/api/checks', serverPlus(), (req, res) => {
   const existing = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1").get(table_id);
   if (existing) return res.status(400).json({ error: 'Table already has an open check', check_id: existing.id });
   const r = db.prepare(
-    "INSERT INTO checks (site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, 'open', ?)"
-  ).run(SITE_ID, table_id, req.user.id, tab_name || null, guest_count, nowIso());
+    "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
+  ).run(crypto.randomUUID(), SITE_ID, table_id, req.user.id, tab_name || null, guest_count, nowIso());
   const check = checkResponse(r.lastInsertRowid);
   broadcastCheckUpdated(check.id);
   res.status(201).json(check);
@@ -470,13 +1031,16 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
     }
   }
   // MP (market price) items: price_cents = 0 requires a manager-entered price.
+  // Fixed-price items ALWAYS use the menu price — a request-supplied
+  // unit_price_cents for them is ignored, never trusted.
   let unitPrice = menuItem.price_cents;
   if (menuItem.price_cents === 0) {
+    if (req.user.role !== 'manager') {
+      return res.status(403).json({ error: 'Market-price items must be priced by a manager' });
+    }
     if (unit_price_cents == null) {
       return res.status(400).json({ error: 'Market-price item requires unit_price_cents (manager-entered price)' });
     }
-    unitPrice = unit_price_cents;
-  } else if (unit_price_cents != null) {
     unitPrice = unit_price_cents;
   }
   if (!isInt(unitPrice) || unitPrice < 0) {
@@ -484,27 +1048,126 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
   }
 
   const r = db.prepare(
-    "INSERT INTO check_items (check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'held', ?)"
-  ).run(check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(modifiers), menuItem.course, nowIso());
+    "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
+  ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(modifiers), menuItem.course, nowIso());
   const item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
   res.status(201).json(itemView(item));
 });
 
+/** DELETE /api/checks/:id/items/:item_id — legacy held-item void path.
+ *  Kept for the offline outbox flush; requires the same manager approval as
+ *  the POST /void-item endpoint (live PIN or offline hash+nonce) and is
+ *  audit-logged identically. There is no unapproved void path. */
 app.delete('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
-  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  const b = req.body || {};
+  const checkId = Number(req.params.id);
+  const itemId = Number(req.params.item_id);
+  const approval = resolveVoidApproval(b, checkId, itemId, res);
+  if (!approval) return;
+  const mgr = approval.mgr;
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot void items on a ${check.status} check` });
-  const item = db.prepare('SELECT * FROM check_items WHERE id = ? AND check_id = ?').get(req.params.item_id, check.id);
+  const item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ? AND ci.check_id = ?').get(itemId, check.id);
   if (!item) return res.status(404).json({ error: 'Item not found on this check' });
   if (item.state !== 'held') {
-    return res.status(400).json({ error: `Only held items can be voided (item is ${item.state})` });
+    if (approval.offline && approval.replay && item.state === 'cancelled') {
+      return res.json({ voided: item.id, state: 'cancelled', already_voided: true, approved_by: mgr.name });
+    }
+    return res.status(400).json({ error: `Only held items can be voided here (item is ${item.state}) — use POST /void-item` });
   }
+  const before = { state: item.state, name: item.name, unit_price_cents: item.unit_price_cents };
   db.prepare("UPDATE check_items SET state = 'cancelled' WHERE id = ?").run(item.id);
+  if (approval.offline && !approval.replay) consumeOfflineApproval(approval.nonce, check.id, item.id, mgr);
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
-  res.json({ voided: item.id, state: 'cancelled' });
+  auditApproval(req, 'void_item', { check_id: check.id, item_id: item.id },
+    { approver: mgr.name, approver_id: mgr.id, before, after: { state: 'cancelled' }, reason: cleanLabel(b.reason) || null,
+      offline: approval.offline || undefined, approval_nonce: approval.offline ? approval.nonce : undefined });
+  res.json({ voided: item.id, state: 'cancelled', approved_by: mgr.name });
+});
+
+/**
+ * POST /api/checks/:id/void-item {item_id, manager_pin, reason?}
+ * Manager-approved void. Works for held AND sent/fulfilled items (the
+ * real fraud vector is post-kitchen voids). The manager physically enters
+ * their PIN at the device; the approval is audit-logged with before/after.
+ */
+app.post('/api/checks/:id/void-item', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const checkId = Number(req.params.id);
+  const itemId = b.item_id != null ? Number(b.item_id) : NaN;
+  if (!Number.isFinite(itemId)) return res.status(400).json({ error: 'item_id is required' });
+  const approval = resolveVoidApproval(b, checkId, itemId, res);
+  if (!approval) return;
+  const mgr = approval.mgr;
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot void items on a ${check.status} check` });
+  const item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ? AND ci.check_id = ?')
+    .get(itemId, check.id);
+  if (!item) return res.status(404).json({ error: 'Item not found on this check' });
+  if (item.state === 'cancelled') {
+    // Idempotent retry of an offline approval after a dropped response.
+    if (approval.offline && approval.replay) {
+      return res.json({ voided: item.id, state: 'cancelled', already_voided: true, approved_by: mgr.name });
+    }
+    return res.status(400).json({ error: 'Item is already voided' });
+  }
+  if (!['held', 'sent', 'fulfilled'].includes(item.state)) {
+    return res.status(400).json({ error: `Cannot void an item in state ${item.state}` });
+  }
+  const reason = cleanLabel(b.reason);
+  const before = { state: item.state, name: item.name, unit_price_cents: item.unit_price_cents };
+  db.prepare("UPDATE check_items SET state = 'cancelled' WHERE id = ?").run(item.id);
+  if (approval.offline && !approval.replay) consumeOfflineApproval(approval.nonce, check.id, item.id, mgr);
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  auditApproval(req, 'void_item', { check_id: check.id, item_id: item.id },
+    { approver: mgr.name, approver_id: mgr.id, before, after: { state: 'cancelled' }, reason: reason || null,
+      offline: approval.offline || undefined, approval_nonce: approval.offline ? approval.nonce : undefined });
+  res.json({ voided: item.id, state: 'cancelled', approved_by: mgr.name, totals: t });
+});
+
+/**
+ * POST /api/checks/:id/comp {amount_cents | percent, manager_pin, reason}
+ * Manager-approved check-level discount. Accumulates on the check (multiple
+ * comps allowed, each audit-logged). Reason is required — comps without a
+ * reason are how money walks out the door.
+ */
+app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) return res.status(403).json({ error: 'Manager PIN required to comp a check' });
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot comp a ${check.status} check` });
+  const reason = cleanLabel(b.reason);
+  if (!reason) return res.status(400).json({ error: 'A reason is required for comps' });
+  const t0 = calcTotals(check.id);
+  let comp;
+  if (b.amount_cents != null) {
+    if (!isInt(b.amount_cents) || b.amount_cents <= 0) return res.status(400).json({ error: 'amount_cents must be a positive whole number of cents' });
+    if (t0.subtotal <= 0) return res.status(400).json({ error: 'Check subtotal is zero — nothing to comp' });
+    comp = b.amount_cents;
+  } else if (b.percent != null) {
+    const p = Number(b.percent);
+    if (!Number.isFinite(p) || p <= 0 || p > 100) return res.status(400).json({ error: 'percent must be > 0 and ≤ 100' });
+    comp = Math.round(t0.subtotal * p / 100);
+    if (comp <= 0) return res.status(400).json({ error: 'Check subtotal is zero — nothing to comp' });
+  } else {
+    return res.status(400).json({ error: 'amount_cents or percent is required' });
+  }
+  const before = check.comp_cents || 0;
+  const after = before + comp;
+  db.prepare('UPDATE checks SET comp_cents = ? WHERE id = ?').run(after, check.id);
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  auditApproval(req, 'comp', { check_id: check.id },
+    { approver: mgr.name, approver_id: mgr.id, before: { comp_cents: before }, after: { comp_cents: after }, added_cents: comp, percent: b.percent ?? null, reason });
+  res.json({ check_id: check.id, comp_cents: after, added_cents: comp, approved_by: mgr.name, totals: t });
 });
 
 /* ------------------------------ send + KDS --------------------------------- */
@@ -541,11 +1204,11 @@ app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
 
   const tickets = [];
   const insTicket = db.prepare(
-    "INSERT INTO kds_tickets (check_id, site_id, station, table_label, server_name, items_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'new', ?)"
+    "INSERT INTO kds_tickets (uuid, check_id, site_id, station, table_label, server_name, items_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)"
   );
   for (const [station, items] of byStation) {
     const r = insTicket.run(
-      check.id, SITE_ID, station,
+      crypto.randomUUID(), check.id, SITE_ID, station,
       table ? table.label : null,
       serverUser ? serverUser.name : null,
       JSON.stringify(items), sentAt
@@ -629,13 +1292,13 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
       broadcastCheckUpdated(targetCheck.id);
     } else {
       const insCheck = db.prepare(
-        "INSERT INTO checks (site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, 'open', ?)"
+        "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
       );
       const moveStmt = db.prepare('UPDATE check_items SET check_id = ? WHERE id = ?');
       groups.forEach((g, i) => {
         const seats = [...new Set(g.map((it) => it.seat))];
         const label = check.tab_name ? `${check.tab_name} · split ${i + 1}` : `Split ${i + 1}`;
-        const r = insCheck.run(SITE_ID, check.table_id, check.server_id, label, Math.max(1, seats.length), now);
+        const r = insCheck.run(crypto.randomUUID(), SITE_ID, check.table_id, check.server_id, label, Math.max(1, seats.length), now);
         for (const it of g) moveStmt.run(r.lastInsertRowid, it.id);
         persistTotals(r.lastInsertRowid);
         broadcastCheckUpdated(r.lastInsertRowid);
@@ -693,8 +1356,8 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
   }
 
   const r = db.prepare(
-    "INSERT INTO payments (check_id, site_id, method, amount_cents, tip_cents, tendered_cents, brand, last4, auth_code, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)"
-  ).run(check.id, SITE_ID, method, amount_cents, tip_cents, tendered_cents ?? null,
+    "INSERT INTO payments (uuid, check_id, site_id, method, amount_cents, tip_cents, tendered_cents, brand, last4, auth_code, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)"
+  ).run(crypto.randomUUID(), check.id, SITE_ID, method, amount_cents, tip_cents, tendered_cents ?? null,
     brand || (method === 'card_demo' ? 'DEMO' : null), last4 || null, authCode, nowIso());
   const payment = paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(r.lastInsertRowid));
 
@@ -729,7 +1392,12 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
 
   const totals = persistTotals(payment.check_id);
   const check = db.prepare('SELECT status FROM checks WHERE id = ?').get(payment.check_id);
-  if (check && (check.status === 'paid' || check.status === 'closed') && totals.balance > 0) {
+  /* A refund on a still-active ('paid') check reopens it so the balance stays
+     visible on the floor. A 'closed' check is end-of-lifecycle history: the
+     refund is recorded in payouts/refunds, but the check does NOT reopen —
+     the customer already left and the balance is not a collectible debt
+     (matches Toast/Square behavior; keeps closed checks out of the open list). */
+  if (check && check.status === 'paid' && totals.balance > 0) {
     // Refund pushed the check back to a positive balance — reopen it.
     db.prepare("UPDATE checks SET status = 'open', closed_at = NULL WHERE id = ?").run(payment.check_id);
   }
@@ -838,6 +1506,9 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
     }
   }
   const expectedPayout = cardVolume - refunds - fees;
+  // Time-clock labor for the same sales date, so Finance shows the full
+  // picture (premiums are wages and belong in labor cost).
+  const labor = dayLabor(date).summary;
   res.json({
     demo: true,
     note: DEMO_FINANCE_NOTE,
@@ -852,6 +1523,8 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
     cash_sales_cents: cashSales,
     tips_cents: tips,
     card_payments: cardPayments,
+    labor_cents: labor.total_cents,
+    labor: { reg_cents: labor.reg_cents, ot_cents: labor.ot_cents, premium_cents: labor.premium_cents, weekly_ot_cents: labor.weekly_ot_cents },
   });
 });
 
@@ -902,6 +1575,536 @@ app.get('/api/finance/shift', managerOnly(), (req, res) => {
   });
 });
 
+/* --------------------------- accounting reports ---------------------------- */
+/** Exportable accounting reports: sales | payouts | tax | labor | tips.
+ *  Formats: xlsx | csv | pdf | docx (genuine files via exceljs / pdf-lib /
+ *  docx) plus json for debugging. Every report honors the requested range:
+ *  period = day | week | month | year | custom, or explicit from/to
+ *  (YYYY-MM-DD, site timezone). Sales bucket by sales date (closed_at);
+ *  payouts/tips by payment date; labor by shift date.
+ *
+ *  NOTE: automated server-side email sending is NOT implemented — it needs
+ *  Daniel's email-provider credentials. The UI downloads the file and opens
+ *  a prefilled mailto: compose instead. Nothing here fakes sending. */
+function badReq(msg) { const e = new Error(msg); e.statusCode = 400; return e; }
+
+function reportRange(q) {
+  const explicit = q.from || q.to;
+  const period = String(q.period || (explicit ? 'custom' : 'day')).toLowerCase();
+  const anchor = /^\d{4}-\d{2}-\d{2}$/.test(q.date || '') ? q.date : todaySite();
+  let from, to, eff = period;
+  if (period === 'custom' || explicit) {
+    eff = 'custom';
+    from = q.from || q.to; to = q.to || q.from;
+    if (!from) throw badReq('from and to are required for a custom range (YYYY-MM-DD)');
+  } else if (period === 'day') { from = to = anchor; }
+  else if (period === 'week') { from = weekStartSite(anchor + 'T12:00:00Z'); to = addDays(from, 6); }
+  else if (period === 'month') {
+    from = anchor.slice(0, 8) + '01';
+    const [y, m] = anchor.split('-').map(Number);
+    to = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+  }
+  else if (period === 'year') { from = anchor.slice(0, 4) + '-01-01'; to = anchor.slice(0, 4) + '-12-31'; }
+  else throw badReq('period must be day, week, month, year, or custom');
+  for (const d of [from, to]) if (!/^\d{4}-\d{2}-\d{2}$/.test(d || '')) throw badReq('from/to must be YYYY-MM-DD');
+  if (from > to) throw badReq('from must not be after to (reversed range)');
+  if (Math.round((new Date(to + 'T00:00:00Z') - new Date(from + 'T00:00:00Z')) / 86400000) > 370) {
+    throw badReq('range is limited to 370 days');
+  }
+  return { from, to, period: eff };
+}
+
+/** Per-sales-date payout math (same contract as GET /api/finance/payouts). */
+function payoutDay(date) {
+  const cfg = getConfig();
+  const payments = db.prepare('SELECT * FROM payments WHERE site_id = ? ORDER BY created_at, id').all(SITE_ID)
+    .filter((p) => tzDate(p.created_at) === date);
+  let cardVolume = 0, refunds = 0, fees = 0, cashSales = 0, tips = 0;
+  for (const p of payments) {
+    tips += p.tip_cents || 0;
+    const refunded = p.refunded_cents || 0;
+    if (p.method === 'card_demo') {
+      cardVolume += p.amount_cents;
+      refunds += refunded;
+      fees += demoFeeCents(p.amount_cents - refunded);
+    } else if (p.method === 'cash') {
+      cashSales += p.amount_cents;
+    }
+  }
+  return {
+    sales_date: date, payout_date: addDays(date, cfg.payout_lag_days),
+    card_volume_cents: cardVolume, refunds_cents: refunds,
+    stripe_fees_cents: fees, expected_payout_cents: cardVolume - refunds - fees,
+    cash_sales_cents: cashSales, tips_cents: tips,
+  };
+}
+
+function eachDate(from, to) {
+  const out = [];
+  for (let d = from; d <= to; d = addDays(d, 1)) out.push(d);
+  return out;
+}
+
+function employeeNumberFor(userId) {
+  const r = db.prepare('SELECT employee_number FROM employees WHERE user_id = ? AND site_id = ?').get(userId, SITE_ID);
+  return r ? r.employee_number : null;
+}
+
+/** Weekly-OT premium rows for one Sun–Sat workweek (mirrors dayLabor). */
+function weeklyOtRows(weekStart) {
+  const cfg = clockConfig();
+  const byUser = new Map();
+  for (const s of db.prepare('SELECT * FROM clock_shifts WHERE site_id = ?').all(SITE_ID)) {
+    if (weekStartSite(s.clock_in) !== weekStart) continue;
+    if (!byUser.has(s.user_id)) byUser.set(s.user_id, []);
+    byUser.get(s.user_id).push(s);
+  }
+  const rows = [];
+  for (const [uid, wshifts] of byUser) {
+    let wh = 0, dot = 0, payAt1x = 0;
+    for (const s of wshifts) {
+      const v = shiftView(s, breaksFor(s.id), cfg);
+      wh += v.hours; dot += v.pay.ot15_hours + v.pay.ot2_hours;
+      payAt1x += v.pay.reg_cents + v.pay.ot15_cents / 1.5 + v.pay.ot2_cents / 2;
+    }
+    const extra = Math.max(0, wh - cfg.ot_weekly_h - dot);
+    const avgRate = wh > 0.005 ? payAt1x / wh : 0;
+    if (extra > 0.005 && avgRate > 0) {
+      rows.push({
+        week_start: weekStart, employee_number: employeeNumberFor(uid),
+        employee_name: wshifts[0].employee_name, extra_ot_hours: r2(extra),
+        premium_cents: Math.round(extra * avgRate * 0.5),
+      });
+    }
+  }
+  return rows;
+}
+
+const REPORT_DEFS = {
+  sales: {
+    title: 'Sales summary',
+    notes: ['Net sales = gross + surcharge + service charge − comps.', 'Tips are not sales and are not taxed.'],
+    columns: [
+      { key: 'date', label: 'Date', kind: 'date' },
+      { key: 'checks', label: 'Checks', kind: 'int' },
+      { key: 'covers', label: 'Covers', kind: 'int' },
+      { key: 'gross_cents', label: 'Gross sales', kind: 'money' },
+      { key: 'surcharge_cents', label: 'Surcharge', kind: 'money' },
+      { key: 'service_cents', label: 'Service charge', kind: 'money' },
+      { key: 'comp_cents', label: 'Comps', kind: 'money' },
+      { key: 'net_cents', label: 'Net sales', kind: 'money' },
+      { key: 'tax_cents', label: 'Tax', kind: 'money' },
+      { key: 'tips_cents', label: 'Tips', kind: 'money' },
+      { key: 'cash_cents', label: 'Cash sales', kind: 'money' },
+      { key: 'card_cents', label: 'Card sales', kind: 'money' },
+    ],
+    totalKeys: ['checks', 'covers', 'gross_cents', 'surcharge_cents', 'service_cents', 'comp_cents', 'net_cents', 'tax_cents', 'tips_cents', 'cash_cents', 'card_cents'],
+    build(from, to) {
+      const checks = db.prepare("SELECT * FROM checks WHERE site_id = ? AND status IN ('paid','closed') AND closed_at IS NOT NULL").all(SITE_ID);
+      const payByCheck = new Map();
+      for (const p of db.prepare('SELECT * FROM payments WHERE site_id = ?').all(SITE_ID)) {
+        if (!payByCheck.has(p.check_id)) payByCheck.set(p.check_id, []);
+        payByCheck.get(p.check_id).push(p);
+      }
+      const rows = eachDate(from, to).map((date) => {
+        const r = { date, checks: 0, covers: 0, gross_cents: 0, surcharge_cents: 0, service_cents: 0, comp_cents: 0, net_cents: 0, tax_cents: 0, tips_cents: 0, cash_cents: 0, card_cents: 0 };
+        for (const c of checks) {
+          if (tzDate(c.closed_at) !== date) continue;
+          const t = persistTotals(c.id);
+          r.checks++; r.covers += c.guest_count || 0;
+          r.gross_cents += t.subtotal; r.surcharge_cents += t.surcharge; r.service_cents += t.service_charge;
+          r.comp_cents += t.comp; r.tax_cents += t.tax;
+          for (const p of (payByCheck.get(c.id) || [])) {
+            r.tips_cents += p.tip_cents || 0;
+            const net = p.amount_cents - (p.refunded_cents || 0);
+            if (p.method === 'cash') r.cash_cents += net;
+            else if (p.method === 'card_demo') r.card_cents += net;
+          }
+        }
+        r.net_cents = r.gross_cents + r.surcharge_cents + r.service_cents - r.comp_cents;
+        return r;
+      });
+      return { rows, extraTables: [] };
+    },
+  },
+  payouts: {
+    title: 'Payout reconciliation',
+    notes: ['Expected payout = card volume − refunds − Stripe fees (DEMO rate: 2.6% + 15¢ per card payment).', 'Sales date and payout date are distinct — payouts land ' + getConfig().payout_lag_days + ' days after the sales date.', 'Tips are collected separately and never reduce the payout.'],
+    columns: [
+      { key: 'sales_date', label: 'Sales date', kind: 'date' },
+      { key: 'payout_date', label: 'Payout date', kind: 'date' },
+      { key: 'card_volume_cents', label: 'Card volume', kind: 'money' },
+      { key: 'refunds_cents', label: 'Refunds', kind: 'money' },
+      { key: 'stripe_fees_cents', label: 'Stripe fees (DEMO)', kind: 'money' },
+      { key: 'expected_payout_cents', label: 'Expected payout', kind: 'money' },
+    ],
+    totalKeys: ['card_volume_cents', 'refunds_cents', 'stripe_fees_cents', 'expected_payout_cents'],
+    build(from, to) {
+      const rows = eachDate(from, to).map((d) => payoutDay(d));
+      return { rows, extraTables: [] };
+    },
+  },
+  tax: {
+    title: 'Sales tax',
+    notes: ['Taxable sales = gross + surcharge + service charge − comps. Tips are not taxed and are shown only for completeness.'],
+    columns: [
+      { key: 'date', label: 'Date', kind: 'date' },
+      { key: 'checks', label: 'Checks', kind: 'int' },
+      { key: 'taxable_cents', label: 'Taxable sales', kind: 'money' },
+      { key: 'tax_cents', label: 'Tax collected', kind: 'money' },
+      { key: 'tips_cents', label: 'Tips (nontaxable)', kind: 'money' },
+    ],
+    totalKeys: ['checks', 'taxable_cents', 'tax_cents', 'tips_cents'],
+    build(from, to) {
+      const checks = db.prepare("SELECT * FROM checks WHERE site_id = ? AND status IN ('paid','closed') AND closed_at IS NOT NULL").all(SITE_ID);
+      const tipByCheck = new Map();
+      for (const p of db.prepare('SELECT check_id, tip_cents FROM payments WHERE site_id = ?').all(SITE_ID)) {
+        tipByCheck.set(p.check_id, (tipByCheck.get(p.check_id) || 0) + (p.tip_cents || 0));
+      }
+      const rows = eachDate(from, to).map((date) => {
+        const r = { date, checks: 0, taxable_cents: 0, tax_cents: 0, tips_cents: 0 };
+        for (const c of checks) {
+          if (tzDate(c.closed_at) !== date) continue;
+          const t = persistTotals(c.id);
+          r.checks++;
+          r.taxable_cents += t.subtotal + t.surcharge + t.service_charge - t.comp;
+          r.tax_cents += t.tax;
+          r.tips_cents += tipByCheck.get(c.id) || 0;
+        }
+        return r;
+      });
+      return { rows, extraTables: [] };
+    },
+  },
+  labor: {
+    title: 'Labor',
+    notes: ['Regular, daily overtime (1.5× after 8h, 2× after 12h), and CA break premiums come from the time clock.', 'Weekly overtime (hours beyond 40/week at 1.5×) is listed separately by workweek and included in the combined total.'],
+    columns: [
+      { key: 'date', label: 'Date', kind: 'date' },
+      { key: 'employee_number', label: '#', kind: 'text' },
+      { key: 'employee_name', label: 'Employee', kind: 'text' },
+      { key: 'role', label: 'Role', kind: 'text' },
+      { key: 'reg_hours', label: 'Reg hrs', kind: 'hours' },
+      { key: 'reg_cents', label: 'Reg pay', kind: 'money' },
+      { key: 'ot15_hours', label: 'OT 1.5 hrs', kind: 'hours' },
+      { key: 'ot15_cents', label: 'OT 1.5 pay', kind: 'money' },
+      { key: 'ot2_hours', label: 'OT 2× hrs', kind: 'hours' },
+      { key: 'ot2_cents', label: 'OT 2× pay', kind: 'money' },
+      { key: 'premium_cents', label: 'Break premium', kind: 'money' },
+      { key: 'total_cents', label: 'Total pay', kind: 'money' },
+    ],
+    totalKeys: ['reg_hours', 'reg_cents', 'ot15_hours', 'ot15_cents', 'ot2_hours', 'ot2_cents', 'premium_cents', 'total_cents'],
+    build(from, to) {
+      const cfg = clockConfig();
+      const shifts = db.prepare('SELECT * FROM clock_shifts WHERE site_id = ? ORDER BY clock_in, id').all(SITE_ID)
+        .filter((s) => { const d = tzDate(s.clock_in); return d >= from && d <= to; });
+      const rows = shifts.map((s) => {
+        const v = shiftView(s, breaksFor(s.id), cfg);
+        return {
+          date: tzDate(s.clock_in), employee_number: employeeNumberFor(s.user_id) || '—',
+          employee_name: s.employee_name, role: s.role,
+          reg_hours: v.pay.reg_hours, reg_cents: v.pay.reg_cents,
+          ot15_hours: v.pay.ot15_hours, ot15_cents: v.pay.ot15_cents,
+          ot2_hours: v.pay.ot2_hours, ot2_cents: v.pay.ot2_cents,
+          premium_cents: v.pay.premium_cents, total_cents: v.pay.total_cents,
+        };
+      });
+      const weekStarts = [...new Set(shifts.map((s) => weekStartSite(s.clock_in)))].sort();
+      const wotRows = weekStarts.flatMap((ws) => weeklyOtRows(ws));
+      const wotTotal = wotRows.reduce((a, r) => a + r.premium_cents, 0);
+      const extraTables = wotRows.length ? [{
+        title: 'Weekly overtime premiums',
+        columns: [
+          { key: 'week_start', label: 'Week starting', kind: 'date' },
+          { key: 'employee_number', label: '#', kind: 'text' },
+          { key: 'employee_name', label: 'Employee', kind: 'text' },
+          { key: 'extra_ot_hours', label: 'Extra OT hrs', kind: 'hours' },
+          { key: 'premium_cents', label: 'Premium pay', kind: 'money' },
+        ],
+        rows: wotRows,
+        totals: { label: 'Total', premium_cents: wotTotal },
+      }] : [];
+      return { rows, extraTables, combinedNote: wotTotal ? 'Combined labor cost incl. weekly OT premiums: see totals above + ' + '$' + (wotTotal / 100).toFixed(2) : null };
+    },
+  },
+  tips: {
+    title: 'Tips',
+    notes: ['Tips are not sales and are not taxed. Cash tips are kept by the server directly; card tips are paid out by the house at checkout.'],
+    columns: [
+      { key: 'date', label: 'Date', kind: 'date' },
+      { key: 'server_name', label: 'Server', kind: 'text' },
+      { key: 'cash_tips_cents', label: 'Cash tips', kind: 'money' },
+      { key: 'card_tips_cents', label: 'Card tips', kind: 'money' },
+      { key: 'total_tips_cents', label: 'Total tips', kind: 'money' },
+    ],
+    totalKeys: ['cash_tips_cents', 'card_tips_cents', 'total_tips_cents'],
+    build(from, to) {
+      const serverByCheck = new Map();
+      for (const c of db.prepare('SELECT id, server_id FROM checks WHERE site_id = ?').all(SITE_ID)) serverByCheck.set(c.id, c.server_id);
+      const nameByUser = new Map();
+      for (const u of db.prepare('SELECT id, name FROM users WHERE site_id = ?').all(SITE_ID)) nameByUser.set(u.id, u.name);
+      const byKey = new Map();
+      for (const p of db.prepare('SELECT * FROM payments WHERE site_id = ?').all(SITE_ID)) {
+        const d = tzDate(p.created_at);
+        if (!d || d < from || d > to) continue;
+        if (!(p.tip_cents > 0)) continue;
+        const nm = nameByUser.get(serverByCheck.get(p.check_id)) || 'Unknown';
+        const k = d + '|' + nm;
+        if (!byKey.has(k)) byKey.set(k, { date: d, server_name: nm, cash_tips_cents: 0, card_tips_cents: 0, total_tips_cents: 0 });
+        const r = byKey.get(k);
+        if (p.method === 'cash') r.cash_tips_cents += p.tip_cents;
+        else r.card_tips_cents += p.tip_cents;
+        r.total_tips_cents += p.tip_cents;
+      }
+      const rows = [...byKey.values()].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.server_name.localeCompare(b.server_name));
+      return { rows, extraTables: [] };
+    },
+  },
+};
+
+function reportTotals(def, rows) {
+  const t = { label: 'Total' };
+  for (const k of (def.totalKeys || [])) {
+    t[k] = rows.reduce((a, r) => a + (Number(r[k]) || 0), 0);
+  }
+  // hours need 2dp rounding after summation
+  for (const c of def.columns) {
+    if (c.kind === 'hours' && typeof t[c.key] === 'number') t[c.key] = r2(t[c.key]);
+  }
+  return t;
+}
+
+function fmtCell(col, v) {
+  if (v == null) return '';
+  if (col.kind === 'money') return '$' + (Number(v) / 100).toFixed(2);
+  if (col.kind === 'hours') return Number(v).toFixed(2);
+  return String(v);
+}
+function csvCell(col, v) {
+  let s;
+  if (v == null) s = '';
+  else if (col.kind === 'money') s = (Number(v) / 100).toFixed(2);
+  else if (col.kind === 'hours') s = Number(v).toFixed(2);
+  else s = String(v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+function buildCsv(def, data) {
+  const lines = [];
+  const table = (columns, rows, totals) => {
+    lines.push(columns.map((c) => csvCell({ kind: 'text' }, c.label)).join(','));
+    for (const r of rows) lines.push(columns.map((c) => csvCell(c, r[c.key])).join(','));
+    if (totals) {
+      lines.push(columns.map((c, i) => i === 0 ? 'Total' : csvCell(c, totals[c.key])).join(','));
+    }
+  };
+  table(def.columns, data.rows, reportTotals(def, data.rows));
+  for (const t of (data.extraTables || [])) {
+    lines.push('');
+    lines.push(csvCell({ kind: 'text' }, t.title));
+    table(t.columns, t.rows, t.totals);
+  }
+  return lines.join('\r\n') + '\r\n';
+}
+
+async function buildXlsx(title, periodLabel, def, data) {
+  const ExcelJS = require('exceljs');
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Expoline';
+  wb.created = new Date();
+  const moneyFmt = '"$"#,##0.00';
+  const addTable = (ws, columns, rows, totals, startRow) => {
+    startRow = startRow || 1;
+    const numKind = (k) => k === 'money' || k === 'int' || k === 'hours';
+    columns.forEach((c, i) => {
+      const col = ws.getColumn(i + 1);
+      col.width = Math.max(c.label.length + 4, c.kind === 'money' ? 14 : 12);
+      if (c.kind === 'money') col.numFmt = moneyFmt;
+      if (c.kind === 'hours') col.numFmt = '0.00';
+    });
+    const hr = ws.getRow(startRow);
+    columns.forEach((c, i) => { hr.getCell(i + 1).value = c.label; });
+    hr.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    hr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F2A33' } };
+    let r = startRow;
+    for (const row of rows) {
+      r++;
+      const xr = ws.getRow(r);
+      columns.forEach((c, i) => { xr.getCell(i + 1).value = numKind(c.kind) ? Number(row[c.key]) || 0 : (row[c.key] ?? ''); });
+    }
+    if (totals) {
+      r++;
+      const tr = ws.getRow(r);
+      columns.forEach((c, i) => { tr.getCell(i + 1).value = i === 0 ? 'Total' : (Number(totals[c.key]) || 0); });
+      tr.font = { bold: true };
+      tr.border = { top: { style: 'thin' } };
+    }
+    return r + 2;
+  };
+  const ws = wb.addWorksheet('Report');
+  ws.getCell('A1').value = title;
+  ws.getCell('A1').font = { bold: true, size: 14 };
+  ws.getCell('A2').value = periodLabel + ' · generated ' + new Date().toISOString();
+  ws.getCell('A2').font = { italic: true, color: { argb: 'FF666666' } };
+  addTable(ws, def.columns, data.rows, reportTotals(def, data.rows), 4);
+  for (const t of (data.extraTables || [])) {
+    const w2 = wb.addWorksheet(t.title.slice(0, 31));
+    addTable(w2, t.columns, t.rows, t.totals, 1);
+  }
+  if (data.combinedNote) {
+    const wn = wb.addWorksheet('Notes');
+    wn.getCell('A1').value = title; wn.getCell('A1').font = { bold: true, size: 14 };
+    (def.notes || []).forEach((n, i) => { wn.getCell('A' + (3 + i)).value = n; });
+    if (data.combinedNote) wn.getCell('A' + (3 + (def.notes || []).length)).value = data.combinedNote;
+  }
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
+async function buildPdf(title, periodLabel, def, data) {
+  const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const bold = await doc.embedFont(StandardFonts.HelveticaBold);
+  const PW = 612, PH = 792, M = 44, ROW_H = 17;
+  const ink = rgb(0.12, 0.12, 0.12), grey = rgb(0.45, 0.45, 0.45), line = rgb(0.8, 0.8, 0.8);
+  // Standard PDF fonts are WinAnsi-only: map common Unicode punctuation to ASCII.
+  const pdfSafe = (s) => String(s ?? '').replace(/−/g, '-').replace(/[’‘]/g, "'").replace(/[“”]/g, '"').replace(/…/g, '...');
+  let page = doc.addPage([PW, PH]);
+  let y = PH - M;
+  const text = (t, x, yy, size, f, color, align) => {
+    t = pdfSafe(t);
+    const w = f.widthOfTextAtSize(t, size);
+    page.drawText(t, { x: align === 'right' ? x - w : x, y: yy, size, font: f, color: color || ink });
+  };
+  const numKind = (k) => k === 'money' || k === 'int' || k === 'hours';
+  const drawTable = (columns, rows, totals) => {
+    const avail = PW - M * 2;
+    // natural widths from header + all cells
+    let widths = columns.map((c) => bold.widthOfTextAtSize(pdfSafe(c.label), 9) + 14);
+    for (const r of rows.concat(totals ? [totals] : [])) {
+      columns.forEach((c, i) => {
+        const w = font.widthOfTextAtSize(pdfSafe(fmtCell(c, i === 0 && totals && r === totals ? r.label : r[c.key])), 9) + 14;
+        if (w > widths[i]) widths[i] = w;
+      });
+    }
+    const sum = widths.reduce((a, b) => a + b, 0);
+    if (sum > avail) widths = widths.map((w) => w * avail / sum);
+    const xs = []; let x = M;
+    widths.forEach((w) => { xs.push(x); x += w; });
+    const need = ROW_H * (rows.length + (totals ? 1 : 0)) + ROW_H + 8;
+    const headerRow = () => {
+      page.drawRectangle({ x: M, y: y - ROW_H + 4, width: avail, height: ROW_H, color: rgb(0.94, 0.94, 0.94) });
+      columns.forEach((c, i) => text(c.label, xs[i] + (numKind(c.kind) ? widths[i] - 7 : 7), y - 12, 9, bold, ink, numKind(c.kind) ? 'right' : undefined));
+      y -= ROW_H;
+      page.drawLine({ start: { x: M, y: y + 4 }, end: { x: M + avail, y: y + 4 }, thickness: 1, color: line });
+    };
+    const bodyRow = (r, isTotal) => {
+      if (y < M + ROW_H) { page = doc.addPage([PW, PH]); y = PH - M; headerRow(); }
+      columns.forEach((c, i) => {
+        const v = isTotal && i === 0 ? 'Total' : fmtCell(c, r[c.key]);
+        text(v, xs[i] + (numKind(c.kind) ? widths[i] - 7 : 7), y - 12, 9, isTotal ? bold : font, ink, numKind(c.kind) ? 'right' : undefined);
+      });
+      y -= ROW_H;
+    };
+    if (y < M + need) { page = doc.addPage([PW, PH]); y = PH - M; }
+    headerRow();
+    rows.forEach((r) => bodyRow(r, false));
+    if (totals) {
+      page.drawLine({ start: { x: M, y: y + 4 }, end: { x: M + avail, y: y + 4 }, thickness: 1, color: ink });
+      bodyRow(Object.fromEntries(columns.map((c) => [c.key, totals[c.key]])), true);
+    }
+    y -= 10;
+  };
+  text(title, M, y, 16, bold); y -= 22;
+  text(periodLabel + ' · generated ' + new Date().toISOString().slice(0, 16).replace('T', ' '), M, y, 9, font, grey); y -= 20;
+  drawTable(def.columns, data.rows, reportTotals(def, data.rows));
+  for (const t of (data.extraTables || [])) {
+    if (y < M + 60) { page = doc.addPage([PW, PH]); y = PH - M; }
+    text(t.title, M, y, 12, bold); y -= 18;
+    drawTable(t.columns, t.rows, t.totals);
+  }
+  for (const n of (def.notes || [])) {
+    if (y < M + 20) { page = doc.addPage([PW, PH]); y = PH - M; }
+    text('• ' + n, M, y, 8, font, grey); y -= 13;
+  }
+  if (data.combinedNote) { text(data.combinedNote, M, y, 9, bold); y -= 14; }
+  const bytes = await doc.save();
+  return Buffer.from(bytes);
+}
+
+async function buildDocx(title, periodLabel, def, data) {
+  const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, HeadingLevel, AlignmentType, WidthType } = require('docx');
+  const cell = (t, opts) => new TableCell({
+    children: [new Paragraph(Object.assign({ children: [new TextRun(t)] }, opts && opts.alignRight ? { alignment: AlignmentType.RIGHT } : {}))],
+  });
+  const numKind = (k) => k === 'money' || k === 'int' || k === 'hours';
+  const mkTable = (columns, rows, totals) => {
+    const head = new TableRow({
+      children: columns.map((c) => new TableCell({
+        children: [new Paragraph({ children: [new TextRun({ text: c.label, bold: true })], alignment: numKind(c.kind) ? AlignmentType.RIGHT : undefined })],
+      })),
+    });
+    const body = rows.map((r) => new TableRow({
+      children: columns.map((c) => cell(fmtCell(c, r[c.key]), { alignRight: numKind(c.kind) })),
+    }));
+    const all = [head, ...body];
+    if (totals) {
+      all.push(new TableRow({
+        children: columns.map((c, i) => new TableCell({
+          children: [new Paragraph({
+            children: [new TextRun({ text: i === 0 ? 'Total' : fmtCell(c, totals[c.key]), bold: true })],
+            alignment: numKind(c.kind) ? AlignmentType.RIGHT : undefined,
+          })],
+        })),
+      }));
+    }
+    return new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: all });
+  };
+  const children = [
+    new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun(title)] }),
+    new Paragraph({ children: [new TextRun({ text: periodLabel + ' · generated ' + new Date().toISOString(), italics: true, color: '666666' })] }),
+    mkTable(def.columns, data.rows, reportTotals(def, data.rows)),
+  ];
+  for (const t of (data.extraTables || [])) {
+    children.push(new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun(t.title)] }));
+    children.push(mkTable(t.columns, t.rows, t.totals));
+  }
+  for (const n of (def.notes || [])) children.push(new Paragraph({ children: [new TextRun({ text: '• ' + n, italics: true, color: '666666' })] }));
+  if (data.combinedNote) children.push(new Paragraph({ children: [new TextRun({ text: data.combinedNote, bold: true })] }));
+  const doc = new Document({ sections: [{ children }] });
+  return Buffer.from(await Packer.toBuffer(doc));
+}
+
+/** GET /api/finance/reports/:report?format=&period=&date=&from=&to= */
+app.get('/api/finance/reports/:report', managerOnly(), async (req, res) => {
+  try {
+    const def = REPORT_DEFS[req.params.report];
+    if (!def) return res.status(400).json({ error: 'Unknown report. Choose: ' + Object.keys(REPORT_DEFS).join(', ') });
+    const format = String(req.query.format || 'xlsx').toLowerCase();
+    if (!['xlsx', 'csv', 'pdf', 'docx', 'json'].includes(format)) {
+      return res.status(400).json({ error: 'format must be xlsx, csv, pdf, or docx' });
+    }
+    const { from, to, period } = reportRange(req.query);
+    const data = def.build(from, to);
+    if (format === 'json') return res.json({ report: req.params.report, from, to, period, rows: data.rows, totals: reportTotals(def, data.rows), extraTables: data.extraTables || [] });
+    const periodLabel = period === 'custom' ? from + ' to ' + to : period + ' of ' + from + (from === to ? '' : ' to ' + to);
+    const fname = 'expoline-' + req.params.report + '-' + from + '_to_' + to + '.' + format;
+    let buf, ctype;
+    if (format === 'xlsx') { buf = await buildXlsx(def.title, periodLabel, def, data); ctype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'; }
+    else if (format === 'csv') { buf = Buffer.from(buildCsv(def, data), 'utf8'); ctype = 'text/csv; charset=utf-8'; }
+    else if (format === 'pdf') { buf = await buildPdf(def.title, periodLabel, def, data); ctype = 'application/pdf'; }
+    else { buf = await buildDocx(def.title, periodLabel, def, data); ctype = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'; }
+    res.setHeader('Content-Type', ctype);
+    res.setHeader('Content-Length', buf.length);
+    res.setHeader('Content-Disposition', 'attachment; filename="' + fname + '"');
+    res.send(buf);
+  } catch (e) {
+    if (e && e.statusCode) return res.status(e.statusCode).json({ error: e.message });
+    console.error('report export failed:', e);
+    res.status(500).json({ error: 'Report generation failed' });
+  }
+});
+
 /* --------------------------------- manager --------------------------------- */
 app.get('/api/manager/overview', managerOnly(), (req, res) => {
   const today = todaySite();
@@ -933,7 +2136,637 @@ app.get('/api/manager/overview', managerOnly(), (req, res) => {
   res.json({
     today: { date: today, open_checks: openChecks, sales_cents: sales, covers },
     alerts,
+    // Time-clock labor cost for today (finalized closed shifts + elapsed-so-far
+    // on open shifts, including break premiums and overtime). Feeds Finance.
+    labor: dayLabor(today).summary,
   });
+});
+
+/* ================= time clock + CA break compliance (phase 2) =================
+   Native time clock with a California meal/rest-break rules engine. Premiums
+   are wages: they feed labor cost (see GET /api/admin/clock/shifts and the
+   labor_today_cents field on /api/manager/overview).
+
+   CA RULES (encoded as CONFIG DATA in CLOCK_CA_DEFAULTS + site_config
+   `clock_*` overrides — NOT hardcoded law; verify against current CA DIR
+   guidance before the pilot — we are not lawyers):
+     - 30-min unpaid meal, must START before end of 5th hour; second before
+       end of 10th hour. 1st waivable (mutual) if shift <= 6h; 2nd waivable if
+       shift <= 12h and the first was taken.
+     - 10-min paid rest per 4h or major fraction (>= 2h); none if shift < 3.5h.
+     - Missed break = 1 hour of pay at regular rate, per TYPE per day
+       (missed meal + missed rest stack; two missed meals do not).
+     - Overtime: 1.5x after 8h/day, 2x after 12h/day, 1.5x after 40h/week
+       (weekly extra computed at day level; daily OT is never double-counted).
+   Money: integer cents, server-side. Break timestamps are ISO strings.
+   ============================================================================ */
+
+const CLOCK_CA_DEFAULTS = {
+  meal_break_min: 30,
+  meal_due_by_hour: 5,
+  second_meal_due_by_hour: 10,
+  meal_waivable_max_shift_h: 6,
+  second_meal_waivable_max_shift_h: 12,
+  rest_break_min: 10,
+  rest_per_hours: 4,
+  rest_major_fraction_h: 2,
+  rest_min_shift_h: 3.5,
+  premium_hours: 1,
+  ot_daily_h: 8,
+  ot_double_h: 12,
+  ot_weekly_h: 40,
+};
+
+/** Effective clock config: CA defaults overlaid with site_config `clock_*`. */
+function clockConfig() {
+  const cfg = { ...CLOCK_CA_DEFAULTS };
+  for (const r of db.prepare("SELECT key, value FROM site_config WHERE site_id = ? AND key LIKE 'clock_%'").all(SITE_ID)) {
+    const k = r.key.slice(6);
+    if (k in cfg) {
+      const n = parseFloat(r.value);
+      if (Number.isFinite(n) && n >= 0) cfg[k] = n;
+    }
+  }
+  return cfg;
+}
+
+function auditClock(req, action, shiftId, details) {
+  db.prepare('INSERT INTO clock_audit (site_id, actor, action, shift_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(SITE_ID, req.user ? req.user.name : '?', action, shiftId ?? null, JSON.stringify(details || {}), nowIso());
+}
+
+const minsBetween = (a, b) => Math.max(0, (new Date(b).getTime() - new Date(a).getTime()) / 60000);
+const r2 = (v) => Math.round(v * 100) / 100;
+
+function openShiftFor(userId) {
+  return db.prepare("SELECT * FROM clock_shifts WHERE site_id = ? AND user_id = ? AND clock_out IS NULL ORDER BY id DESC LIMIT 1")
+    .get(SITE_ID, userId);
+}
+function shiftById(id) {
+  return db.prepare('SELECT * FROM clock_shifts WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+function breaksFor(shiftId) {
+  return db.prepare('SELECT * FROM clock_breaks WHERE shift_id = ? ORDER BY id').all(shiftId);
+}
+
+/**
+ * Compliance + pay for one shift. `finalized` is true once clocked out —
+ * premiums are only assessed on closed shifts (open shifts report due/overdue
+ * separately via clockDue()).
+ */
+function clockCompute(shift, breaks, cfg) {
+  const endIso = shift.clock_out || nowIso();
+  const h = minsBetween(shift.clock_in, endIso) / 60;
+  const rate = shift.regular_rate_cents || 0;
+  const finalized = !!shift.clock_out;
+  const dueAt = (hours) => new Date(new Date(shift.clock_in).getTime() + hours * 3600 * 1000).toISOString();
+
+  const mealOk = (b) => b.end_at && minsBetween(b.start_at, b.end_at) >= cfg.meal_break_min && b.duty_free === 1;
+  const meals = breaks.filter((b) => b.type === 'meal' && !b.waived);
+  const waivers = breaks.filter((b) => b.type === 'meal' && b.waived);
+
+  const need1 = h > cfg.meal_due_by_hour;
+  const need2 = h > cfg.second_meal_due_by_hour;
+  const firstTaken = meals.some((b) => (b.meal_seq || 1) === 1 && mealOk(b) && b.start_at <= dueAt(cfg.meal_due_by_hour));
+  const secondTaken = meals.some((b) => b.meal_seq === 2 && mealOk(b) && b.start_at <= dueAt(cfg.second_meal_due_by_hour));
+  const waive1 = waivers.some((b) => (b.meal_seq || 1) === 1);
+  const waive2 = waivers.some((b) => b.meal_seq === 2);
+  const meal1ok = !need1 || firstTaken || (waive1 && h <= cfg.meal_waivable_max_shift_h);
+  const meal2ok = !need2 || secondTaken || (waive2 && h <= cfg.second_meal_waivable_max_shift_h && firstTaken);
+
+  const restsRequired = h < cfg.rest_min_shift_h ? 0
+    : Math.floor(h / cfg.rest_per_hours) + ((h % cfg.rest_per_hours) >= cfg.rest_major_fraction_h ? 1 : 0);
+  const restsTaken = breaks.filter((b) => b.type === 'rest' && b.end_at && minsBetween(b.start_at, b.end_at) >= cfg.rest_break_min).length;
+  const restsOk = restsTaken >= restsRequired;
+
+  // One premium per violation TYPE per day (missed meal + missed rest stack).
+  const violations = [];
+  if (finalized) {
+    if ((need1 && !meal1ok) || (need2 && !meal2ok)) violations.push('meal');
+    if (!restsOk) violations.push('rest');
+  }
+  const premiumCents = Math.round(violations.length * cfg.premium_hours * rate);
+
+  const regH = Math.min(h, cfg.ot_daily_h);
+  const ot15H = Math.min(Math.max(h - cfg.ot_daily_h, 0), cfg.ot_double_h - cfg.ot_daily_h);
+  const ot2H = Math.max(h - cfg.ot_double_h, 0);
+  const regCents = Math.round(regH * rate);
+  const ot15Cents = Math.round(ot15H * rate * 1.5);
+  const ot2Cents = Math.round(ot2H * rate * 2);
+
+  return {
+    hours: r2(h), finalized, rate_cents: rate,
+    mealsRequired: (need1 ? 1 : 0) + (need2 ? 1 : 0), meal1ok, meal2ok,
+    restsRequired, restsTaken, restsOk, violations,
+    regH: r2(regH), ot15H: r2(ot15H), ot2H: r2(ot2H),
+    regCents, ot15Cents, ot2Cents, premiumCents,
+    totalCents: regCents + ot15Cents + ot2Cents + premiumCents,
+    meal1DueAt: dueAt(cfg.meal_due_by_hour), meal2DueAt: dueAt(cfg.second_meal_due_by_hour),
+  };
+}
+
+function breakView(b) {
+  return {
+    id: b.id, uuid: b.uuid, type: b.type, meal_seq: b.meal_seq, start_at: b.start_at, end_at: b.end_at,
+    waived: b.waived === 1, duty_free: b.duty_free === 1,
+    minutes: b.end_at ? Math.round(minsBetween(b.start_at, b.end_at)) : null,
+  };
+}
+
+function shiftView(shift, breaks, cfg) {
+  const c = clockCompute(shift, breaks, cfg);
+  return {
+    id: shift.id, uuid: shift.uuid, user_id: shift.user_id, employee_id: shift.employee_id ?? null, employee_name: shift.employee_name, role: shift.role,
+    regular_rate_cents: shift.regular_rate_cents, clock_in: shift.clock_in, clock_out: shift.clock_out,
+    open: !shift.clock_out,
+    hours: c.hours,
+    breaks: breaks.map(breakView),
+    compliance: {
+      meals_required: c.mealsRequired, meal1_ok: c.meal1ok, meal2_ok: c.meal2ok,
+      rests_required: c.restsRequired, rests_taken: c.restsTaken, rests_ok: c.restsOk,
+      violations: c.violations, finalized: c.finalized,
+    },
+    pay: {
+      reg_hours: c.regH, ot15_hours: c.ot15H, ot2_hours: c.ot2H,
+      reg_cents: c.regCents, ot15_cents: c.ot15Cents, ot2_cents: c.ot2Cents,
+      premium_cents: c.premiumCents, total_cents: c.totalCents,
+    },
+  };
+}
+
+/** Sunday (site tz) starting the workweek containing `iso`. */
+function weekStartSite(iso) {
+  const [y, m, d] = tzDate(iso).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d, 12));
+  dt.setUTCDate(dt.getUTCDate() - dt.getUTCDay());
+  return dt.toISOString().slice(0, 10);
+}
+
+/* ------------------------------ employee clock ----------------------------- */
+
+/** POST /api/clock/in — clock yourself in; managers may pass {user_id}. */
+app.post('/api/clock/in', (req, res) => {
+  let targetId = req.user.id, managerActing = false;
+  if (req.body && req.body.user_id != null) {
+    if (req.user.role !== 'manager') return res.status(403).json({ error: 'Forbidden: only managers can clock in other employees' });
+    targetId = req.body.user_id; managerActing = true;
+  }
+  const emp = db.prepare('SELECT id, name, role, hourly_rate_cents, COALESCE(active, 1) AS active FROM users WHERE id = ? AND site_id = ?').get(targetId, SITE_ID);
+  if (!emp) return res.status(400).json({ error: 'Unknown employee' });
+  if (!emp.active) return res.status(403).json({ error: emp.name + ' is deactivated and cannot clock in' });
+  if (openShiftFor(emp.id)) return res.status(400).json({ error: emp.name + ' is already clocked in' });
+  const empRec = db.prepare('SELECT id, active FROM employees WHERE user_id = ? AND site_id = ?').get(emp.id, SITE_ID);
+  if (empRec && empRec.active !== 1) return res.status(403).json({ error: emp.name + ' is deactivated and cannot clock in' });
+  const r = db.prepare('INSERT INTO clock_shifts (uuid, site_id, user_id, employee_id, employee_name, role, regular_rate_cents, clock_in, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(crypto.randomUUID(), SITE_ID, emp.id, empRec ? empRec.id : null, emp.name, emp.role, emp.hourly_rate_cents || 0, nowIso(), nowIso());
+  if (managerActing) auditClock(req, 'manager_clock_in', r.lastInsertRowid, { user_id: emp.id, employee_name: emp.name });
+  const cfg = clockConfig();
+  res.status(201).json(shiftView(shiftById(r.lastInsertRowid), [], cfg));
+});
+
+/** POST /api/clock/out — clock yourself out; managers may pass {user_id}. */
+app.post('/api/clock/out', (req, res) => {
+  let targetId = req.user.id, managerActing = false;
+  if (req.body && req.body.user_id != null) {
+    if (req.user.role !== 'manager') return res.status(403).json({ error: 'Forbidden: only managers can clock out other employees' });
+    targetId = req.body.user_id; managerActing = true;
+  }
+  const shift = openShiftFor(targetId);
+  if (!shift) return res.status(400).json({ error: 'No open shift to clock out of' });
+  const outIso = nowIso();
+  db.prepare('UPDATE clock_shifts SET clock_out = ? WHERE id = ?').run(outIso, shift.id);
+  if (managerActing) auditClock(req, 'manager_clock_out', shift.id, { user_id: targetId, employee_name: shift.employee_name });
+  const cfg = clockConfig();
+  res.json(shiftView(shiftById(shift.id), breaksFor(shift.id), cfg));
+});
+
+/** POST /api/clock/break/start {type: meal|rest} */
+app.post('/api/clock/break/start', (req, res) => {
+  const type = req.body && req.body.type;
+  if (type !== 'meal' && type !== 'rest') return res.status(400).json({ error: 'type must be meal or rest' });
+  const shift = openShiftFor(req.user.id);
+  if (!shift) return res.status(400).json({ error: 'Clock in before starting a break' });
+  const existing = breaksFor(shift.id).filter((b) => !b.waived);
+  if (existing.some((b) => b.type === type && !b.end_at)) {
+    return res.status(400).json({ error: 'A ' + type + ' break is already in progress' });
+  }
+  const mealSeq = type === 'meal' ? existing.filter((b) => b.type === 'meal').length + 1 : null;
+  const r = db.prepare("INSERT INTO clock_breaks (uuid, shift_id, type, meal_seq, start_at, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(crypto.randomUUID(), shift.id, type, mealSeq, nowIso(), nowIso());
+  res.status(201).json(breakView(db.prepare('SELECT * FROM clock_breaks WHERE id = ?').get(r.lastInsertRowid)));
+});
+
+/** POST /api/clock/break/end {type: meal|rest, duty_free} — meal end REQUIRES
+    the duty-free attestation (employee confirms fully relieved of duty). */
+app.post('/api/clock/break/end', (req, res) => {
+  const type = req.body && req.body.type;
+  if (type !== 'meal' && type !== 'rest') return res.status(400).json({ error: 'type must be meal or rest' });
+  const shift = openShiftFor(req.user.id);
+  if (!shift) return res.status(400).json({ error: 'No open shift' });
+  const b = breaksFor(shift.id).find((x) => x.type === type && !x.end_at && !x.waived);
+  if (!b) return res.status(400).json({ error: 'No ' + type + ' break in progress' });
+  let dutyFree = 0;
+  if (type === 'meal') {
+    const att = req.body && req.body.duty_free;
+    if (att !== true && att !== 1 && att !== '1') {
+      return res.status(400).json({ error: 'Meal break end requires the duty-free attestation (fully relieved of duty)' });
+    }
+    dutyFree = 1;
+  }
+  db.prepare('UPDATE clock_breaks SET end_at = ?, duty_free = ? WHERE id = ?').run(nowIso(), dutyFree, b.id);
+  res.json(breakView(db.prepare('SELECT * FROM clock_breaks WHERE id = ?').get(b.id)));
+});
+
+/** POST /api/clock/break/waive {type: 'meal', meal_seq: 1|2} — statutory meal
+    waivers only (first if shift <= 6h, second if <= 12h and first taken).
+    Eligibility is re-checked at clock-out; an ineligible waiver is ignored. */
+app.post('/api/clock/break/waive', (req, res) => {
+  const seq = req.body && req.body.meal_seq;
+  if ((req.body && req.body.type) !== 'meal' || (seq !== 1 && seq !== 2)) {
+    return res.status(400).json({ error: 'Only meal breaks can be waived; meal_seq must be 1 or 2' });
+  }
+  const shift = openShiftFor(req.user.id);
+  if (!shift) return res.status(400).json({ error: 'No open shift' });
+  const existing = breaksFor(shift.id);
+  if (existing.some((b) => b.type === 'meal' && b.waived && (b.meal_seq || 1) === seq)) {
+    return res.status(400).json({ error: 'That meal break is already waived' });
+  }
+  if (existing.some((b) => b.type === 'meal' && !b.waived && (b.meal_seq || 1) === seq)) {
+    return res.status(400).json({ error: 'That meal break was already taken — it cannot be waived' });
+  }
+  const r = db.prepare("INSERT INTO clock_breaks (uuid, shift_id, type, meal_seq, waived, created_at) VALUES (?, ?, 'meal', ?, 1, ?)")
+    .run(crypto.randomUUID(), shift.id, seq, nowIso());
+  res.status(201).json(breakView(db.prepare('SELECT * FROM clock_breaks WHERE id = ?').get(r.lastInsertRowid)));
+});
+
+/** GET /api/clock/status — my current shift + which breaks are due/overdue. */
+app.get('/api/clock/status', (req, res) => {
+  const shift = openShiftFor(req.user.id);
+  if (!shift) return res.json({ clocked_in: false });
+  const cfg = clockConfig();
+  const breaks = breaksFor(shift.id);
+  const view = shiftView(shift, breaks, cfg);
+  const nowMs = Date.now();
+  const inMs = new Date(shift.clock_in).getTime();
+  const elapsedH = (nowMs - inMs) / 3600000;
+  const taken = (seq) => breaks.some((b) => b.type === 'meal' && !b.waived && (b.meal_seq || 1) === seq && b.end_at && b.duty_free === 1);
+  const waived = (seq) => breaks.some((b) => b.type === 'meal' && b.waived && (b.meal_seq || 1) === seq);
+  const inProg = (t) => breaks.some((b) => b.type === t && !b.end_at && !b.waived);
+  const due = [];
+  const mealState = (seq, dueHour) => {
+    const dueAt = new Date(inMs + dueHour * 3600 * 1000).toISOString();
+    if (taken(seq)) return { kind: 'meal', seq, state: 'taken', due_at: dueAt };
+    if (waived(seq)) return { kind: 'meal', seq, state: 'waived', due_at: dueAt };
+    if (inProg('meal')) return { kind: 'meal', seq, state: 'in_progress', due_at: dueAt };
+    if (nowMs > inMs + dueHour * 3600 * 1000) return { kind: 'meal', seq, state: 'overdue', due_at: dueAt };
+    if (nowMs > inMs + (dueHour - 0.5) * 3600 * 1000) return { kind: 'meal', seq, state: 'due', due_at: dueAt };
+    return { kind: 'meal', seq, state: 'upcoming', due_at: dueAt };
+  };
+  due.push(mealState(1, cfg.meal_due_by_hour));
+  if (elapsedH > cfg.meal_due_by_hour + 3 || breaks.some((b) => b.type === 'meal' && (b.meal_seq || 1) === 2)) {
+    due.push(mealState(2, cfg.second_meal_due_by_hour));
+  }
+  const restsReq = elapsedH < cfg.rest_min_shift_h ? 0
+    : Math.floor(elapsedH / cfg.rest_per_hours) + ((elapsedH % cfg.rest_per_hours) >= cfg.rest_major_fraction_h ? 1 : 0);
+  const restsTaken = breaks.filter((b) => b.type === 'rest' && b.end_at && minsBetween(b.start_at, b.end_at) >= cfg.rest_break_min).length;
+  due.push({
+    kind: 'rest', state: inProg('rest') ? 'in_progress' : (restsTaken >= restsReq ? 'ok' : (restsReq > 0 ? 'due' : 'upcoming')),
+    required: restsReq, taken: restsTaken, due_at: null,
+  });
+  view.due = due;
+  view.elapsed_h = r2(elapsedH);
+  res.json(view);
+});
+
+/* --------------------------- manager time clock ---------------------------- */
+
+/** Day labor rollup (closed shifts finalized; open shifts counted elapsed-so-far). */
+function dayLabor(dateStr) {
+  const cfg = clockConfig();
+  const shifts = db.prepare('SELECT * FROM clock_shifts WHERE site_id = ?').all(SITE_ID)
+    .filter((s) => tzDate(s.clock_in) === dateStr);
+  let reg = 0, ot = 0, premium = 0, total = 0;
+  const views = [];
+  for (const s of shifts) {
+    const v = shiftView(s, breaksFor(s.id), cfg);
+    views.push(v);
+    reg += v.pay.reg_cents; ot += v.pay.ot15_cents + v.pay.ot2_cents;
+    premium += v.pay.premium_cents; total += v.pay.total_cents;
+  }
+  // Weekly OT: per user, hours beyond 40h/week (Sun-Sat, site tz) not already
+  // counted as daily OT convert to 1.5x.
+  const ws = weekStartSite(dateStr + 'T12:00:00Z');
+  const weekly = [];
+  const byUser = new Map();
+  for (const s of db.prepare('SELECT * FROM clock_shifts WHERE site_id = ?').all(SITE_ID)) {
+    if (weekStartSite(s.clock_in) !== ws) continue;
+    if (!byUser.has(s.user_id)) byUser.set(s.user_id, []);
+    byUser.get(s.user_id).push(s);
+  }
+  let weeklyOtCents = 0;
+  for (const [uid, wshifts] of byUser) {
+    let wh = 0, dot = 0, payAt1x = 0;
+    for (const s of wshifts) {
+      const v = shiftView(s, breaksFor(s.id), cfg);
+      wh += v.hours; dot += v.pay.ot15_hours + v.pay.ot2_hours;
+      // Hours already paid at 1x contribute to a weighted-average rate so the
+      // weekly premium lands on the right base when rates vary mid-week.
+      payAt1x += v.pay.reg_cents + v.pay.ot15_cents / 1.5 + v.pay.ot2_cents / 2;
+    }
+    const extra = Math.max(0, wh - cfg.ot_weekly_h - dot);
+    const avgRate = wh > 0.005 ? payAt1x / wh : 0;
+    if (extra > 0.005 && avgRate > 0) {
+      // These hours already earned 1x in the daily rollup; the weekly premium
+      // is the additional 0.5x that brings them to 1.5x total (never 2.5x).
+      const pay = Math.round(extra * avgRate * 0.5);
+      weeklyOtCents += pay;
+      const nm = wshifts[0].employee_name;
+      weekly.push({ user_id: uid, employee_name: nm, week_hours: r2(wh), extra_ot15_hours: r2(extra), extra_ot15_cents: pay });
+    }
+  }
+  total += weeklyOtCents;
+  return { views, summary: { reg_cents: reg, ot_cents: ot, premium_cents: premium, weekly_ot_cents: weeklyOtCents, total_cents: total }, weekly };
+}
+
+/** GET /api/admin/clock/shifts?date=YYYY-MM-DD — manager: all shifts, breaks,
+    compliance, premiums, OT, and the day labor rollup. */
+app.get('/api/admin/clock/shifts', managerOnly(), (req, res) => {
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || '') ? req.query.date : todaySite();
+  const { views, summary, weekly } = dayLabor(date);
+  const onShift = db.prepare("SELECT id, employee_name, role, clock_in FROM clock_shifts WHERE site_id = ? AND clock_out IS NULL").all(SITE_ID);
+  const violations = views.filter((v) => v.compliance.violations.length)
+    .map((v) => ({ shift_id: v.id, employee_name: v.employee_name, violations: v.compliance.violations, premium_cents: v.pay.premium_cents }));
+  res.json({ date, on_shift: onShift, shifts: views, labor: summary, weekly_ot: weekly, violations });
+});
+
+/** POST /api/admin/clock/adjust — manager correction (audit-logged).
+ *  Adjusts clock_in/clock_out/rate AND break start/end times; pay recomputes
+ *  from the adjusted times on read. A manager PIN is REQUIRED for every
+ *  adjustment — the manager physically enters their PIN at the device and
+ *  there is no adjustment path without it. The correction lands in the
+ *  approval_audit table (same as voids/comps) with before/after + approver. */
+app.post('/api/admin/clock/adjust', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  // Point-of-action approval FIRST: a valid session alone is NOT enough — the
+  // manager must enter their PIN at the device for every adjustment. Checked
+  // before anything else so no information leaks without approval either.
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) return res.status(403).json({ error: 'Manager PIN required for time-clock adjustments' });
+  const shift = b.shift_id != null ? shiftById(b.shift_id) : null;
+  if (!shift) return res.status(400).json({ error: 'Unknown shift_id' });
+  const approver = mgr.name;
+  const patch = {};
+  if (b.clock_in !== undefined) {
+    if (isNaN(new Date(b.clock_in).getTime())) return res.status(400).json({ error: 'clock_in must be an ISO timestamp' });
+    patch.clock_in = new Date(b.clock_in).toISOString();
+  }
+  if (b.clock_out !== undefined) {
+    if (b.clock_out !== null && isNaN(new Date(b.clock_out).getTime())) return res.status(400).json({ error: 'clock_out must be an ISO timestamp or null' });
+    patch.clock_out = b.clock_out === null ? null : new Date(b.clock_out).toISOString();
+  }
+  const ci = patch.clock_in !== undefined ? patch.clock_in : shift.clock_in;
+  const co = patch.clock_out !== undefined ? patch.clock_out : shift.clock_out;
+  if (ci && co && new Date(co) <= new Date(ci)) return res.status(400).json({ error: 'clock_out must be after clock_in' });
+  if (b.regular_rate_cents !== undefined) {
+    if (!isInt(b.regular_rate_cents) || b.regular_rate_cents < 0) return res.status(400).json({ error: 'regular_rate_cents must be a whole number of cents ≥ 0' });
+    patch.regular_rate_cents = b.regular_rate_cents;
+  }
+  // Break-time correction: {break_id, start_at?, end_at?} — the break must
+  // belong to this shift; times stay inside the shift window.
+  let breakPatch = null;
+  if (b.break_id !== undefined) {
+    const brk = db.prepare('SELECT * FROM clock_breaks WHERE id = ? AND shift_id = ?').get(b.break_id, shift.id);
+    if (!brk) return res.status(400).json({ error: 'Unknown break_id for this shift' });
+    breakPatch = { id: brk.id, before: { start_at: brk.start_at, end_at: brk.end_at } };
+    const bs = {}, bsets = [];
+    if (b.start_at !== undefined) {
+      if (isNaN(new Date(b.start_at).getTime())) return res.status(400).json({ error: 'start_at must be an ISO timestamp' });
+      bs.start_at = new Date(b.start_at).toISOString(); bsets.push('start_at = ?');
+    }
+    if (b.end_at !== undefined) {
+      if (b.end_at !== null && isNaN(new Date(b.end_at).getTime())) return res.status(400).json({ error: 'end_at must be an ISO timestamp or null' });
+      bs.end_at = b.end_at === null ? null : new Date(b.end_at).toISOString(); bsets.push('end_at = ?');
+    }
+    const nbs = bs.start_at !== undefined ? bs.start_at : brk.start_at;
+    const nbe = bs.end_at !== undefined ? bs.end_at : brk.end_at;
+    if (nbs && nbe && new Date(nbe) <= new Date(nbs)) return res.status(400).json({ error: 'break end_at must be after start_at' });
+    if (!bsets.length) return res.status(400).json({ error: 'Nothing to adjust on the break' });
+    db.prepare('UPDATE clock_breaks SET ' + bsets.join(', ') + ' WHERE id = ?').run(...Object.values(bs), brk.id);
+    breakPatch.after = { start_at: nbs, end_at: nbe };
+  }
+  if (!Object.keys(patch).length && !breakPatch) return res.status(400).json({ error: 'Nothing to adjust' });
+  const before = { clock_in: shift.clock_in, clock_out: shift.clock_out, regular_rate_cents: shift.regular_rate_cents };
+  if (Object.keys(patch).length) {
+    const sets = Object.keys(patch).map((k) => k + ' = ?').join(', ');
+    db.prepare('UPDATE clock_shifts SET ' + sets + ' WHERE id = ?').run(...Object.values(patch), shift.id);
+  }
+  const approvalDetails = { approver, approver_id: mgr.id, before, after: patch };
+  if (breakPatch) approvalDetails.break = breakPatch;
+  // Canonical audit: time adjustments live in approval_audit alongside
+  // voids/comps (actor, action, before/after, timestamp). The shift-timeline
+  // row in clock_audit is kept as well for the clock history view.
+  auditApproval(req, 'adjust', { shift_id: shift.id }, approvalDetails);
+  auditClock(req, 'adjust', shift.id, approvalDetails);
+  const cfg = clockConfig();
+  res.json(shiftView(shiftById(shift.id), breaksFor(shift.id), cfg));
+});
+
+/** GET /api/admin/clock/config — resolved CA-rule config (defaults + overrides). */
+app.get('/api/admin/clock/config', managerOnly(), (req, res) => {
+  const overrides = {};
+  for (const r of db.prepare("SELECT key, value FROM site_config WHERE site_id = ? AND key LIKE 'clock_%'").all(SITE_ID)) {
+    overrides[r.key.slice(6)] = r.value;
+  }
+  res.json({ defaults: CLOCK_CA_DEFAULTS, overrides, effective: clockConfig() });
+});
+
+/** PUT /api/admin/clock/config {key, value} — tune a threshold (audit-logged). */
+app.put('/api/admin/clock/config', managerOnly(), (req, res) => {
+  const { key, value } = req.body || {};
+  if (!(key in CLOCK_CA_DEFAULTS)) return res.status(400).json({ error: 'Unknown clock config key' });
+  const n = parseFloat(value);
+  if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'value must be a number ≥ 0' });
+  db.prepare('INSERT INTO site_config (site_id, key, value) VALUES (?, ?, ?) ON CONFLICT(site_id, key) DO UPDATE SET value = excluded.value')
+    .run(SITE_ID, 'clock_' + key, String(n));
+  auditClock(req, 'config_change', null, { key, value: n });
+  res.json({ key, value: n, effective: clockConfig() });
+});
+
+/** GET /api/admin/clock/users — team list with hourly rates (for the manager UI). */
+app.get('/api/admin/clock/users', managerOnly(), (req, res) => {
+  res.json(db.prepare('SELECT id, name, role, hourly_rate_cents FROM users WHERE site_id = ? ORDER BY role, name').all(SITE_ID));
+});
+
+/** PUT /api/admin/clock/users/:id/rate {hourly_rate_cents} — set pay rate (audit-logged). */
+app.put('/api/admin/clock/users/:id/rate', managerOnly(), (req, res) => {
+  const u = db.prepare('SELECT id, name, role, hourly_rate_cents FROM users WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!u) return res.status(400).json({ error: 'Unknown user' });
+  const v = req.body && req.body.hourly_rate_cents;
+  if (!isInt(v) || v < 0) return res.status(400).json({ error: 'hourly_rate_cents must be a whole number of cents ≥ 0' });
+  db.prepare('UPDATE users SET hourly_rate_cents = ? WHERE id = ?').run(v, u.id);
+  auditClock(req, 'rate_change', null, { user_id: u.id, employee_name: u.name, before: u.hourly_rate_cents, after: v });
+  res.json({ id: u.id, name: u.name, role: u.role, hourly_rate_cents: v });
+});
+
+/** GET /api/admin/clock/audit?limit= — who changed what, when. */
+app.get('/api/admin/clock/audit', managerOnly(), (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '100', 10) || 100, 1), 500);
+  res.json(db.prepare('SELECT id, actor, action, shift_id, details, created_at FROM clock_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
+});
+
+/* ------------------------- employee records (phase 2) ------------------------ */
+/** Manager-only staff management. employees is the canonical record; the
+ *  users row stays in sync so PIN login keeps working. DELETE is a soft
+ *  deactivation (payroll history must survive) and can never remove the
+ *  last active manager. PINs are never returned by these endpoints. */
+function employeeView(e) {
+  return {
+    id: e.id, employee_number: e.employee_number, name: e.name, role: e.role,
+    wage_rate_cents: e.wage_rate_cents, active: e.active === 1, created_at: e.created_at,
+  };
+}
+function nextEmployeeNumber() {
+  const r = db.prepare('SELECT MAX(employee_number) AS m FROM employees WHERE site_id = ?').get(SITE_ID);
+  return Math.max(101, (r && r.m != null ? r.m : 100) + 1);
+}
+const EMP_ROLES = new Set(['server', 'kitchen', 'manager']);
+function validEmployeePin(p) { return typeof p === 'string' && /^\d{4}$/.test(p); }
+function employeeById(id) {
+  return db.prepare('SELECT * FROM employees WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+
+app.get('/api/admin/employees', managerOnly(), (req, res) => {
+  let sql = 'SELECT * FROM employees WHERE site_id = ?';
+  const params = [SITE_ID];
+  if (req.query.active === '1') { sql += ' AND active = 1'; }
+  else if (req.query.active === '0') { sql += ' AND active = 0'; }
+  sql += ' ORDER BY employee_number, id';
+  res.json(db.prepare(sql).all(...params).map(employeeView));
+});
+
+app.get('/api/admin/employees/next-number', managerOnly(), (req, res) => {
+  res.json({ employee_number: nextEmployeeNumber() });
+});
+
+app.post('/api/admin/employees', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const name = cleanLabel(b.name);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  const role = typeof b.role === 'string' ? b.role.trim().toLowerCase() : '';
+  if (!EMP_ROLES.has(role)) return res.status(400).json({ error: 'role must be server, kitchen, or manager' });
+  const pin = b.pin != null ? String(b.pin) : '';
+  if (!validEmployeePin(pin)) return res.status(400).json({ error: 'pin must be 4 digits' });
+  if (db.prepare('SELECT id FROM users WHERE pin = ? AND site_id = ?').get(pin, SITE_ID)) {
+    return res.status(400).json({ error: 'PIN is already in use' });
+  }
+  let number = b.employee_number;
+  if (number === undefined || number === null || number === '') number = nextEmployeeNumber();
+  number = Number(number);
+  if (!isInt(number) || number <= 0) return res.status(400).json({ error: 'employee_number must be a positive integer' });
+  if (db.prepare('SELECT id FROM employees WHERE employee_number = ? AND site_id = ?').get(number, SITE_ID)) {
+    return res.status(400).json({ error: 'Employee number is already in use' });
+  }
+  const wage = b.wage_rate_cents === undefined ? 0 : b.wage_rate_cents;
+  if (!isInt(wage) || wage < 0) return res.status(400).json({ error: 'wage_rate_cents must be a whole number of cents ≥ 0' });
+  try {
+    db.exec('BEGIN');
+    const u = db.prepare('INSERT INTO users (site_id, name, role, pin, hourly_rate_cents, active) VALUES (?, ?, ?, ?, ?, 1)')
+      .run(SITE_ID, name, role, pin, wage);
+    const e = db.prepare('INSERT INTO employees (site_id, employee_number, user_id, name, role, pin, wage_rate_cents, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)')
+      .run(SITE_ID, number, u.lastInsertRowid, name, role, pin, wage, new Date().toISOString());
+    db.exec('COMMIT');
+    auditApproval(req, 'employee.create', {}, { employee_id: e.lastInsertRowid, after: { name, role, employee_number: number, wage_rate_cents: wage } });
+    res.status(201).json(employeeView(employeeById(e.lastInsertRowid)));
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+    return res.status(400).json({ error: 'Could not create employee: ' + (err.message || 'constraint failed') });
+  }
+});
+
+app.put('/api/admin/employees/:id', managerOnly(), (req, res) => {
+  const emp = employeeById(req.params.id);
+  if (!emp) return res.status(404).json({ error: 'Employee not found' });
+  const b = req.body || {};
+  const patch = {}, userPatch = {};
+  if (b.name !== undefined) {
+    const name = cleanLabel(b.name);
+    if (!name) return res.status(400).json({ error: 'name cannot be blank' });
+    patch.name = name; userPatch.name = name;
+  }
+  if (b.role !== undefined) {
+    const role = String(b.role).trim().toLowerCase();
+    if (!EMP_ROLES.has(role)) return res.status(400).json({ error: 'role must be server, kitchen, or manager' });
+    if (emp.role === 'manager' && role !== 'manager') {
+      const others = db.prepare("SELECT COUNT(*) AS n FROM employees WHERE site_id = ? AND role = 'manager' AND active = 1 AND id != ?").get(SITE_ID, emp.id).n;
+      if (!others) return res.status(400).json({ error: 'Cannot demote the last active manager' });
+    }
+    patch.role = role; userPatch.role = role;
+  }
+  if (b.pin !== undefined) {
+    const pin = String(b.pin);
+    if (!validEmployeePin(pin)) return res.status(400).json({ error: 'pin must be 4 digits' });
+    const clash = db.prepare('SELECT id FROM users WHERE pin = ? AND site_id = ? AND id != ?').get(pin, SITE_ID, emp.user_id);
+    if (clash) return res.status(400).json({ error: 'PIN is already in use' });
+    patch.pin = pin; userPatch.pin = pin;
+  }
+  if (b.employee_number !== undefined) {
+    const number = Number(b.employee_number);
+    if (!isInt(number) || number <= 0) return res.status(400).json({ error: 'employee_number must be a positive integer' });
+    const clash = db.prepare('SELECT id FROM employees WHERE employee_number = ? AND site_id = ? AND id != ?').get(number, SITE_ID, emp.id);
+    if (clash) return res.status(400).json({ error: 'Employee number is already in use' });
+    patch.employee_number = number;
+  }
+  if (b.wage_rate_cents !== undefined) {
+    if (!isInt(b.wage_rate_cents) || b.wage_rate_cents < 0) return res.status(400).json({ error: 'wage_rate_cents must be a whole number of cents ≥ 0' });
+    patch.wage_rate_cents = b.wage_rate_cents; userPatch.hourly_rate_cents = b.wage_rate_cents;
+  }
+  if (b.active !== undefined) {
+    const active = b.active ? 1 : 0;
+    if (!active && emp.role === 'manager') {
+      const others = db.prepare("SELECT COUNT(*) AS n FROM employees WHERE site_id = ? AND role = 'manager' AND active = 1 AND id != ?").get(SITE_ID, emp.id).n;
+      if (!others) return res.status(400).json({ error: 'Cannot deactivate the last active manager' });
+    }
+    patch.active = active; userPatch.active = active;
+  }
+  if (!Object.keys(patch).length) return res.status(400).json({ error: 'Nothing to update' });
+  const before = employeeView(emp);
+  try {
+    db.exec('BEGIN');
+    db.prepare('UPDATE employees SET ' + Object.keys(patch).map((k) => k + ' = ?').join(', ') + ' WHERE id = ?')
+      .run(...Object.values(patch), emp.id);
+    if (Object.keys(userPatch).length && emp.user_id) {
+      db.prepare('UPDATE users SET ' + Object.keys(userPatch).map((k) => k + ' = ?').join(', ') + ' WHERE id = ?')
+        .run(...Object.values(userPatch), emp.user_id);
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* noop */ }
+    return res.status(400).json({ error: 'Could not update employee: ' + (err.message || 'constraint failed') });
+  }
+  const after = employeeView(employeeById(emp.id));
+  auditApproval(req, 'employee.update', {}, { employee_id: emp.id, before, after });
+  res.json(after);
+});
+
+/** DELETE deactivates (never hard-deletes — payroll history must survive). */
+app.delete('/api/admin/employees/:id', managerOnly(), (req, res) => {
+  const emp = employeeById(req.params.id);
+  if (!emp) return res.status(404).json({ error: 'Employee not found' });
+  if (emp.role === 'manager') {
+    const others = db.prepare("SELECT COUNT(*) AS n FROM employees WHERE site_id = ? AND role = 'manager' AND active = 1 AND id != ?").get(SITE_ID, emp.id).n;
+    if (!others) return res.status(400).json({ error: 'Cannot deactivate the last active manager' });
+  }
+  const before = employeeView(emp);
+  db.prepare('UPDATE employees SET active = 0 WHERE id = ?').run(emp.id);
+  if (emp.user_id) db.prepare('UPDATE users SET active = 0 WHERE id = ?').run(emp.user_id);
+  auditApproval(req, 'employee.deactivate', {}, { employee_id: emp.id, before, after: { ...before, active: false } });
+  res.json({ id: emp.id, active: false });
+});
+
+/** GET /api/admin/approvals/audit?limit= — every manager approval, who/when/what. */
+app.get('/api/admin/approvals/audit', managerOnly(), (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '100', 10) || 100, 1), 500);
+  res.json(db.prepare('SELECT id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at FROM approval_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
 });
 
 /* --------------------------- 404 for unknown /api --------------------------- */
@@ -999,6 +2832,9 @@ wss.on('connection', (ws) => {
       } else if (msg.channel === 'checks') {
         ws.subs.push({ channel: 'checks' });
         ws.send(JSON.stringify({ type: 'subscribed', channel: 'checks' }));
+      } else if (msg.channel === 'menu') {
+        ws.subs.push({ channel: 'menu' });
+        ws.send(JSON.stringify({ type: 'subscribed', channel: 'menu' }));
       } else {
         ws.send(JSON.stringify({ type: 'error', error: 'Unknown channel' }));
       }
@@ -1049,6 +2885,16 @@ function broadcastCheckUpdated(checkId) {
   for (const ws of wss.clients) {
     if ((ws.subs || []).some((s) => s.channel === 'checks')) {
       wsSend(ws, { type: 'check_updated', check_id: checkId });
+    }
+  }
+}
+
+/** Push {type:'menu_updated'} to 'menu' channel subscribers — every device
+    refetches the menu (used by the menu editor and the one-tap 86 toggle). */
+function broadcastMenuUpdated() {
+  for (const ws of wss.clients) {
+    if ((ws.subs || []).some((s) => s.channel === 'menu')) {
+      wsSend(ws, { type: 'menu_updated' });
     }
   }
 }
