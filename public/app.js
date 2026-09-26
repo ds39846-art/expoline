@@ -1906,12 +1906,18 @@ async function renderOrder(app, checkId) {
       let html = '';
       if (s.fired.length) html += '<p class="small muted">Fired: ' + s.fired.map((f) => esc(f.course) + ' ' + fmtTime(f.fired_at)).join(', ') + '</p>';
       if (s.schedule.length) {
-        html += '<div class="fire-schedule">' + s.schedule.map((it) => {
+        /* Course order is enforced server-side: only the first scheduled
+           course can fire — later ones wait until earlier held courses fire.
+           Show them disabled with the reason instead of letting the tap 409. */
+        html += '<div class="fire-schedule">' + s.schedule.map((it, i) => {
           const fireMs = new Date(it.fire_at).getTime();
           const mins = Math.max(0, Math.round((fireMs - now) / 60000));
           const due = fireMs <= now + 60000;
-          return '<div class="fire-row' + (due ? ' fire-due' : '') + '"><span><b>' + esc(it.course) + '</b> <span class="muted small">~' + fmtTime(it.fire_at) + (mins > 0 ? ' (' + mins + 'm)' : ' (now)') + '</span></span>' +
-            '<button class="btn btn-sm ' + (due ? 'btn-amber' : 'btn-ghost') + '" data-fire-course="' + esc(it.course) + '">' + (due ? '🔥 FIRE NOW' : 'Fire') + '</button></div>';
+          const blockedBy = i > 0 ? s.schedule[0].course : null;
+          const btn = blockedBy
+            ? '<button class="btn btn-sm btn-ghost" disabled title="Fire ' + esc(blockedBy) + ' first">waiting on ' + esc(blockedBy) + '</button>'
+            : '<button class="btn btn-sm ' + (due ? 'btn-amber' : 'btn-ghost') + '" data-fire-course="' + esc(it.course) + '">' + (due ? '🔥 FIRE NOW' : 'Fire') + '</button>';
+          return '<div class="fire-row' + (due && !blockedBy ? ' fire-due' : '') + '"><span><b>' + esc(it.course) + '</b> <span class="muted small">~' + fmtTime(it.fire_at) + (mins > 0 ? ' (' + mins + 'm)' : ' (now)') + '</span></span>' + btn + '</div>';
         }).join('') + '</div>';
       } else {
         html += '<p class="small muted">All courses fired.</p>';
@@ -1921,7 +1927,10 @@ async function renderOrder(app, checkId) {
         b.disabled = true;
         try { await api('/api/checks/' + encodeURIComponent(checkId) + '/fire-course', 'POST', { course: b.dataset.fireCourse }); }
         catch (e) { handleApiError(e); b.disabled = false; return; }
-        loadFireSchedule();
+        toast('Fired ' + b.dataset.fireCourse + ' to KDS', 'ok');
+        /* Re-render the whole order view so item badges flip HELD -> SENT
+           and the fire schedule recomputes (same as HOLD does). */
+        renderRoute(true);
       });
     } catch (e) { /* offline: hide card */ card.style.display = 'none'; }
   };

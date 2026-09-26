@@ -604,6 +604,9 @@ function getConfig() {
 
 /* --------------------------------- helpers -------------------------------- */
 const nowIso = () => new Date().toISOString();
+/* Sentinel for "fail this request with a 409" thrown from inside a
+   transaction (the rollback is harmless — nothing was written yet). */
+class FireConflict extends Error {}
 const parseJson = (s, fb) => { try { return JSON.parse(s ?? ''); } catch { return fb; } };
 const isInt = (v) => Number.isInteger(v);
 
@@ -1945,27 +1948,72 @@ app.post('/api/checks/:id/fire-course', serverPlus(), (req, res) => {
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot fire course on a ${check.status} check` });
   const { course } = req.body || {};
-  if (!course || !['drink', 'appetizer', 'entree', 'dessert'].includes(course)) return res.status(400).json({ error: 'valid course required' });
-  /* Idempotency: one fire per course per check. Pre-check for the clean 409;
-     the unique index below is the race guard. */
-  const existing = db.prepare(`SELECT id FROM course_fires WHERE site_id = ? AND check_id = ? AND course = ?`).get(SITE_ID, check.id, course);
-  if (existing) return res.status(409).json({ error: 'course already fired' });
+  const order = ['drink', 'appetizer', 'entree', 'dessert'];
+  if (!course || !order.includes(course)) return res.status(400).json({ error: 'valid course required' });
+
+  /* Course order is enforced: a course cannot fire while an earlier course
+     still has held items waiting. (A course with nothing held never blocks —
+     e.g. firing appetizer when no drinks were ordered is fine.) */
+  const earlier = order.slice(0, order.indexOf(course));
+  if (earlier.length) {
+    const rows = db.prepare(
+      `SELECT LOWER(course) AS course, COUNT(*) AS n FROM check_items
+       WHERE check_id = ? AND state = 'held' AND LOWER(course) IN (${earlier.map(() => '?').join(',')})
+       GROUP BY LOWER(course)`
+    ).all(check.id, ...earlier);
+    if (rows.length) {
+      rows.sort((a, b) => order.indexOf(a.course) - order.indexOf(b.course));
+      const blocker = rows[0];
+      return res.status(409).json({
+        error: `fire ${blocker.course} first — ${blocker.n} item(s) still held`,
+        blocked_by: blocker.course, need_course_order: true,
+      });
+    }
+  }
+
   const firedAt = nowIso();
+  const actor = req.user?.name || req.user?.pin || 'staff';
+  const heldStmt = db.prepare(
+    "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? AND ci.state = 'held' AND LOWER(ci.course) = ? ORDER BY ci.added_at, ci.id"
+  );
+  let result;
   try {
-    db.prepare(`INSERT INTO course_fires (uuid, site_id, check_id, course, fired_at, fired_by) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(crypto.randomUUID(), SITE_ID, check.id, course, firedAt, req.user?.name || req.user?.pin || 'staff');
+    /* One transaction, one truth: the fire-record upsert, the item/inventory/
+       ticket writes, totals, and the audit entry all commit or roll back
+       together. Held items are re-read INSIDE the transaction so two
+       concurrent fires can never ticket the same item twice. */
+    result = withTransaction(() => {
+      const heldNow = heldStmt.all(check.id, course.toLowerCase());
+      const existingNow = db.prepare(`SELECT id FROM course_fires WHERE site_id = ? AND check_id = ? AND course = ?`).get(SITE_ID, check.id, course);
+      /* Re-fire policy: firing a course that already fired is allowed when new
+         held items landed in that course afterwards — only the still-held items
+         fire, and the fire record's timestamp refreshes. Re-firing with nothing
+         held is a no-op 409. The unique index + upsert is the race guard. */
+      if (!heldNow.length && existingNow) throw new FireConflict('course already fired');
+      db.prepare(`INSERT INTO course_fires (uuid, site_id, check_id, course, fired_at, fired_by)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(site_id, check_id, course) DO UPDATE SET fired_at = excluded.fired_at, fired_by = excluded.fired_by`)
+        .run(crypto.randomUUID(), SITE_ID, check.id, course, firedAt, actor);
+      /* The actual fire — held items of this course go to KDS now via the shared
+         fire path (same tickets, inventory, totals as /send). When nothing is
+         held the fire is still recorded (and audited) for timing. */
+      const core = fireHeldItemsToKdsCore(check, heldNow);
+      persistTotals(check.id);
+      /* Dedicated audit entry so every course fire is traceable. */
+      db.prepare(`INSERT INTO approval_audit (site_id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at)
+        VALUES (?, ?, ?, 'course_fire', ?, NULL, NULL, NULL, NULL, ?, ?)`)
+        .run(SITE_ID, actor, actor, check.id,
+          JSON.stringify({ course, fired_at: firedAt, refire: !!existingNow, items_sent: core.sent, item_ids: heldNow.map((i) => i.id), ticket_ids: core.tickets.map((t) => t.id) }),
+          firedAt);
+      return { ...core, refire: !!existingNow };
+    });
   } catch (e) {
-    if (String(e.message || '').includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'course already fired' });
+    if (e instanceof FireConflict) return res.status(409).json({ error: e.message });
     throw e;
   }
-  /* Actually fire the course: held items of this course go to KDS now via the
-     shared fire path (same tickets, inventory, broadcasts as /send). When
-     nothing is held the fire is still recorded for timing. */
-  const held = db.prepare(
-    "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? AND ci.state = 'held' AND LOWER(ci.course) = ? ORDER BY ci.added_at, ci.id"
-  ).all(check.id, course.toLowerCase());
-  const result = fireHeldItemsToKds(check, held);
-  res.json({ ok: true, course, fired_at: firedAt, sent: result.sent, tickets: result.tickets });
+  for (const ticket of result.tickets) broadcastTicket(ticket);
+  broadcastCheckUpdated(check.id);
+  res.json({ ok: true, course, fired_at: firedAt, refire: result.refire, sent: result.sent, tickets: result.tickets });
 });
 
 /* Phase 3A (P1): editable check metadata — guest count, tab name, coursing.
@@ -2573,36 +2621,42 @@ app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
 /* Core KDS fire: mark held items sent, create station tickets, deplete
    inventory, broadcast. Shared by /send and /fire-course so a course fire
    actually puts food on the KDS — not just a timestamp. Returns {sent, tickets}. */
-function fireHeldItemsToKds(check, held) {
+/* Core KDS fire: mark held items sent, create station tickets, deplete
+   inventory. Shared by /send and /fire-course so a course fire actually puts
+   food on the KDS — not just a timestamp.
+   DB-ONLY: runs inside the caller's transaction (no broadcasts here) so the
+   item/inventory/ticket writes commit or roll back as one unit. Returns
+   {sent, tickets} with full ticket views; the caller broadcasts after commit. */
+function fireHeldItemsToKdsCore(check, held) {
   const sentAt = nowIso();
   const table = check.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(check.table_id) : null;
   const serverUser = check.server_id ? db.prepare('SELECT name FROM users WHERE id = ?').get(check.server_id) : null;
 
   const byStation = new Map();
   const markSent = db.prepare("UPDATE check_items SET state = 'sent', sent_at = ? WHERE id = ?");
-  withTransaction(() => {
-    for (const it of held) {
-      markSent.run(sentAt, it.id);
-      const station = it.station || 'expediter';
-      if (!byStation.has(station)) byStation.set(station, []);
-      byStation.get(station).push({
-        item_id: it.id,
-        name: it.name,
-        seat: it.seat,
-        qty: it.qty,
-        course: it.course,
-        modifiers: parseJson(it.modifiers_json, []),
-        /* Allergy + special-request note ride the ticket to KDS (schema:
-         * check_items.note / .allergy / .allergy_detail — shared contract
-         * with order-entry; KDS only renders, never edits). */
-        note: it.note || null,
-        allergy: it.allergy ? 1 : 0,
-        allergy_detail: it.allergy_detail || null,
-      });
-    }
-    depleteInventoryForItems(held); // phase 3C: ingredient-level depletion from real sales
-  });
+  for (const it of held) {
+    markSent.run(sentAt, it.id);
+    const station = it.station || 'expediter';
+    if (!byStation.has(station)) byStation.set(station, []);
+    byStation.get(station).push({
+      item_id: it.id,
+      name: it.name,
+      seat: it.seat,
+      qty: it.qty,
+      course: it.course,
+      modifiers: parseJson(it.modifiers_json, []),
+      /* Allergy + special-request note ride the ticket to KDS (schema:
+       * check_items.note / .allergy / .allergy_detail — shared contract
+       * with order-entry; KDS only renders, never edits). */
+      note: it.note || null,
+      allergy: it.allergy ? 1 : 0,
+      allergy_detail: it.allergy_detail || null,
+    });
+  }
+  depleteInventoryForItems(held); // phase 3C: ingredient-level depletion from real sales
 
+  /* Tickets are created in the SAME transaction as the item/inventory writes:
+     a crash mid-fire can never leave items marked sent with no KDS ticket. */
   const tickets = [];
   const insTicket = db.prepare(
     "INSERT INTO kds_tickets (uuid, check_id, site_id, station, table_label, server_name, items_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)"
@@ -2614,13 +2668,17 @@ function fireHeldItemsToKds(check, held) {
       serverUser ? serverUser.name : null,
       JSON.stringify(items), sentAt
     );
-    const ticket = ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid));
-    tickets.push(ticket);
-    broadcastTicket(ticket); // push {type:'ticket'} to that station's subscribers
+    tickets.push(ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid)));
   }
+  return { sent: held.length, tickets };
+}
+
+function fireHeldItemsToKds(check, held) {
+  const result = withTransaction(() => fireHeldItemsToKdsCore(check, held));
+  for (const ticket of result.tickets) broadcastTicket(ticket); // push {type:'ticket'} to that station's subscribers
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
-  return { sent: held.length, tickets };
+  return { sent: result.sent, tickets: result.tickets };
 }
 
 app.post('/api/checks/:id/send', serverPlus(), (req, res) => {

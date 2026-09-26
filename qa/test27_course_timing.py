@@ -124,6 +124,14 @@ sched_courses = [s["course"] for s in s1["schedule"]]
 ok(sched_courses == ["drink", "appetizer", "entree"], "schedule lists held courses in order", str(sched_courses))
 ok(all("fire_at" in s and "eat_minutes" in s for s in s1["schedule"]), "schedule entries have fire_at + estimates")
 
+# Course order is enforced: appetizer cannot fire while drink is held
+expect_status("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "appetizer"}, 409, "appetizer blocked while drink held -> 409")
+
+# FIRE the drink course first
+f0 = api("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "drink"})
+ok(f0.get("ok") and f0.get("sent") == 1 and not f0.get("refire"), "fire drink -> sent 1 item", str(f0.get("sent")))
+ok(len(f0.get("tickets", [])) == 1, "fire drink -> 1 KDS ticket")
+
 # FIRE the appetizer course
 f1 = api("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "appetizer"})
 ok(f1.get("ok") and f1.get("sent") == 1, "fire appetizer -> sent 1 item", str(f1.get("sent")))
@@ -135,37 +143,60 @@ items_json = tix.get("items_json") or tix.get("items") or []
 if isinstance(items_json, str): items_json = json.loads(items_json)
 ok(any((it.get("course") or "").lower() == "appetizer" for it in items_json), "KDS ticket holds appetizer item")
 
-# Verify item state flipped to sent
+# Verify item states flipped to sent
 check_items = api("GET", f"/api/checks/{cid}", ST).get("items", [])
-app_items = [i for i in check_items if (i.get("course") or "").lower() == "appetizer"]
-ok(all(i.get("state") == "sent" for i in app_items), "appetizer items marked sent")
-drink_items = [i for i in check_items if (i.get("course") or "").lower() == "drink"]
-ok(all(i.get("state") == "held" for i in drink_items), "drink items still held")
+for course in ("drink", "appetizer"):
+    course_items = [i for i in check_items if (i.get("course") or "").lower() == course]
+    ok(course_items and all(i.get("state") == "sent" for i in course_items), f"{course} items marked sent")
+entree_items = [i for i in check_items if (i.get("course") or "").lower() == "entree"]
+ok(all(i.get("state") == "held" for i in entree_items), "entree items still held")
 
-# Schedule now excludes appetizer, shows fired
+# Schedule now shows only entree; drink + appetizer in fired list
 s2 = api("GET", f"/api/checks/{cid}/fire-schedule", ST)
-ok([s["course"] for s in s2["schedule"]] == ["drink", "entree"], "appetizer dropped from schedule", str([s["course"] for s in s2["schedule"]]))
-ok(any(f["course"] == "appetizer" for f in s2["fired"]), "appetizer in fired list")
+ok([s["course"] for s in s2["schedule"]] == ["entree"], "only entree remains in schedule", str([s["course"] for s in s2["schedule"]]))
+ok(any(f["course"] == "drink" for f in s2["fired"]) and any(f["course"] == "appetizer" for f in s2["fired"]), "drink + appetizer in fired list")
 
-print("== Test 27d: duplicate fire -> 409, out-of-order, re-fire ==")
+# Every fire wrote a dedicated audit entry
+audit = api("GET", "/api/admin/approvals/audit?limit=50", MT)
+audit = audit if isinstance(audit, list) else audit.get("entries", [])
+fires = [a for a in audit if a.get("action") == "course_fire"]
+ok(len(fires) >= 2, "course_fire audit entries recorded", str(len(fires)))
+ok(all(a.get("check_id") == cid for a in fires), "audit entries tied to this check")
+
+print("== Test 27d: duplicate fire -> 409, re-fire works, out-of-order blocked ==")
+# Duplicate fire with nothing held -> 409 (idempotent no-op)
 expect_status("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "appetizer"}, 409, "duplicate appetizer fire -> 409")
 
-# Out-of-order: fire entree before drink — allowed, schedule recomputes
+# Entree is now the earliest held course -> fires fine
 f2 = api("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "entree"})
-ok(f2.get("ok") and f2.get("sent") == 1, "out-of-order entree fire works")
+ok(f2.get("ok") and f2.get("sent") == 1, "fire entree -> sent 1")
 s3 = api("GET", f"/api/checks/{cid}/fire-schedule", ST)
-ok([s["course"] for s in s3["schedule"]] == ["drink"], "only drink remains", str([s["course"] for s in s3["schedule"]]))
+ok(s3["schedule"] == [], "schedule empty after all courses fired")
 
-# Re-fire: add another drink after drink was never fired — then fire drink twice via new items
-f3 = api("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "drink"})
-ok(f3.get("ok") and f3.get("sent") == 1, "fire drink -> sent 1")
-# Add another drink item post-fire; schedule should offer drink again
+# Re-fire: add another drink after drink already fired; schedule offers drink again
 mi_drink = by_course["drink"]
 api("POST", f"/api/checks/{cid}/items", ST, {"menu_item_id": mi_drink["id"], "seat": 2, "qty": 1})
 s4 = api("GET", f"/api/checks/{cid}/fire-schedule", ST)
-ok("drink" in [s["course"] for s in s4["schedule"]], "new drink item reappears in schedule")
-# But duplicate fire record is still blocked
-expect_status("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "drink"}, 409, "drink re-fire blocked (already recorded)")
+ok([s["course"] for s in s4["schedule"]] == ["drink"], "new drink item reappears in schedule")
+f3 = api("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "drink"})
+ok(f3.get("ok") and f3.get("sent") == 1 and f3.get("refire"), "drink re-fire sends the new item", str(f3))
+# Re-fire with nothing left held -> 409 again
+expect_status("POST", f"/api/checks/{cid}/fire-course", ST, {"course": "drink"}, 409, "re-fire with nothing held -> 409")
+
+# Out-of-order on a fresh check: entree held while drink held -> blocked
+c2 = api("POST", "/api/checks", ST, {"table_id": 2, "guest_count": 2, "tab_name": "QA course order"})
+cid2 = c2["id"]
+api("POST", f"/api/checks/{cid2}/items", ST, {"menu_item_id": by_course["entree"]["id"], "seat": 1, "qty": 1})
+api("POST", f"/api/checks/{cid2}/items", ST, {"menu_item_id": by_course["drink"]["id"], "seat": 1, "qty": 1})
+r_st, r_txt = api("POST", f"/api/checks/{cid2}/fire-course", ST, {"course": "entree"}, raw=True)
+r = json.loads(r_txt or "{}")
+ok(r_st == 409 and r.get("blocked_by") == "drink", "out-of-order entree blocked by drink", f"(got {r_st} {r_txt[:150]})")
+# And the blocked item is still held (nothing half-fired)
+ci2 = api("GET", f"/api/checks/{cid2}", ST).get("items", [])
+ok(all(i.get("state") == "held" for i in ci2), "blocked fire leaves items held")
+# Fire in order works
+ok(api("POST", f"/api/checks/{cid2}/fire-course", ST, {"course": "drink"}).get("ok"), "drink fires first")
+ok(api("POST", f"/api/checks/{cid2}/fire-course", ST, {"course": "entree"}).get("ok"), "entree fires after drink")
 
 print("== Test 27e: closed check ==")
 # Pay & close the check, then fire -> 400
