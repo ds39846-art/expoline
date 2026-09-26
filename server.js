@@ -2088,14 +2088,11 @@ app.post('/api/checks/:id/void', serverPlus(), (req, res) => {
   const reason = cleanLabel(b.reason);
   if (!reason) return res.status(400).json({ error: 'A void reason is required' });
   if (reason.length > 120) return res.status(400).json({ error: 'reason must be at most 120 characters' });
-  let mgr = null;
-  if (req.user.role === 'manager') {
-    mgr = { id: req.user.id, name: req.user.name };
-  } else {
-    mgr = verifyManagerPin(b.manager_pin);
-    if (!mgr) {
-      return res.status(403).json({ error: "Voiding a whole check needs a manager's approval", need_manager_pin: true });
-    }
+  /* Daniel's policy (2026-09-26): whole-check void requires a FRESH manager PIN
+     every time, no exceptions — even a logged-in manager must re-enter their PIN. */
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) {
+    return res.status(403).json({ error: "Voiding a whole check needs a manager's PIN — enter it fresh every time", need_manager_pin: true });
   }
   const payCount = db.prepare('SELECT COUNT(*) AS n FROM payments WHERE check_id = ?').get(check.id).n;
   if (payCount > 0) {
