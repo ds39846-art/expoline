@@ -2173,30 +2173,32 @@ function employeeNumberFor(userId) {
   return r ? r.employee_number : null;
 }
 
-/** Weekly-OT premium rows for one Sun–Sat workweek (mirrors dayLabor). */
+/** Weekly-OT premium rows for one Sun-Sat workweek (shares weekPayroll with
+    dayLabor so the finance report and the time-clock summary always agree). */
 function weeklyOtRows(weekStart) {
-  const cfg = clockConfig();
-  const byUser = new Map();
-  for (const s of db.prepare('SELECT * FROM clock_shifts WHERE site_id = ?').all(SITE_ID)) {
-    if (weekStartSite(s.clock_in) !== weekStart) continue;
-    if (!byUser.has(s.user_id)) byUser.set(s.user_id, []);
-    byUser.get(s.user_id).push(s);
-  }
   const rows = [];
-  for (const [uid, wshifts] of byUser) {
-    let wh = 0, dot = 0, payAt1x = 0;
-    for (const s of wshifts) {
-      const v = shiftView(s, breaksFor(s.id), cfg);
-      wh += v.hours; dot += v.pay.ot15_hours + v.pay.ot2_hours;
-      payAt1x += v.pay.reg_cents + v.pay.ot15_cents / 1.5 + v.pay.ot2_cents / 2;
-    }
-    const extra = Math.max(0, wh - cfg.ot_weekly_h - dot);
-    const avgRate = wh > 0.005 ? payAt1x / wh : 0;
-    if (extra > 0.005 && avgRate > 0) {
+  for (const w of weekPayroll(weekStart)) {
+    if (w.extra_ot15_hours > 0.005 && w.extra_ot15_cents > 0) {
       rows.push({
-        week_start: weekStart, employee_number: employeeNumberFor(uid),
-        employee_name: wshifts[0].employee_name, extra_ot_hours: r2(extra),
-        premium_cents: Math.round(extra * avgRate * 0.5),
+        week_start: weekStart, employee_number: employeeNumberFor(w.user_id),
+        employee_name: w.employee_name, extra_ot_hours: r2(w.extra_ot15_hours),
+        premium_cents: w.extra_ot15_cents,
+      });
+    }
+  }
+  return rows;
+}
+
+/** Seventh-consecutive-day premium rows for one Sun-Sat workweek: the uplift
+    (extra 0.5x) on hours not already at 2x, per 7th workday. */
+function seventhDayRows(weekStart) {
+  const rows = [];
+  for (const w of weekPayroll(weekStart)) {
+    for (const sd of w.seventhDays) {
+      rows.push({
+        week_start: weekStart, date: sd.date, employee_number: employeeNumberFor(w.user_id),
+        employee_name: w.employee_name, day_hours: r2(sd.hours),
+        uplifted_hours: r2(sd.regH + sd.ot15H), premium_cents: sd.upliftCents,
       });
     }
   }
@@ -2301,7 +2303,7 @@ const REPORT_DEFS = {
   },
   labor: {
     title: 'Labor',
-    notes: ['Regular, daily overtime (1.5× after 8h, 2× after 12h), and CA break premiums come from the time clock.', 'Weekly overtime (hours beyond 40/week at 1.5×) is listed separately by workweek and included in the combined total.'],
+    notes: ['Regular, daily overtime (1.5× after 8h, 2× after 12h), and CA break premiums come from the time clock.', 'Weekly overtime (hours beyond 40/week at 1.5×) and seventh-consecutive-day premiums (first 8h at 1.5×, beyond 8h at 2×) are listed separately by workweek and included in the combined total.'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'employee_number', label: '#', kind: 'text' },
@@ -2335,7 +2337,10 @@ const REPORT_DEFS = {
       const weekStarts = [...new Set(shifts.map((s) => weekStartSite(s.clock_in)))].sort();
       const wotRows = weekStarts.flatMap((ws) => weeklyOtRows(ws));
       const wotTotal = wotRows.reduce((a, r) => a + r.premium_cents, 0);
-      const extraTables = wotRows.length ? [{
+      const sdRows = weekStarts.flatMap((ws) => seventhDayRows(ws));
+      const sdTotal = sdRows.reduce((a, r) => a + r.premium_cents, 0);
+      const extraTables = [];
+      if (wotRows.length) extraTables.push({
         title: 'Weekly overtime premiums',
         columns: [
           { key: 'week_start', label: 'Week starting', kind: 'date' },
@@ -2346,8 +2351,22 @@ const REPORT_DEFS = {
         ],
         rows: wotRows,
         totals: { label: 'Total', premium_cents: wotTotal },
-      }] : [];
-      return { rows, extraTables, combinedNote: wotTotal ? 'Combined labor cost incl. weekly OT premiums: see totals above + ' + '$' + (wotTotal / 100).toFixed(2) : null };
+      });
+      if (sdRows.length) extraTables.push({
+        title: 'Seventh consecutive day premiums (CA)',
+        columns: [
+          { key: 'date', label: 'Date', kind: 'date' },
+          { key: 'employee_number', label: '#', kind: 'text' },
+          { key: 'employee_name', label: 'Employee', kind: 'text' },
+          { key: 'day_hours', label: 'Day hrs', kind: 'hours' },
+          { key: 'uplifted_hours', label: 'Uplifted hrs', kind: 'hours' },
+          { key: 'premium_cents', label: 'Premium pay', kind: 'money' },
+        ],
+        rows: sdRows,
+        totals: { label: 'Total', premium_cents: sdTotal },
+      });
+      const premTotal = wotTotal + sdTotal;
+      return { rows, extraTables, combinedNote: premTotal ? 'Combined labor cost incl. weekly OT + seventh-day premiums: see totals above + ' + '$' + (premTotal / 100).toFixed(2) : null };
     },
   },
   tips: {
@@ -2670,17 +2689,34 @@ app.get('/api/manager/overview', managerOnly(), (req, res) => {
    are wages: they feed labor cost (see GET /api/admin/clock/shifts and the
    labor_today_cents field on /api/manager/overview).
 
-   CA RULES (encoded as CONFIG DATA in CLOCK_CA_DEFAULTS + site_config
-   `clock_*` overrides — NOT hardcoded law; verify against current CA DIR
-   guidance before the pilot — we are not lawyers):
-     - 30-min unpaid meal, must START before end of 5th hour; second before
-       end of 10th hour. 1st waivable (mutual) if shift <= 6h; 2nd waivable if
-       shift <= 12h and the first was taken.
-     - 10-min paid rest per 4h or major fraction (>= 2h); none if shift < 3.5h.
-     - Missed break = 1 hour of pay at regular rate, per TYPE per day
-       (missed meal + missed rest stack; two missed meals do not).
-     - Overtime: 1.5x after 8h/day, 2x after 12h/day, 1.5x after 40h/week
-       (weekly extra computed at day level; daily OT is never double-counted).
+   CA RULES (validated 2026-09-26 against current DIR/DLSE guidance; encoded
+   as CONFIG DATA in CLOCK_CA_DEFAULTS + site_config `clock_*` overrides —
+   thresholds are NOT hardcoded law, and this engine is NOT legal advice:
+   consult employment counsel before relying on it for payroll. Sources:
+     - Meal periods: DIR FAQ_MealPeriods.html (Labor Code 512) —
+       https://www.dir.ca.gov/dlse/FAQ_MealPeriods.html
+       30-min unpaid duty-free meal before end of 5th hour (must START by the
+       5th-hour mark); second 30-min meal before end of 10th hour when the
+       shift exceeds 10h. 1st waivable by mutual consent if total shift <= 6h;
+       2nd waivable if total shift <= 12h AND the first meal was taken.
+     - Rest periods: DIR FAQ_RestPeriods.htm (IWC Wage Orders; Brinker
+       Restaurant Corp. v. Superior Court (2012) 53 Cal.4th 1004) —
+       http://www.dir.ca.gov/dlse/FAQ_RestPeriods.htm
+       10-min paid duty-free rest per 4h or MAJOR FRACTION (>2h, strictly
+       more than half); none if total shift < 3.5h. Brinker table:
+       3.5-6h -> 1, >6-10h -> 2, >10-14h -> 3, and so on.
+     - Premiums: Labor Code 226.7 + IWC Orders — 1 extra hour at the regular
+       rate per workday per violation TYPE (missed meal + missed rest stack to
+       2h/day; two missed meals in one day do NOT). Not hours worked for OT.
+     - Overtime: DIR IWC Article 17 + Labor Code 510 —
+       http://www.dir.ca.gov/IWC/IWCArticle17.pdf
+       1.5x for hours >8 up to and including 12 in a workday, for hours >40 in
+       a workweek, and for the first 8 hours on the 7th consecutive day of
+       work in a workweek; 2x for hours >12 in a workday and for hours >8 on
+       the 7th consecutive day. Daily OT is workday-based (site-tz date); the
+       day summary aggregates multi-shift days so split shifts are not
+       underpaid. Weekly OT never double-counts daily OT or 7th-day hours
+       (no pyramiding).
    Money: integer cents, server-side. Break timestamps are ISO strings.
    ============================================================================ */
 
@@ -2732,6 +2768,35 @@ function breaksFor(shiftId) {
   return db.prepare('SELECT * FROM clock_breaks WHERE shift_id = ? ORDER BY id').all(shiftId);
 }
 
+/** Rest periods required for h hours worked. Brinker/DLSE: 10 minutes net
+    per 4 hours or MAJOR FRACTION thereof, where a major fraction is MORE
+    than 2 hours (strictly greater — a 6.0h shift owes 1 rest, not 2; a
+    10.0h shift owes 2, not 3). None when the shift is under 3.5h. */
+function restsRequiredFor(h, cfg) {
+  if (h < cfg.rest_min_shift_h) return 0;
+  return Math.floor(h / cfg.rest_per_hours) + ((h % cfg.rest_per_hours) > cfg.rest_major_fraction_h ? 1 : 0);
+}
+
+/** A meal break counts as taken: at least 30 minutes, duty-free (employee
+    fully relieved of duty), and STARTED no later than the due mark
+    (Brinker: the meal must be provided before the end of the 5th/10th hour). */
+function mealBreakOk(b, cfg, dueAtIso) {
+  return !!(b.end_at && b.duty_free === 1 &&
+    minsBetween(b.start_at, b.end_at) >= cfg.meal_break_min &&
+    b.start_at <= dueAtIso);
+}
+
+/** YYYY-MM-DD shifted by n calendar days. */
+function shiftDateStr(dateStr, n) {
+  const dt = new Date(dateStr + 'T12:00:00Z');
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+
+/** Displayed everywhere the CA rule thresholds surface: configuration is
+    not legal advice. */
+const CLOCK_LEGAL_NOTICE = 'Break and overtime rules are configuration data reflecting California DIR/DLSE guidance as validated 2026-09-26 — not legal advice. Consult employment counsel before relying on them for payroll.';
+
 /**
  * Compliance + pay for one shift. `finalized` is true once clocked out —
  * premiums are only assessed on closed shifts (open shifts report due/overdue
@@ -2744,21 +2809,19 @@ function clockCompute(shift, breaks, cfg) {
   const finalized = !!shift.clock_out;
   const dueAt = (hours) => new Date(new Date(shift.clock_in).getTime() + hours * 3600 * 1000).toISOString();
 
-  const mealOk = (b) => b.end_at && minsBetween(b.start_at, b.end_at) >= cfg.meal_break_min && b.duty_free === 1;
   const meals = breaks.filter((b) => b.type === 'meal' && !b.waived);
   const waivers = breaks.filter((b) => b.type === 'meal' && b.waived);
 
   const need1 = h > cfg.meal_due_by_hour;
   const need2 = h > cfg.second_meal_due_by_hour;
-  const firstTaken = meals.some((b) => (b.meal_seq || 1) === 1 && mealOk(b) && b.start_at <= dueAt(cfg.meal_due_by_hour));
-  const secondTaken = meals.some((b) => b.meal_seq === 2 && mealOk(b) && b.start_at <= dueAt(cfg.second_meal_due_by_hour));
+  const firstTaken = meals.some((b) => (b.meal_seq || 1) === 1 && mealBreakOk(b, cfg, dueAt(cfg.meal_due_by_hour)));
+  const secondTaken = meals.some((b) => b.meal_seq === 2 && mealBreakOk(b, cfg, dueAt(cfg.second_meal_due_by_hour)));
   const waive1 = waivers.some((b) => (b.meal_seq || 1) === 1);
   const waive2 = waivers.some((b) => b.meal_seq === 2);
   const meal1ok = !need1 || firstTaken || (waive1 && h <= cfg.meal_waivable_max_shift_h);
   const meal2ok = !need2 || secondTaken || (waive2 && h <= cfg.second_meal_waivable_max_shift_h && firstTaken);
 
-  const restsRequired = h < cfg.rest_min_shift_h ? 0
-    : Math.floor(h / cfg.rest_per_hours) + ((h % cfg.rest_per_hours) >= cfg.rest_major_fraction_h ? 1 : 0);
+  const restsRequired = restsRequiredFor(h, cfg);
   const restsTaken = breaks.filter((b) => b.type === 'rest' && b.end_at && minsBetween(b.start_at, b.end_at) >= cfg.rest_break_min).length;
   const restsOk = restsTaken >= restsRequired;
 
@@ -2919,6 +2982,11 @@ app.post('/api/clock/break/waive', (req, res) => {
   }
   const r = db.prepare("INSERT INTO clock_breaks (uuid, shift_id, type, meal_seq, waived, created_at) VALUES (?, ?, 'meal', ?, 1, ?)")
     .run(crypto.randomUUID(), shift.id, seq, nowIso());
+  // Waivers are compliance-significant: the waiver row lives on the shift's
+  // break list AND an audit entry records who waived which meal and when.
+  // Statutory eligibility (<=6h / <=12h + first taken) is re-checked at
+  // clock-out; an ineligible waiver is ignored by clockCompute.
+  auditClock(req, 'meal_waived', shift.id, { meal_seq: seq, employee_name: shift.employee_name });
   res.status(201).json(breakView(db.prepare('SELECT * FROM clock_breaks WHERE id = ?').get(r.lastInsertRowid)));
 });
 
@@ -2932,13 +3000,15 @@ app.get('/api/clock/status', (req, res) => {
   const nowMs = Date.now();
   const inMs = new Date(shift.clock_in).getTime();
   const elapsedH = (nowMs - inMs) / 3600000;
-  const taken = (seq) => breaks.some((b) => b.type === 'meal' && !b.waived && (b.meal_seq || 1) === seq && b.end_at && b.duty_free === 1);
+  const dueAtIso = (dueHour) => new Date(inMs + dueHour * 3600 * 1000).toISOString();
+  const taken = (seq, dueHour) => breaks.some((b) => b.type === 'meal' && !b.waived && (b.meal_seq || 1) === seq &&
+    mealBreakOk(b, cfg, dueAtIso(dueHour)));
   const waived = (seq) => breaks.some((b) => b.type === 'meal' && b.waived && (b.meal_seq || 1) === seq);
   const inProg = (t) => breaks.some((b) => b.type === t && !b.end_at && !b.waived);
   const due = [];
   const mealState = (seq, dueHour) => {
-    const dueAt = new Date(inMs + dueHour * 3600 * 1000).toISOString();
-    if (taken(seq)) return { kind: 'meal', seq, state: 'taken', due_at: dueAt };
+    const dueAt = dueAtIso(dueHour);
+    if (taken(seq, dueHour)) return { kind: 'meal', seq, state: 'taken', due_at: dueAt };
     if (waived(seq)) return { kind: 'meal', seq, state: 'waived', due_at: dueAt };
     if (inProg('meal')) return { kind: 'meal', seq, state: 'in_progress', due_at: dueAt };
     if (nowMs > inMs + dueHour * 3600 * 1000) return { kind: 'meal', seq, state: 'overdue', due_at: dueAt };
@@ -2949,12 +3019,15 @@ app.get('/api/clock/status', (req, res) => {
   if (elapsedH > cfg.meal_due_by_hour + 3 || breaks.some((b) => b.type === 'meal' && (b.meal_seq || 1) === 2)) {
     due.push(mealState(2, cfg.second_meal_due_by_hour));
   }
-  const restsReq = elapsedH < cfg.rest_min_shift_h ? 0
-    : Math.floor(elapsedH / cfg.rest_per_hours) + ((elapsedH % cfg.rest_per_hours) >= cfg.rest_major_fraction_h ? 1 : 0);
+  const restsReq = restsRequiredFor(elapsedH, cfg);
   const restsTaken = breaks.filter((b) => b.type === 'rest' && b.end_at && minsBetween(b.start_at, b.end_at) >= cfg.rest_break_min).length;
+  // Next rest is ideally mid-block ("insofar as practicable in the middle of
+  // each work period"): middle of the next 4-hour block.
+  const restDueAt = restsTaken >= restsReq ? null
+    : new Date(inMs + (restsTaken * cfg.rest_per_hours + cfg.rest_per_hours / 2) * 3600 * 1000).toISOString();
   due.push({
     kind: 'rest', state: inProg('rest') ? 'in_progress' : (restsTaken >= restsReq ? 'ok' : (restsReq > 0 ? 'due' : 'upcoming')),
-    required: restsReq, taken: restsTaken, due_at: null,
+    required: restsReq, taken: restsTaken, due_at: restDueAt,
   });
   view.due = due;
   view.elapsed_h = r2(elapsedH);
@@ -2963,63 +3036,177 @@ app.get('/api/clock/status', (req, res) => {
 
 /* --------------------------- manager time clock ---------------------------- */
 
-/** Day labor rollup (closed shifts finalized; open shifts counted elapsed-so-far). */
+/** Per-user week payroll detail for one Sun-Sat workweek (site tz). Day-level
+    buckets (not per-shift) drive the weekly math because CA daily OT is
+    workday-based. Also detects 7th consecutive workdays: a workday preceded
+    by 6 consecutive calendar days with hours worked (the streak may start in
+    the prior workweek — consecutive days don't reset on Sunday; the 7th day
+    itself is always inside this workweek). On a 7th day the first 8 hours
+    earn 1.5x and hours beyond 8 earn 2x (IWC Article 17); the uplift is the
+    extra 0.5x on hours not already at 2x, valued at the day's
+    hours-weighted average 1x rate. */
+function weekPayroll(weekStart) {
+  const cfg = clockConfig();
+  const byUserDay = new Map();
+  for (const s of db.prepare('SELECT * FROM clock_shifts WHERE site_id = ?').all(SITE_ID)) {
+    if (weekStartSite(s.clock_in) !== weekStart) continue;
+    const d = tzDate(s.clock_in);
+    if (!byUserDay.has(s.user_id)) byUserDay.set(s.user_id, new Map());
+    const m = byUserDay.get(s.user_id);
+    if (!m.has(d)) m.set(d, []);
+    m.get(d).push(s);
+  }
+  const out = [];
+  for (const [uid, days] of byUserDay) {
+    const dayRows = [];
+    for (const [date, ss] of days) {
+      const H = ss.reduce((a, s) => a + minsBetween(s.clock_in, s.clock_out || nowIso()) / 60, 0);
+      let payAt1x = 0;
+      for (const s of ss) {
+        const v = shiftView(s, breaksFor(s.id), cfg);
+        payAt1x += v.pay.reg_cents + v.pay.ot15_cents / 1.5 + v.pay.ot2_cents / 2;
+      }
+      const regH = Math.min(H, cfg.ot_daily_h);
+      const ot15H = Math.min(Math.max(H - cfg.ot_daily_h, 0), cfg.ot_double_h - cfg.ot_daily_h);
+      const ot2H = Math.max(H - cfg.ot_double_h, 0);
+      dayRows.push({
+        date, hours: H, regH, ot15H, ot2H, payAt1x,
+        avgRate: H > 0.005 && payAt1x > 0 ? payAt1x / H : 0,
+        employee_name: ss[0].employee_name,
+      });
+    }
+    dayRows.sort((a, b) => (a.date < b.date ? -1 : 1));
+    // Dates with any hours worked (whole history — the 6-day lookback may
+    // reach into the prior workweek).
+    const worked = new Set();
+    for (const s of db.prepare('SELECT clock_in, clock_out FROM clock_shifts WHERE site_id = ? AND user_id = ?').all(SITE_ID, uid)) {
+      if (minsBetween(s.clock_in, s.clock_out || nowIso()) > 0) worked.add(tzDate(s.clock_in));
+    }
+    const seventhDays = [];
+    for (const dr of dayRows) {
+      if (dr.hours <= 0.005) continue;
+      let consec = true;
+      for (let i = 1; i <= 6; i++) {
+        if (!worked.has(shiftDateStr(dr.date, -i))) { consec = false; break; }
+      }
+      if (!consec) continue;
+      // First 8h -> 1.5x (uplift +0.5x on regH); beyond 8h -> 2x (uplift +0.5x
+      // on ot15H; ot2H already at 2x). Never pyramided with weekly OT.
+      const upliftCents = Math.round((dr.regH + dr.ot15H) * dr.avgRate * 0.5);
+      seventhDays.push({ ...dr, upliftCents });
+    }
+    const wh = dayRows.reduce((a, d) => a + d.hours, 0);
+    const dotH = dayRows.reduce((a, d) => a + d.ot15H + d.ot2H, 0);
+    const s7h = seventhDays.reduce((a, d) => a + d.hours, 0);
+    const payAt1xW = dayRows.reduce((a, d) => a + d.payAt1x, 0);
+    const avgW = wh > 0.005 && payAt1xW > 0 ? payAt1xW / wh : 0;
+    // Weekly OT: hours beyond 40/week at 1.5x. Hours already premium-paid
+    // (daily OT buckets, 7th-day hours) are excluded — no pyramiding.
+    const extra = Math.max(0, wh - cfg.ot_weekly_h - dotH - s7h);
+    const weeklyOtCents = (extra > 0.005 && avgW > 0) ? Math.round(extra * avgW * 0.5) : 0;
+    const seventhDayCents = seventhDays.reduce((a, d) => a + d.upliftCents, 0);
+    out.push({
+      user_id: uid, employee_name: dayRows.length ? dayRows[0].employee_name : '',
+      week_hours: wh, extra_ot15_hours: extra, extra_ot15_cents: weeklyOtCents,
+      seventhDays, seventhDayCents,
+    });
+  }
+  return out;
+}
+
+/** Day labor rollup (closed shifts finalized; open shifts counted elapsed-so-far).
+ *  The per-shift `views` are line items. The SUMMARY is computed per
+ *  (employee, workday) because CA daily OT thresholds (8h/12h) and break
+ *  premiums (one per violation type per workday, LC 226.7) are workday-based,
+ *  not shift-based — a split shift (e.g. 5h + 5h) owes daily OT on the hours
+ *  past 8, and two shifts missing the same break type in one workday owe one
+ *  premium hour, not two. Single-shift days use the shift's own numbers
+ *  exactly; multi-shift days land a transparent entry in `adjustments`. */
 function dayLabor(dateStr) {
   const cfg = clockConfig();
   const shifts = db.prepare('SELECT * FROM clock_shifts WHERE site_id = ?').all(SITE_ID)
     .filter((s) => tzDate(s.clock_in) === dateStr);
-  let reg = 0, ot = 0, premium = 0, total = 0;
   const views = [];
+  const viewById = new Map();
   for (const s of shifts) {
     const v = shiftView(s, breaksFor(s.id), cfg);
-    views.push(v);
-    reg += v.pay.reg_cents; ot += v.pay.ot15_cents + v.pay.ot2_cents;
-    premium += v.pay.premium_cents; total += v.pay.total_cents;
+    views.push(v); viewById.set(s.id, v);
   }
-  // Weekly OT: per user, hours beyond 40h/week (Sun-Sat, site tz) not already
-  // counted as daily OT convert to 1.5x.
-  const ws = weekStartSite(dateStr + 'T12:00:00Z');
-  const weekly = [];
+  let reg = 0, ot = 0, premium = 0;
+  const adjustments = [];
   const byUser = new Map();
-  for (const s of db.prepare('SELECT * FROM clock_shifts WHERE site_id = ?').all(SITE_ID)) {
-    if (weekStartSite(s.clock_in) !== ws) continue;
+  for (const s of shifts) {
     if (!byUser.has(s.user_id)) byUser.set(s.user_id, []);
     byUser.get(s.user_id).push(s);
   }
-  let weeklyOtCents = 0;
-  for (const [uid, wshifts] of byUser) {
-    let wh = 0, dot = 0, payAt1x = 0;
-    for (const s of wshifts) {
-      const v = shiftView(s, breaksFor(s.id), cfg);
-      wh += v.hours; dot += v.pay.ot15_hours + v.pay.ot2_hours;
-      // Hours already paid at 1x contribute to a weighted-average rate so the
-      // weekly premium lands on the right base when rates vary mid-week.
-      payAt1x += v.pay.reg_cents + v.pay.ot15_cents / 1.5 + v.pay.ot2_cents / 2;
+  for (const [uid, us] of byUser) {
+    if (us.length === 1) {
+      const v = viewById.get(us[0].id);
+      reg += v.pay.reg_cents; ot += v.pay.ot15_cents + v.pay.ot2_cents; premium += v.pay.premium_cents;
+      continue;
     }
-    const extra = Math.max(0, wh - cfg.ot_weekly_h - dot);
-    const avgRate = wh > 0.005 ? payAt1x / wh : 0;
-    if (extra > 0.005 && avgRate > 0) {
-      // These hours already earned 1x in the daily rollup; the weekly premium
-      // is the additional 0.5x that brings them to 1.5x total (never 2.5x).
-      const pay = Math.round(extra * avgRate * 0.5);
-      weeklyOtCents += pay;
-      const nm = wshifts[0].employee_name;
-      weekly.push({ user_id: uid, employee_name: nm, week_hours: r2(wh), extra_ot15_hours: r2(extra), extra_ot15_cents: pay });
+    const H = us.reduce((a, s) => a + minsBetween(s.clock_in, s.clock_out || nowIso()) / 60, 0);
+    let payAt1x = 0, sReg = 0, sOt = 0, sPrem = 0;
+    const types = new Set();
+    for (const s of us) {
+      const v = viewById.get(s.id);
+      payAt1x += v.pay.reg_cents + v.pay.ot15_cents / 1.5 + v.pay.ot2_cents / 2;
+      sReg += v.pay.reg_cents; sOt += v.pay.ot15_cents + v.pay.ot2_cents; sPrem += v.pay.premium_cents;
+      if (v.compliance.finalized) for (const t of v.compliance.violations) types.add(t);
+    }
+    const avg = H > 0.005 && payAt1x > 0 ? payAt1x / H : 0;
+    const regH = Math.min(H, cfg.ot_daily_h);
+    const ot15H = Math.min(Math.max(H - cfg.ot_daily_h, 0), cfg.ot_double_h - cfg.ot_daily_h);
+    const ot2H = Math.max(H - cfg.ot_double_h, 0);
+    const regC = Math.round(regH * avg), ot15C = Math.round(ot15H * avg * 1.5), ot2C = Math.round(ot2H * avg * 2);
+    const premC = Math.round(types.size * cfg.premium_hours * avg);
+    reg += regC; ot += ot15C + ot2C; premium += premC;
+    adjustments.push({
+      kind: 'workday_aggregation', user_id: uid, employee_name: us[0].employee_name, date: dateStr,
+      detail: us.length + ' shifts aggregated to one workday: daily OT rebucketed per workday (8h/12h), break premiums capped at one per violation type per workday',
+      reg_cents_delta: regC - sReg, ot_cents_delta: (ot15C + ot2C) - sOt, premium_cents_delta: premC - sPrem,
+    });
+  }
+  // Weekly OT + 7th-consecutive-day premiums: per user, Sun-Sat workweek.
+  const ws = weekStartSite(dateStr + 'T12:00:00Z');
+  const weekly = [], seventh = [];
+  let weeklyOtCents = 0, seventhDayCents = 0;
+  for (const w of weekPayroll(ws)) {
+    weeklyOtCents += w.extra_ot15_cents;
+    if (w.extra_ot15_hours > 0.005 && w.extra_ot15_cents > 0) {
+      weekly.push({ user_id: w.user_id, employee_name: w.employee_name, week_hours: r2(w.week_hours), extra_ot15_hours: r2(w.extra_ot15_hours), extra_ot15_cents: w.extra_ot15_cents });
+    }
+    for (const sd of w.seventhDays) {
+      // The uplift is earned on the 7th day itself: only the queried date's
+      // share lands in this day's total (weekly_ot_cents stays week-level,
+      // matching the pre-existing weekly-OT semantics).
+      if (sd.date === dateStr) seventhDayCents += sd.upliftCents;
+      seventh.push({
+        user_id: w.user_id, employee_name: w.employee_name, date: sd.date,
+        day_hours: r2(sd.hours), uplifted_hours: r2(sd.regH + sd.ot15H), uplift_cents: sd.upliftCents,
+      });
     }
   }
-  total += weeklyOtCents;
-  return { views, summary: { reg_cents: reg, ot_cents: ot, premium_cents: premium, weekly_ot_cents: weeklyOtCents, total_cents: total }, weekly };
+  const total = reg + ot + premium + weeklyOtCents + seventhDayCents;
+  return {
+    views, adjustments,
+    summary: {
+      reg_cents: reg, ot_cents: ot, premium_cents: premium,
+      weekly_ot_cents: weeklyOtCents, seventh_day_cents: seventhDayCents, total_cents: total,
+    },
+    weekly, seventh_day: seventh,
+  };
 }
 
 /** GET /api/admin/clock/shifts?date=YYYY-MM-DD — manager: all shifts, breaks,
     compliance, premiums, OT, and the day labor rollup. */
 app.get('/api/admin/clock/shifts', managerOnly(), (req, res) => {
   const date = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || '') ? req.query.date : todaySite();
-  const { views, summary, weekly } = dayLabor(date);
+  const { views, adjustments, summary, weekly, seventh_day } = dayLabor(date);
   const onShift = db.prepare("SELECT id, employee_name, role, clock_in FROM clock_shifts WHERE site_id = ? AND clock_out IS NULL").all(SITE_ID);
   const violations = views.filter((v) => v.compliance.violations.length)
     .map((v) => ({ shift_id: v.id, employee_name: v.employee_name, violations: v.compliance.violations, premium_cents: v.pay.premium_cents }));
-  res.json({ date, on_shift: onShift, shifts: views, labor: summary, weekly_ot: weekly, violations });
+  res.json({ date, on_shift: onShift, shifts: views, labor: summary, adjustments, weekly_ot: weekly, seventh_day, violations, legal_notice: CLOCK_LEGAL_NOTICE });
 });
 
 /** POST /api/admin/clock/adjust — manager correction (audit-logged).
@@ -3104,7 +3291,7 @@ app.get('/api/admin/clock/config', managerOnly(), (req, res) => {
   for (const r of db.prepare("SELECT key, value FROM site_config WHERE site_id = ? AND key LIKE 'clock_%'").all(SITE_ID)) {
     overrides[r.key.slice(6)] = r.value;
   }
-  res.json({ defaults: CLOCK_CA_DEFAULTS, overrides, effective: clockConfig() });
+  res.json({ defaults: CLOCK_CA_DEFAULTS, overrides, effective: clockConfig(), notice: CLOCK_LEGAL_NOTICE });
 });
 
 /** PUT /api/admin/clock/config {key, value} — tune a threshold (audit-logged). */

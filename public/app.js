@@ -3106,7 +3106,7 @@ async function renderTimeClock(app) {
       '<tbody>' + (rows || '<tr><td colspan="8" class="muted">No shifts this date.</td></tr>') + '</tbody></table></div></div>' +
       '<div class="card"><h3>Team hourly rates</h3>' + rates +
       '<p class="muted small mt">Rates are captured on each shift at clock-in, so past shifts keep their historical rate. Changes apply to future shifts.</p></div>' +
-      '<p class="muted small">Break rules use California defaults (30-min duty-free meal before the 5th hour, 10-min paid rest per 4h or major fraction, 1h premium per violation type per day, OT after 8/12h daily and 40h weekly). Thresholds are config data — verify against current CA DIR guidance before the pilot. We are not lawyers.</p>';
+      '<p class="muted small">Break rules use California defaults validated against DIR/DLSE guidance 2026-09-26 (30-min duty-free meal before the 5th hour, 10-min paid rest per 4h or major fraction &gt;2h, 1h premium per violation type per day, OT after 8/12h daily incl. 7th-day rules, 40h weekly). Thresholds are config data — not legal advice. Consult employment counsel before relying on them for payroll.</p>';
 
     body.querySelectorAll('[data-rate]').forEach((b) => {
       b.onclick = async () => {
