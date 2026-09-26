@@ -1383,7 +1383,11 @@ async function renderOrder(app, checkId) {
     /* Phase 3A (P0-4): one-tap send-now — staged items go straight to the
        KDS, skipping the HOLD step (Toast "Send" parity). */
     '<button class="btn btn-blue btn-big" id="btn-sendnow" title="Add staged items and fire them immediately">SEND NOW</button></div>' +
-    '</div></div></div>';
+    '</div></div></div>' +
+    /* Synchronized course-fire timing: shows optimal fire times for remaining
+       courses, computed from eat/prep estimates. Fire at the right moment so
+       courses land in sequence — no gap, no rush. */
+    '<div class="card" id="course-fire-card" style="margin-top:12px;display:none"><h3>🔥 Course timing</h3><div id="course-fire-body"><p class="muted small">Loading…</p></div></div>';
 
   const seatRow = $('#seat-row'), catTabs = $('#cat-tabs'), itemGrid = $('#item-grid'), cartBody = $('#cart-body');
 
@@ -1889,6 +1893,39 @@ async function renderOrder(app, checkId) {
   const vm0 = visibleMenu();
   activeCat = vm0.length ? vm0[0].id : null;
   drawCats(); drawItems();
+  /* Synchronized course-fire timing: load schedule, render fire buttons. */
+  const loadFireSchedule = async () => {
+    const card = $('#course-fire-card'), body = $('#course-fire-body');
+    if (!card || !body) return;
+    try {
+      const s = await api('/api/checks/' + encodeURIComponent(checkId) + '/fire-schedule');
+      if (!s.schedule.length && !s.fired.length) { card.style.display = 'none'; return; }
+      card.style.display = '';
+      const fmtTime = (iso) => { const d = new Date(iso); return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); };
+      const now = Date.now();
+      let html = '';
+      if (s.fired.length) html += '<p class="small muted">Fired: ' + s.fired.map((f) => esc(f.course) + ' ' + fmtTime(f.fired_at)).join(', ') + '</p>';
+      if (s.schedule.length) {
+        html += '<div class="fire-schedule">' + s.schedule.map((it) => {
+          const fireMs = new Date(it.fire_at).getTime();
+          const mins = Math.max(0, Math.round((fireMs - now) / 60000));
+          const due = fireMs <= now + 60000;
+          return '<div class="fire-row' + (due ? ' fire-due' : '') + '"><span><b>' + esc(it.course) + '</b> <span class="muted small">~' + fmtTime(it.fire_at) + (mins > 0 ? ' (' + mins + 'm)' : ' (now)') + '</span></span>' +
+            '<button class="btn btn-sm ' + (due ? 'btn-amber' : 'btn-ghost') + '" data-fire-course="' + esc(it.course) + '">' + (due ? '🔥 FIRE NOW' : 'Fire') + '</button></div>';
+        }).join('') + '</div>';
+      } else {
+        html += '<p class="small muted">All courses fired.</p>';
+      }
+      body.innerHTML = html;
+      body.querySelectorAll('[data-fire-course]').forEach((b) => b.onclick = async () => {
+        b.disabled = true;
+        try { await api('/api/checks/' + encodeURIComponent(checkId) + '/fire-course', 'POST', { course: b.dataset.fireCourse }); }
+        catch (e) { handleApiError(e); b.disabled = false; return; }
+        loadFireSchedule();
+      });
+    } catch (e) { /* offline: hide card */ card.style.display = 'none'; }
+  };
+  loadFireSchedule();
   if (!menu.length) {
     itemGrid.innerHTML = '<div class="empty"><p>No menu loaded.</p>' +
       '<button class="btn btn-primary" id="menu-retry">Retry loading menu</button></div>';

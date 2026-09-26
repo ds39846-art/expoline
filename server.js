@@ -413,6 +413,28 @@ require('./routes/parity_kds_pay').migrate(db);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_drawers_site_status ON cash_drawers(site_id, status)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_drawer_events ON cash_drawer_events(drawer_id, created_at)`);
 
+  /* Synchronized course-fire timing: per-course eat/prep estimates drive
+     optimal fire-time computation so courses land in sequence with no gap
+     and no rush. Configurable per site; fires are tracked per check. */
+  db.exec(`CREATE TABLE IF NOT EXISTS course_timing (
+    site_id TEXT,
+    course TEXT,
+    eat_minutes INTEGER DEFAULT 20,
+    prep_minutes INTEGER DEFAULT 12,
+    updated_at TEXT,
+    PRIMARY KEY (site_id, course)
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS course_fires (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT UNIQUE,
+    site_id TEXT,
+    check_id TEXT,
+    course TEXT,
+    fired_at TEXT,
+    fired_by TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_course_fires ON course_fires(site_id, check_id, fired_at)`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS schedule_shifts (
     id INTEGER PRIMARY KEY,
     uuid TEXT UNIQUE,
@@ -517,6 +539,16 @@ const SITE_ID = (() => {
 (() => {
   const cur = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'review_prompt'").get(SITE_ID);
   if (!cur) db.prepare("INSERT INTO site_config (site_id, key, value) VALUES (?, 'review_prompt', '1')").run(SITE_ID);
+})();
+
+/* Synchronized course-fire timing defaults: seed per-course eat/prep
+   estimates (tunable by manager via PUT /api/course-timing). */
+(() => {
+  const ct = db.prepare(`INSERT OR IGNORE INTO course_timing (site_id, course, eat_minutes, prep_minutes, updated_at) VALUES (?, ?, ?, ?, ?)`);
+  const now = new Date().toISOString();
+  [['drink', 10, 5], ['appetizer', 20, 12], ['entree', 30, 18], ['dessert', 15, 10]].forEach(([c, e, p]) => {
+    try { ct.run(SITE_ID, c, e, p, now); } catch (err) { /* seeded */ }
+  });
 })();
 
 function getConfig() {
@@ -1847,6 +1879,75 @@ app.get('/api/checks/:id', serverPlus(), (req, res) => {
   const check = checkResponse(req.params.id);
   if (!check) return res.status(404).json({ error: 'Check not found' });
   res.json(check);
+});
+
+/* Synchronized course-fire timing API.
+   GET /api/course-timing — per-course eat/prep minutes for this site.
+   PUT /api/course-timing — manager updates estimates.
+   GET /api/checks/:id/fire-schedule — optimal fire times for remaining courses,
+     computed from last fire + eat duration - next prep time.
+   POST /api/checks/:id/fire-course {course} — record a course fire. */
+app.get('/api/course-timing', serverPlus(), (req, res) => {
+  const rows = db.prepare(`SELECT course, eat_minutes, prep_minutes FROM course_timing WHERE site_id = ?`).all(SITE_ID);
+  res.json({ timing: rows });
+});
+app.put('/api/course-timing', serverPlus(), managerOnly(), (req, res) => {
+  const { timing } = req.body || {};
+  if (!Array.isArray(timing)) return res.status(400).json({ error: 'timing array required' });
+  const up = db.prepare(`INSERT INTO course_timing (site_id, course, eat_minutes, prep_minutes, updated_at)
+    VALUES (?, ?, ?, ?, ?) ON CONFLICT(site_id, course) DO UPDATE SET eat_minutes=excluded.eat_minutes, prep_minutes=excluded.prep_minutes, updated_at=excluded.updated_at`);
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    for (const t of timing) {
+      if (!t.course || typeof t.eat_minutes !== 'number' || typeof t.prep_minutes !== 'number') continue;
+      up.run(SITE_ID, String(t.course), Math.max(1, Math.min(180, Math.round(t.eat_minutes))), Math.max(1, Math.min(120, Math.round(t.prep_minutes))), now);
+    }
+  })();
+  res.json({ ok: true });
+});
+app.get('/api/checks/:id/fire-schedule', serverPlus(), (req, res) => {
+  const checkId = req.params.id;
+  const timing = Object.fromEntries(db.prepare(`SELECT course, eat_minutes, prep_minutes FROM course_timing WHERE site_id = ?`).all(SITE_ID).map((r) => [r.course, r]));
+  const fires = db.prepare(`SELECT course, fired_at FROM course_fires WHERE site_id = ? AND check_id = ? ORDER BY fired_at DESC`).all(SITE_ID, checkId);
+  const order = ['drink', 'appetizer', 'entree', 'dessert'];
+  /* Remaining = courses after the last fired course in sequence.
+     Courses before the fired one are done/skipped, not rescheduled. */
+  let startIdx = 0;
+  if (fires.length) {
+    const lastFired = fires[0].course;
+    const li = order.indexOf(lastFired);
+    if (li >= 0) startIdx = li + 1;
+  }
+  const remaining = order.slice(startIdx);
+  const schedule = [];
+  let anchor = fires.length ? new Date(fires[0].fired_at).getTime() : Date.now();
+  let anchorCourse = fires.length ? fires[0].course : null;
+  for (const course of remaining) {
+    const t = timing[course] || { eat_minutes: 20, prep_minutes: 12 };
+    let fireAt;
+    if (!fires.length && schedule.length === 0) {
+      fireAt = Date.now();
+    } else {
+      const anchorTiming = anchorCourse ? (timing[anchorCourse] || { eat_minutes: 20 }) : { eat_minutes: 20 };
+      fireAt = anchor + anchorTiming.eat_minutes * 60000 - t.prep_minutes * 60000;
+      fireAt = Math.max(fireAt, Date.now());
+    }
+    schedule.push({ course, fire_at: new Date(fireAt).toISOString(), eat_minutes: t.eat_minutes, prep_minutes: t.prep_minutes });
+    anchor = fireAt;
+    anchorCourse = course;
+  }
+  res.json({ check_id: checkId, fired: fires.map((f) => ({ course: f.course, fired_at: f.fired_at })), schedule });
+});
+app.post('/api/checks/:id/fire-course', serverPlus(), (req, res) => {
+  const checkId = req.params.id;
+  const { course } = req.body || {};
+  if (!course || !['drink', 'appetizer', 'entree', 'dessert'].includes(course)) return res.status(400).json({ error: 'valid course required' });
+  const id = crypto.randomUUID();
+  try {
+    db.prepare(`INSERT INTO course_fires (uuid, site_id, check_id, course, fired_at, fired_by) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(id, SITE_ID, checkId, course, new Date().toISOString(), req.user?.name || req.user?.pin || 'staff');
+  } catch (e) { return res.status(409).json({ error: 'course already fired' }); }
+  res.json({ ok: true, course, fired_at: new Date().toISOString() });
 });
 
 /* Phase 3A (P1): editable check metadata — guest count, tab name, coursing.

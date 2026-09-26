@@ -649,3 +649,8 @@ ul.clean li { padding: 6px 0; border-bottom: 1px solid var(--line); }
 .menu-search-row input[type="search"] { flex: 1; min-height: 44px; background: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; color: var(--text); font-size: 16px; }
 .menu-search-row input[type="search"]:focus { outline: none; border-color: var(--brass); }
 .item-card .cat-lbl { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+/* Course-fire timing */
+.fire-schedule { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.fire-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: var(--ink); border: 1px solid var(--line); border-radius: 8px; }
+.fire-row.fire-due { border-color: var(--amber); background: rgba(255, 180, 0, 0.08); }
