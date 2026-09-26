@@ -97,6 +97,7 @@ ALLOW = [
     ("routes/online.js", "parseFloat(r ? r.value", "tax config rate"),
     # display-only formatting ($ strings, never fed back into math)
     ("server.js", "(wotTotal / 100).toFixed(2)", "display"),
+    ("server.js", "(premTotal / 100).toFixed(2)", "display"),
     ("server.js", "(Number(v) / 100).toFixed(2)", "display"),
     ("server.js", "s = (Number(v) / 100).toFixed(2)", "display"),
     ("server.js", "Number(v).toFixed(2)", "display"),

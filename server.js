@@ -1815,11 +1815,21 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
 
   const totals = persistTotals(check.id);
   if (totals.balance <= 0) return res.status(400).json({ error: 'Check is already paid in full' });
-  // Phase 1B money audit: a payment may never exceed the remaining balance —
-  // over-application used to drive the balance negative and mark the check
-  // paid with money the house never collected.
+  // Phase 1B money audit: a payment may never be APPLIED for more than the
+  // remaining balance — over-application used to drive the balance negative
+  // and mark the check paid with money the house never collected.
+  // Cash is the exception: over-tender is a normal restaurant flow (hand $20
+  // for a $13.94 check), but only when the tendered amount is stated
+  // explicitly via tendered_cents — an unstated over-tender is ambiguous and
+  // is rejected. Cards can never exceed the balance.
+  let appliedCents = amount_cents;
+  let tenderedCents = tendered_cents ?? null;
   if (amount_cents > totals.balance) {
-    return res.status(400).json({ error: `amount_cents (${amount_cents}¢) exceeds the remaining balance (${totals.balance}¢)` });
+    if (method === 'cash' && tendered_cents != null) {
+      appliedCents = totals.balance;
+    } else {
+      return res.status(400).json({ error: `amount_cents (${amount_cents}¢) exceeds the remaining balance (${totals.balance}¢)` });
+    }
   }
 
   // Reserve AFTER validation, BEFORE the mutation.
@@ -1842,7 +1852,7 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
 
     const r = db.prepare(
       "INSERT INTO payments (uuid, check_id, site_id, method, amount_cents, tip_cents, tendered_cents, brand, last4, auth_code, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)"
-    ).run(crypto.randomUUID(), check.id, SITE_ID, method, amount_cents, tip_cents, tendered_cents ?? null,
+    ).run(crypto.randomUUID(), check.id, SITE_ID, method, appliedCents, tip_cents, tenderedCents,
       brand || (method === 'card_demo' ? 'DEMO' : null), last4 || null, authCode, nowIso());
     const payment = paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(r.lastInsertRowid));
 
@@ -1853,7 +1863,7 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
 
     broadcastCheckUpdated(check.id);
     const out = { payment, check: checkResponse(check.id) };
-    if (method === 'cash' && tendered_cents != null) out.change_cents = tendered_cents - amount_cents;
+    if (method === 'cash' && tenderedCents != null) out.change_cents = tenderedCents - appliedCents;
     if (demo) out.demo = demo;
     if (idem) idemStore('payments', idem, 201, out);
     return res.status(201).json(out);

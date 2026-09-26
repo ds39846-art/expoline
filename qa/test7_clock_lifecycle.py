@@ -135,8 +135,9 @@ s, b = call('POST', f'/api/checks/{cid}/items', st, {'menu_item_id': item['id'],
 check('add item', s in (200, 201), (s, b))
 s, b = call('POST', f'/api/checks/{cid}/send', st, {})
 check('send to kitchen', s in (200, 201), (s, b))
-s, b = call('POST', f'/api/checks/{cid}/payments', st, {'method': 'cash', 'amount_cents': 100000})
+s, b = call('POST', f'/api/checks/{cid}/payments', st, {'method': 'cash', 'amount_cents': 100000, 'tendered_cents': 100000})
 check('cash pay', s in (200, 201), (s, b))
+check('cash over-tender gives change', isinstance(b, dict) and b.get('change_cents', 0) > 0, (s, b))
 s, b = call('POST', f'/api/checks/{cid}/close', st, {})
 check('close check', s in (200, 201), (s, b))
 
