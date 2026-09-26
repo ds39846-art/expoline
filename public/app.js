@@ -17,6 +17,16 @@ const fmtClock = (ts) => new Date(ts).toLocaleTimeString([], { hour: 'numeric', 
 const fmtDate = (ts) => new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
 const fmtDateTime = (ts) => new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 const todayISO = () => { const d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); };
+// Site-timezone business date (America/Los_Angeles for the Bali Hai pilot),
+// so date pickers default to the restaurant's sales date, not the device date.
+async function siteDate() {
+  try {
+    const c = await getConfig();
+    const d = c.site_date;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(d || '')) return d;
+  } catch (e) {}
+  return todayISO();
+}
 const uid = (p) => (p || 'id') + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
@@ -24,7 +34,7 @@ const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = se
 const state = {
   user: null,          // {id,name,role}
   route: null,
-  kds: { station: 'Expediter', tickets: [], ws: null, wsUp: false, recall: false, retryMs: 1000 },
+  kds: { station: 'expediter', tickets: [], ws: null, wsUp: false, recall: false, retryMs: 1000 },
   timers: { kds: null },
 };
 
@@ -787,7 +797,8 @@ async function renderOrder(app, checkId) {
         const pill = kind === 'staged' ? '<span class="pill staged">staged</span>'
           : ref.state === 'held' ? '<span class="pill held">held</span>' : '<span class="pill sent">sent</span>';
         const mods = (ref.modifiers || []).map((m) => esc(m.name) + (m.price_delta_cents ? ' (+' + fmt(m.price_delta_cents) + ')' : '')).join(', ');
-        const lineTotal = (ref.price_cents || 0) * (ref.qty || 1) + (ref.modifiers || []).reduce((a, m) => a + (m.price_delta_cents || 0) * (ref.qty || 1), 0);
+        const unitCents = (ref.unit_price_cents != null ? ref.unit_price_cents : ref.price_cents) || 0;
+        const lineTotal = unitCents * (ref.qty || 1) + (ref.modifiers || []).reduce((a, m) => a + (m.price_delta_cents || 0) * (ref.qty || 1), 0);
         const voidBtn = (kind === 'staged' || ref.state === 'held')
           ? '<button class="icon-btn" data-void="' + esc(String(ref.temp_id || ref.id)) + '" data-kind="' + kind + '" aria-label="Void item" title="Void">✕</button>' : '';
         return '<div class="cart-line"><div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
@@ -895,7 +906,16 @@ async function renderOrder(app, checkId) {
    Live tickets via WS /ws?token=, subscribe {action:'subscribe',
    channel:'kds', station}. Timers tick every second.
    ============================================================ */
-const KDS_STATIONS = ['Expediter', 'Garde Manger', 'Dessert', 'Bar'];
+const KDS_STATIONS = [
+  { label: 'Expediter', slug: 'expediter' },
+  { label: 'Garde Manger', slug: 'garde_manger' },
+  { label: 'Dessert', slug: 'dessert' },
+  { label: 'Bar', slug: 'bar' },
+];
+function kdsLabel(slug) {
+  const s = KDS_STATIONS.find((x) => x.slug === slug);
+  return s ? s.label : slug;
+}
 
 function closeKdsSocket() {
   if (state.kds.ws) { try { state.kds.ws.close(); } catch (e) {} state.kds.ws = null; }
@@ -919,7 +939,7 @@ async function renderKds(app) {
     '<span class="kds-ws" id="kds-ws"><span class="dot-dead"></span>connecting…</span> ' +
     '<button class="btn btn-ghost" id="kds-recall-btn">Recall</button></div>' +
     '<div class="tabs" id="kds-tabs">' +
-    KDS_STATIONS.map((s) => '<button class="tab' + (s === state.kds.station ? ' active' : '') + '" data-st="' + esc(s) + '">' + esc(s) + '</button>').join('') +
+    KDS_STATIONS.map((s) => '<button class="tab' + (s.slug === state.kds.station ? ' active' : '') + '" data-st="' + esc(s.slug) + '">' + esc(s.label) + '</button>').join('') +
     '</div><div class="kds-grid" id="kds-grid"></div>';
 
   const grid = $('#kds-grid'), wsBadge = $('#kds-ws'), recallBtn = $('#kds-recall-btn');
@@ -971,7 +991,7 @@ async function renderKds(app) {
   function drawTickets() {
     const list = state.kds.tickets;
     if (!list.length) {
-      grid.innerHTML = '<div class="kds-empty">' + (state.kds.recall ? 'No recently fulfilled tickets.' : 'All clear — no open tickets for ' + esc(state.kds.station) + '.') + '</div>';
+      grid.innerHTML = '<div class="kds-empty">' + (state.kds.recall ? 'No recently fulfilled tickets.' : 'All clear — no open tickets for ' + esc(kdsLabel(state.kds.station)) + '.') + '</div>';
       return;
     }
     grid.innerHTML = list.map(ticketCard).join('');
@@ -1206,7 +1226,7 @@ async function renderPay(app, checkId) {
     if (!items.length) { toast('No items to move'); return; }
     const bd = openModal('<h2>Move items</h2><p class="muted">Select items to move onto a brand-new check.</p>' +
       '<div class="checkbox-list">' + items.map((i) =>
-        '<label><input type="checkbox" data-mv="' + esc(String(i.id)) + '"><span style="flex:1">' + (i.qty > 1 ? i.qty + '× ' : '') + esc(i.name) + ' <span class="muted small">Seat ' + (i.seat || '—') + '</span></span><span>' + fmt((i.price_cents || 0) * (i.qty || 1)) + '</span></label>').join('') +
+        '<label><input type="checkbox" data-mv="' + esc(String(i.id)) + '"><span style="flex:1">' + (i.qty > 1 ? i.qty + '× ' : '') + esc(i.name) + ' <span class="muted small">Seat ' + (i.seat || '—') + '</span></span><span>' + fmt(((i.unit_price_cents != null ? i.unit_price_cents : i.price_cents) || 0) * (i.qty || 1)) + '</span></label>').join('') +
       '</div><div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Move to new check</button></div>');
     $('[data-x="c"]', bd).onclick = closeModal;
     $('[data-x="go"]', bd).onclick = async () => {
@@ -1341,9 +1361,10 @@ async function renderManager(app) {
   if (!mgrGuard(app)) return;
   let o = {};
   try { o = await api('/api/manager/overview'); } catch (e) { if (handleApiError(e) === 'bounced') return; }
-  const sales = o.today_sales_cents ?? o.sales_cents ?? o.net_sales_cents ?? 0;
-  const open = o.open_checks ?? o.open_check_count ?? 0;
-  const covers = o.covers ?? o.today_covers ?? 0;
+  const t = o.today || {};
+  const sales = t.sales_cents ?? o.today_sales_cents ?? o.sales_cents ?? o.net_sales_cents ?? 0;
+  const open = t.open_checks ?? o.open_checks ?? o.open_check_count ?? 0;
+  const covers = t.covers ?? o.covers ?? o.today_covers ?? 0;
   app.innerHTML = '<div class="view-head"><h1>Manager</h1></div>' + mgrNav('overview') +
     '<div class="stat-grid">' +
     '<div class="stat"><div class="k">Today sales</div><div class="v">' + fmt(sales) + '</div></div>' +
@@ -1357,7 +1378,7 @@ async function renderManager(app) {
    Sales date and payout date are distinct columns. */
 async function renderFinance(app) {
   if (!mgrGuard(app)) return;
-  const date = todayISO();
+  const date = await siteDate();
   app.innerHTML = '<div class="view-head"><h1>Finance &amp; Payouts</h1><span class="spacer"></span>' +
     '<input type="date" id="fin-date" value="' + date + '" aria-label="Sales date" style="min-height:44px;background:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--text)"></div>' +
     mgrNav('finance') + '<div id="fin-body"></div>';
@@ -1378,16 +1399,19 @@ function financeHtml(r, date) {
   const p = r.payout || r;
   const cardVol = p.card_volume_cents ?? p.cardVolume ?? 0;
   const refunds = p.refunds_cents ?? p.refund_cents ?? 0;
-  const fees = p.fees || p.stripe_fees || [];
   const tips = p.tips_cents ?? 0;
-  const feeTotal = fees.reduce((a, f) => a + (f.amount_cents ?? f.cents ?? 0), 0);
+  const cards = p.card_payments || [];
+  // Backend contract: stripe_fees_cents (total) + per-payment fee_cents in card_payments[].
+  const feeTotal = p.stripe_fees_cents ?? p.stripe_fee_cents ??
+    cards.reduce((a, c) => a + (c.fee_cents || 0), 0);
   const expected = p.expected_payout_cents ?? (cardVol - refunds - feeTotal);
   const salesDate = p.sales_date || p.date || date;
   const payoutDate = p.payout_date || p.estimated_payout_date || '—';
-  const feeRows = fees.length
-    ? fees.map((f) => '<tr><td>− ' + esc(f.name || f.label || 'Fee') +
-        (f.detail ? '<span class="lbl-note">' + esc(f.detail) + '</span>' : '') +
-        '</td><td class="num neg">−' + fmt(f.amount_cents ?? f.cents ?? 0) + '</td></tr>').join('')
+  const feeRows = cards.length
+    ? cards.map((c) => '<tr><td>− Stripe fee <span class="lbl-note">DEMO ' + esc(String(c.brand || 'Card')) +
+        (c.last4 ? ' ••••' + esc(String(c.last4)) : '') + ' · ' + fmt(c.amount_cents || 0) +
+        (c.status && c.status !== 'completed' ? ' · ' + esc(String(c.status)) : '') + '</span></td>' +
+        '<td class="num neg">−' + fmt(c.fee_cents || 0) + '</td></tr>').join('')
     : '<tr><td>− Stripe fees <span class="lbl-note">no fee breakdown returned by API</span></td><td class="num neg">−' + fmt(feeTotal) + '</td></tr>';
   return '<div class="date-cols"><div class="date-col"><div class="k">Sales date</div><div class="v">' + esc(String(salesDate)) + '</div></div>' +
     '<div class="date-col"><div class="k">Payout date</div><div class="v">' + esc(String(payoutDate)) + '</div></div></div>' +
@@ -1404,7 +1428,7 @@ function financeHtml(r, date) {
 
 async function renderShift(app) {
   if (!mgrGuard(app)) return;
-  const date = todayISO();
+  const date = await siteDate();
   app.innerHTML = '<div class="view-head"><h1>Shift report</h1><span class="spacer"></span>' +
     '<input type="date" id="sh-date" value="' + date + '" aria-label="Shift date" style="min-height:44px;background:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--text)"></div>' +
     mgrNav('shift') + '<div id="sh-body"></div>';
@@ -1426,8 +1450,15 @@ function shiftHtml(r, date) {
   const closed = s.checks_closed ?? s.closed_checks ?? 0;
   const sub = s.subtotal_cents ?? 0;
   const tips = s.tips_cents ?? 0;
-  const brands = s.card_brands || s.card_brand_breakdown || [];
-  const cash = s.cash || {};
+  // Backend contract: card_brand_breakdown is {Brand: cents}, cash_sales_cents is a number.
+  const bb = s.card_brand_breakdown || s.card_brands || {};
+  const brandNames = Array.isArray(bb) ? [] : Object.keys(bb);
+  const brandRows = brandNames.length
+    ? brandNames.map((b) => '<tr><td>' + esc(b) + '</td><td class="num">' + fmt(bb[b] || 0) + '</td></tr>').join('')
+    : (Array.isArray(bb) && bb.length ? bb.map((b) =>
+      '<tr><td>' + esc(b.brand || b.name || 'Card') + ' <span class="muted small">×' + (b.count ?? b.transactions ?? '') + '</span></td><td class="num">' + fmt(b.cents ?? b.amount_cents ?? 0) + '</td></tr>').join('') : '');
+  const cashSales = s.cash_sales_cents ?? s.cash?.expected_cents ?? 0;
+  const cardTipsOwed = s.cash_owed_to_server_cents ?? 0;
   return '<p class="muted small">Shift date: <b>' + esc(String(s.date || date)) + '</b>' + (s.server_name ? ' · Server: <b>' + esc(s.server_name) + '</b>' : '') + '</p>' +
     '<div class="report-grid">' +
     '<div class="card"><h2>Totals</h2><table class="fin-table">' +
@@ -1435,13 +1466,11 @@ function shiftHtml(r, date) {
     '<tr><td>Subtotal</td><td class="num">' + fmt(sub) + '</td></tr>' +
     '<tr><td>Tips</td><td class="num">' + fmt(tips) + '</td></tr></table></div>' +
     '<div class="card"><h2>Card brand breakdown</h2>' +
-    (brands.length ? '<table class="fin-table">' + brands.map((b) =>
-      '<tr><td>' + esc(b.brand || b.name || 'Card') + ' <span class="muted small">×' + (b.count ?? b.transactions ?? '') + '</span></td><td class="num">' + fmt(b.cents ?? b.amount_cents ?? 0) + '</td></tr>').join('') + '</table>'
+    (brandRows ? '<table class="fin-table">' + brandRows + '</table>'
       : '<p class="muted">No card breakdown returned.</p>') + '</div>' +
     '<div class="card"><h2>Cash reconciliation</h2><table class="fin-table">' +
-    '<tr><td>Expected cash</td><td class="num">' + fmt(cash.expected_cents ?? 0) + '</td></tr>' +
-    '<tr><td>Counted cash</td><td class="num">' + fmt(cash.counted_cents ?? 0) + '</td></tr>' +
-    '<tr class="result"><td>= Variance</td><td class="num">' + fmt((cash.counted_cents ?? 0) - (cash.expected_cents ?? 0)) + '</td></tr>' +
+    '<tr><td>Cash sales</td><td class="num">' + fmt(cashSales) + '</td></tr>' +
+    '<tr><td>Card tips owed to server <span class="lbl-note">paid out at checkout</span></td><td class="num">' + fmt(cardTipsOwed) + '</td></tr>' +
     '</table></div></div>';
 }
 

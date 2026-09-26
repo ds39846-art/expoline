@@ -6,7 +6,7 @@
  *
  * MONEY MATH (server-side single source of truth, ALL integer cents,
  * recomputed + persisted on every mutation via persistTotals()):
- *   billable items : state IN ('held','sent')          (cancelled excluded)
+ *   billable items : state IN ('held','sent','fulfilled')  (void/cancelled excluded)
  *   line total     : qty * unit_price_cents + qty * Σ modifier price_delta_cents
  *   subtotal       : Σ lines
  *   surcharge      : round(subtotal * surcharge_pct)    (5% on every check)
@@ -85,6 +85,8 @@ function getConfig() {
     stripe_demo_rate: parseFloat(m.stripe_demo_rate ?? '0.026'),
     stripe_demo_fixed_cents: parseInt(m.stripe_demo_fixed_cents ?? '15', 10),
     payout_lag_days: parseInt(m.payout_lag_days ?? '2', 10),
+    site_tz: SITE_TZ,
+    site_date: todaySite(),
   };
 }
 
@@ -135,10 +137,15 @@ function lineTotal(it) {
 }
 
 /** Recompute every money field for a check; returns totals {subtotal, surcharge, service_charge, tax, total, paid, balance}. */
+// Billable = every non-void line. Held + sent + fulfilled are all owed;
+// only 'void'/'cancelled' are excluded. (KDS send uses state='held' only.)
+const BILLABLE_STATES = "('held','sent','fulfilled')";
+
 function calcTotals(checkId) {
   const cfg = getConfig();
+  // Billable = every non-void line: held, sent, AND fulfilled (served food is still owed).
   const items = db.prepare(
-    "SELECT * FROM check_items WHERE check_id = ? AND state IN ('held','sent')"
+    `SELECT * FROM check_items WHERE check_id = ? AND state IN ${BILLABLE_STATES}`
   ).all(checkId);
   const subtotal = items.reduce((s, it) => s + lineTotal(it), 0);
   const surcharge = Math.round(subtotal * cfg.surcharge_pct);
@@ -169,7 +176,7 @@ function persistTotals(checkId) {
 
 function billableItems(checkId) {
   return db.prepare(
-    "SELECT ci.*, mi.name, mi.station AS menu_station FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? AND ci.state IN ('held','sent') ORDER BY ci.added_at, ci.id"
+    "SELECT ci.*, mi.name, mi.station AS menu_station FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.check_id = ? AND ci.state IN " + BILLABLE_STATES + " ORDER BY ci.added_at, ci.id"
   ).all(checkId);
 }
 
@@ -228,6 +235,14 @@ function checkResponse(checkId) {
       balance: t.balance,
     },
   };
+}
+
+// Canonical KDS station slugs; accepts display names too ("Expediter", "Garde Manger", ...)
+const KDS_STATION_SLUGS = ['bar', 'expediter', 'garde_manger', 'dessert'];
+function canonStation(s) {
+  if (typeof s !== 'string') return null;
+  const slug = s.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return KDS_STATION_SLUGS.includes(slug) ? slug : null;
 }
 
 function ticketView(row) {
@@ -410,7 +425,7 @@ app.get('/api/checks/open', serverPlus(), (req, res) => {
   const rows = db.prepare(
     `SELECT c.id, c.table_id, c.server_id, c.tab_name, c.guest_count, c.status, c.opened_at,
             t.label AS table_label, u.name AS server_name,
-            (SELECT COUNT(*) FROM check_items ci WHERE ci.check_id = c.id AND ci.state IN ('held','sent')) AS item_count
+            (SELECT COUNT(*) FROM check_items ci WHERE ci.check_id = c.id AND ci.state IN ${BILLABLE_STATES}) AS item_count
      FROM checks c
      LEFT JOIN tables t ON t.id = c.table_id
      LEFT JOIN users u ON u.id = c.server_id
@@ -629,7 +644,7 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
     }
     // If the source check is now empty (no billable items, no payments), close it.
     const remaining = db.prepare(
-      "SELECT COUNT(*) AS n FROM check_items WHERE check_id = ? AND state IN ('held','sent')"
+      "SELECT COUNT(*) AS n FROM check_items WHERE check_id = ? AND state IN " + BILLABLE_STATES
     ).get(check.id).n;
     if (remaining === 0) {
       db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(now, check.id);
@@ -714,9 +729,9 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
 
   const totals = persistTotals(payment.check_id);
   const check = db.prepare('SELECT status FROM checks WHERE id = ?').get(payment.check_id);
-  if (check && check.status === 'paid' && totals.balance > 0) {
+  if (check && (check.status === 'paid' || check.status === 'closed') && totals.balance > 0) {
     // Refund pushed the check back to a positive balance — reopen it.
-    db.prepare("UPDATE checks SET status = 'open' WHERE id = ?").run(payment.check_id);
+    db.prepare("UPDATE checks SET status = 'open', closed_at = NULL WHERE id = ?").run(payment.check_id);
   }
   broadcastCheckUpdated(payment.check_id);
   res.json({ payment: paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(payment.id)) });
@@ -750,11 +765,12 @@ app.get('/api/kds/tickets', kitchenPlus(), (req, res) => {
   const params = [SITE_ID];
   if (statusClause === 't.status = ?') params.push(status);
   if (station) {
-    if (!['bar', 'expediter', 'garde_manger', 'dessert'].includes(station)) {
+    const slug = canonStation(station);
+    if (!slug) {
       return res.status(400).json({ error: 'Unknown station' });
     }
     sql += ' AND t.station = ?';
-    params.push(station);
+    params.push(slug);
   }
   sql += ' ORDER BY t.created_at, t.id';
   res.json(db.prepare(sql).all(...params).map(ticketView));
@@ -973,12 +989,13 @@ wss.on('connection', (ws) => {
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg && msg.action === 'subscribe' && typeof msg.channel === 'string') {
       if (msg.channel === 'kds') {
-        if (!['bar', 'expediter', 'garde_manger', 'dessert'].includes(msg.station)) {
+        const slug = canonStation(msg.station);
+        if (!slug) {
           ws.send(JSON.stringify({ type: 'error', error: 'Unknown KDS station' }));
           return;
         }
-        ws.subs.push({ channel: 'kds', station: msg.station });
-        ws.send(JSON.stringify({ type: 'subscribed', channel: 'kds', station: msg.station }));
+        ws.subs.push({ channel: 'kds', station: slug });
+        ws.send(JSON.stringify({ type: 'subscribed', channel: 'kds', station: slug }));
       } else if (msg.channel === 'checks') {
         ws.subs.push({ channel: 'checks' });
         ws.send(JSON.stringify({ type: 'subscribed', channel: 'checks' }));
