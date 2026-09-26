@@ -314,6 +314,115 @@ require('./routes/online').migrate(db);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_waitlist_site_status ON waitlist(site_id, status, created_at)`);
 })();
 
+/* Phase 3C — competitor parity: back office. Runs on every boot; guarded via
+   CREATE TABLE IF NOT EXISTS / PRAGMA column checks. All money stays in
+   integer cents; quantities (inventory) are REALs. */
+(() => {
+  // Waitlist pre-ordering: preorder_json on waitlist (array of
+  // {menu_item_id, qty, seat, modifiers}).
+  const wcols = new Set(db.prepare('PRAGMA table_info(waitlist)').all().map((c) => c.name));
+  if (!wcols.has('preorder_json')) db.exec("ALTER TABLE waitlist ADD COLUMN preorder_json TEXT DEFAULT '[]'");
+
+  db.exec(`CREATE TABLE IF NOT EXISTS cash_drawers (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT UNIQUE,
+    site_id TEXT,
+    opened_at TEXT,
+    closed_at TEXT,
+    opened_by TEXT,
+    opening_float_cents INTEGER DEFAULT 0,
+    status TEXT CHECK(status IN ('open','closed')) DEFAULT 'open',
+    expected_cents INTEGER,
+    counted_cents INTEGER,
+    variance_cents INTEGER,
+    counted_by TEXT,
+    notes TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS cash_drawer_events (
+    id INTEGER PRIMARY KEY,
+    drawer_id INTEGER,
+    site_id TEXT,
+    kind TEXT CHECK(kind IN ('open','paid_in','paid_out','no_sale','note','close')),
+    amount_cents INTEGER DEFAULT 0,
+    note TEXT,
+    actor TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_drawers_site_status ON cash_drawers(site_id, status)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_drawer_events ON cash_drawer_events(drawer_id, created_at)`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS schedule_shifts (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT UNIQUE,
+    site_id TEXT,
+    user_id INTEGER,
+    employee_name TEXT,
+    role TEXT,
+    work_date TEXT,
+    start_min INTEGER,
+    end_min INTEGER,
+    rate_cents INTEGER,
+    created_by TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sched_site_date ON schedule_shifts(site_id, work_date)`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS ingredients (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    name TEXT,
+    unit TEXT DEFAULT 'ea',
+    on_hand REAL DEFAULT 0,
+    par REAL DEFAULT 0,
+    cost_per_unit_cents INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS recipes (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    menu_item_id INTEGER,
+    ingredient_id INTEGER,
+    qty REAL DEFAULT 0,
+    UNIQUE(site_id, menu_item_id, ingredient_id)
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS inventory_adjustments (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    ingredient_id INTEGER,
+    delta REAL,
+    reason TEXT,
+    actor TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_recipes_item ON recipes(site_id, menu_item_id)`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS staff_notes (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT UNIQUE,
+    site_id TEXT,
+    title TEXT,
+    body TEXT,
+    priority TEXT DEFAULT 'normal' CHECK(priority IN ('low','normal','high')),
+    active_from TEXT,
+    active_to TEXT,
+    created_by TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_notes_site ON staff_notes(site_id, active_from, active_to)`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS guest_reviews (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    check_id INTEGER,
+    rating INTEGER CHECK(rating BETWEEN 1 AND 5),
+    comment TEXT,
+    marketing_opt_in INTEGER DEFAULT 0,
+    created_at TEXT,
+    UNIQUE(site_id, check_id)
+  )`);
+})();
+
 /* Idempotency keys (Phase 1B money audit). Guards payment / refund /
    gift-card / loyalty-redeem endpoints against double-tap and double-POST:
    a retried request carrying the same Idempotency-Key (header or
@@ -341,6 +450,13 @@ const SITE_ID = (() => {
   return r.id;
 })();
 
+/* Phase 3C defaults: post-payment review nudge is ON unless the manager
+   turns it off (PUT /api/admin/settings). Set once per site. */
+(() => {
+  const cur = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'review_prompt'").get(SITE_ID);
+  if (!cur) db.prepare("INSERT INTO site_config (site_id, key, value) VALUES (?, 'review_prompt', '1')").run(SITE_ID);
+})();
+
 function getConfig() {
   const rows = db.prepare('SELECT key, value FROM site_config WHERE site_id = ?').all(SITE_ID);
   const m = Object.fromEntries(rows.map((r) => [r.key, r.value]));
@@ -352,6 +468,7 @@ function getConfig() {
     stripe_demo_rate: parseFloat(m.stripe_demo_rate ?? '0.026'),
     stripe_demo_fixed_cents: parseInt(m.stripe_demo_fixed_cents ?? '15', 10),
     payout_lag_days: parseInt(m.payout_lag_days ?? '2', 10),
+    drawer_close_role: m.drawer_close_role === 'server' ? 'server' : 'manager',
     site_tz: SITE_TZ,
     site_date: todaySite(),
     site_slug: SITE_SLUG, // LAN BRAIN (phase 2): op envelopes carry this
@@ -1742,6 +1859,7 @@ app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
         modifiers: parseJson(it.modifiers_json, []),
       });
     }
+    depleteInventoryForItems(held); // phase 3C: ingredient-level depletion from real sales
   });
 
   const tickets = [];
@@ -3529,6 +3647,31 @@ app.put('/api/admin/service-charge/config', managerOnly(), (req, res) => {
   res.json({ key, value: next, current: svcChargeCurrent() });
 });
 
+/** GET /api/admin/drawer/config — who may perform a blind drawer close.
+ *  Manager-only by default (Daniel's policy); a manager can relax it to
+ *  'server' (servers and managers) with a live manager PIN. */
+app.get('/api/admin/drawer/config', managerOnly(), (req, res) => {
+  res.json({ drawer_close_role: getConfig().drawer_close_role });
+});
+
+/** PUT /api/admin/drawer/config {value, manager_pin} — value is
+ *  'manager' or 'server'. Requires a manager session AND a live manager PIN
+ *  (point-of-action approval, like comps). Audit-logged with before/after. */
+app.put('/api/admin/drawer/config', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  if (!['manager', 'server'].includes(b.value)) {
+    return res.status(400).json({ error: "value must be 'manager' or 'server'" });
+  }
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) return res.status(403).json({ error: 'Manager PIN required to change the drawer close policy' });
+  const before = { drawer_close_role: getConfig().drawer_close_role };
+  db.prepare('INSERT INTO site_config (site_id, key, value) VALUES (?, ?, ?) ON CONFLICT(site_id, key) DO UPDATE SET value = excluded.value')
+    .run(SITE_ID, 'drawer_close_role', b.value);
+  const after = { drawer_close_role: getConfig().drawer_close_role };
+  auditApproval(req, 'drawer_config_change', {}, { before, after, approver: mgr.name });
+  res.json({ drawer_close_role: after.drawer_close_role });
+});
+
 /* ------------------------- employee records (phase 2) ------------------------ */
 /** Manager-only staff management. employees is the canonical record; the
  *  users row stays in sync so PIN login keeps working. DELETE is a soft
@@ -3916,29 +4059,165 @@ function wlView(w) {
   };
 }
 
+/* ----------------- waitlist quotes from REAL turn-time data -----------------
+   Quotes are computed from this site's own check history (opened_at ->
+   closed_at), bucketed by party size. Buckets with fewer than 5 samples in
+   the last 28 days fall back to a labeled 75-minute default — the response
+   always says which basis was used. Never a fixed blind guess. */
+const PARTY_BUCKETS = ['1-2', '3-4', '5-6', '7+'];
+function partyBucket(n) {
+  const p = Math.max(1, n | 0);
+  return p <= 2 ? '1-2' : p <= 4 ? '3-4' : p <= 6 ? '5-6' : '7+';
+}
+function turnTimeStats() {
+  const cutoff = new Date(Date.now() - 28 * 86400000).toISOString();
+  const rows = db.prepare(
+    `SELECT guest_count, opened_at, closed_at FROM checks
+     WHERE site_id = ? AND status IN ('paid','closed')
+       AND closed_at IS NOT NULL AND closed_at >= ? AND opened_at IS NOT NULL`
+  ).all(SITE_ID, cutoff);
+  const per = {};
+  for (const r of rows) {
+    const mins = (Date.parse(r.closed_at) - Date.parse(r.opened_at)) / 60000;
+    if (!isFinite(mins) || mins <= 0 || mins > 720) continue;
+    const b = partyBucket(r.guest_count || 2);
+    (per[b] = per[b] || []).push(mins);
+  }
+  const out = {};
+  for (const b of PARTY_BUCKETS) {
+    const a = (per[b] || []).sort((x, y) => x - y);
+    out[b] = a.length >= 5
+      ? { median_min: Math.round(a[Math.floor(a.length / 2)]), samples: a.length, fallback: false }
+      : { median_min: 75, samples: a.length, fallback: true };
+  }
+  return out;
+}
+function quoteWaitlist(party) {
+  const stats = turnTimeStats();
+  const myBucket = partyBucket(party);
+  const my = stats[myBucket];
+  const suitable = db.prepare('SELECT id FROM tables WHERE site_id = ? AND seats >= ? ORDER BY seats ASC').all(SITE_ID, party);
+  if (!suitable.length) {
+    return { quoted_wait_min: null, reason: 'no table seats a party of ' + party, basis: { party_bucket: myBucket, median_turn_min: my.median_min, samples: my.samples, fallback: my.fallback } };
+  }
+  const waitingAhead = db.prepare(
+    `SELECT COUNT(*) AS c FROM waitlist WHERE site_id = ? AND status IN ('waiting','notified') AND party_size >= ?`
+  ).get(SITE_ID, Math.max(1, party - 2)).c;
+  const openStmt = db.prepare('SELECT opened_at, guest_count FROM checks WHERE table_id = ? AND status = ? ORDER BY opened_at LIMIT 1');
+  const nowMs = Date.now();
+  let freeNow = 0;
+  let soonestFreeMin = Infinity;
+  for (const t of suitable) {
+    const oc = openStmt.get(t.id, 'open');
+    if (!oc || !oc.opened_at) { freeNow++; continue; }
+    const st = stats[partyBucket(oc.guest_count || 2)];
+    const elapsed = (nowMs - Date.parse(oc.opened_at)) / 60000;
+    const remain = Math.max(0, st.median_min - (isFinite(elapsed) ? elapsed : 0));
+    soonestFreeMin = Math.min(soonestFreeMin, remain);
+  }
+  if (!isFinite(soonestFreeMin)) soonestFreeMin = 0;
+  // Model: tables that are free now (or imminently) absorb the queue ahead;
+  // the rest of the wait is amortized across suitable tables by median turn.
+  let quote;
+  if (freeNow > waitingAhead) quote = 0;
+  else quote = Math.max(5, Math.round(soonestFreeMin + ((waitingAhead - freeNow) * my.median_min) / suitable.length));
+  return {
+    quoted_wait_min: quote,
+    basis: {
+      party_bucket: myBucket, median_turn_min: my.median_min, samples: my.samples, fallback: my.fallback,
+      suitable_tables: suitable.length, free_now: freeNow, waiting_ahead: waitingAhead,
+    },
+  };
+}
+
+/** Validate waitlist pre-order lines. Returns {items:[{menuItem, qty, seat, modifiers}]} or {error}. */
+function validatePreorder(lines, partySize, actorRole) {
+  if (lines == null) return { items: [] };
+  if (!Array.isArray(lines)) return { error: 'preorder_items must be an array' };
+  if (lines.length > 40) return { error: 'preorder_items is limited to 40 lines' };
+  const items = [];
+  for (const [i, ln] of lines.entries()) {
+    const menuItem = ln && ln.menu_item_id != null
+      ? db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ? AND active = 1').get(ln.menu_item_id, SITE_ID)
+      : null;
+    if (!menuItem) return { error: `preorder_items[${i}]: valid active menu_item_id is required` };
+    const qty = ln.qty == null ? 1 : ln.qty;
+    if (!isInt(qty) || qty < 1 || qty > 20) return { error: `preorder_items[${i}]: qty must be 1–20` };
+    const seat = ln.seat == null ? 1 : ln.seat;
+    if (!isInt(seat) || seat < 1 || seat > partySize) return { error: `preorder_items[${i}]: seat must be 1–${partySize}` };
+    const mods = ln.modifiers == null ? [] : ln.modifiers;
+    if (!Array.isArray(mods)) return { error: `preorder_items[${i}]: modifiers must be an array` };
+    for (const m of mods) {
+      if (!m || typeof m.name !== 'string' || !isInt(m.price_delta_cents)) {
+        return { error: `preorder_items[${i}]: each modifier needs {name, price_delta_cents}` };
+      }
+    }
+    let unitPrice = menuItem.price_cents;
+    if (menuItem.price_cents === 0) {
+      // Market-price items: a manager must set the price when the pre-order is taken.
+      if (actorRole !== 'manager') {
+        return { error: `preorder_items[${i}]: market-price item "${menuItem.name}" must be pre-ordered by a manager` };
+      }
+      if (!isInt(ln.unit_price_cents) || ln.unit_price_cents < 0) {
+        return { error: `preorder_items[${i}]: market-price item needs unit_price_cents (manager-entered price)` };
+      }
+      unitPrice = ln.unit_price_cents;
+    }
+    items.push({ menuItem, qty, seat, modifiers: mods, unitPrice });
+  }
+  return { items };
+}
+
+function wlPreorderView(w) {
+  return { ...wlView(w), preorder_items: parseJson(w.preorder_json, []) };
+}
+
 app.post('/api/waitlist', serverPlus(), (req, res) => {
   const b = req.body || {};
   const name = cleanLabel(b.customer_name);
   if (!name) return res.status(400).json({ error: 'customer_name is required' });
   if (!isInt(b.party_size) || b.party_size < 1 || b.party_size > 24)
     return res.status(400).json({ error: 'party_size must be a whole number from 1 to 24' });
-  const quoted = b.quoted_wait_min == null ? null : b.quoted_wait_min;
+  const pre = validatePreorder(b.preorder_items, b.party_size, req.user.role);
+  if (pre.error) return res.status(400).json({ error: pre.error });
+  let quoted = b.quoted_wait_min == null ? null : b.quoted_wait_min;
+  let quoteBasis = null;
   if (quoted != null && (!isInt(quoted) || quoted < 0 || quoted > 480))
     return res.status(400).json({ error: 'quoted_wait_min must be 0–480' });
+  if (quoted == null) {
+    // Data-driven default: quote from real turn-time history, never a guess.
+    const q = quoteWaitlist(b.party_size);
+    quoted = q.quoted_wait_min == null ? 0 : q.quoted_wait_min;
+    quoteBasis = q.basis || null;
+  }
   const phone = cleanPhone(b.phone);
   const r = db.prepare(
-    `INSERT INTO waitlist (uuid, site_id, customer_name, phone, party_size, quoted_wait_min, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?)`
-  ).run(crypto.randomUUID(), SITE_ID, name, phone || null, b.party_size, quoted, nowIso());
+    `INSERT INTO waitlist (uuid, site_id, customer_name, phone, party_size, quoted_wait_min, preorder_json, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', ?)`
+  ).run(crypto.randomUUID(), SITE_ID, name, phone || null, b.party_size, quoted, JSON.stringify(pre.items.map((p) => ({
+    menu_item_id: p.menuItem.id, name: p.menuItem.name, qty: p.qty, seat: p.seat,
+    modifiers: p.modifiers, unit_price_cents: p.unitPrice,
+  }))), nowIso());
   broadcastResvUpdated();
-  res.status(201).json(wlView(wlById(r.lastInsertRowid)));
+  const out = wlPreorderView(wlById(r.lastInsertRowid));
+  if (quoteBasis) out.quote_basis = quoteBasis;
+  res.status(201).json(out);
+});
+
+/** GET /api/waitlist/quote?party_size=N — data-driven quote without adding
+ *  anyone to the list. */
+app.get('/api/waitlist/quote', serverPlus(), (req, res) => {
+  const party = req.query.party_size == null ? 2 : parseInt(req.query.party_size, 10);
+  if (!isInt(party) || party < 1 || party > 24)
+    return res.status(400).json({ error: 'party_size must be 1–24' });
+  res.json(quoteWaitlist(party));
 });
 
 app.get('/api/waitlist', serverPlus(), (req, res) => {
   const rows = db.prepare(
     `SELECT * FROM waitlist WHERE site_id = ? AND status IN ('waiting','notified') ORDER BY created_at`
   ).all(SITE_ID);
-  res.json(rows.map(wlView));
+  res.json(rows.map(wlPreorderView));
 });
 
 app.post('/api/waitlist/:id/notify', serverPlus(), (req, res) => {
@@ -3947,7 +4226,7 @@ app.post('/api/waitlist/:id/notify', serverPlus(), (req, res) => {
   if (w.status !== 'waiting') return res.status(400).json({ error: `Entry is ${w.status}` });
   db.prepare("UPDATE waitlist SET status = 'notified', notified_at = ? WHERE id = ?").run(nowIso(), w.id);
   broadcastResvUpdated();
-  res.json(wlView(wlById(w.id)));
+  res.json(wlPreorderView(wlById(w.id)));
 });
 
 /** One-tap seat: waiting/notified entry -> open check on the chosen table. */
@@ -3960,9 +4239,28 @@ app.post('/api/waitlist/:id/seat', serverPlus(), (req, res) => {
   if (!t) return res.status(400).json({ error: 'Valid table_id is required' });
   const opened = openCheckOnTable(t.id, w.party_size, w.customer_name, req.user.id);
   if (opened.error) return res.status(400).json({ error: opened.error, check_id: opened.check_id || null });
+  // Attach the pre-order as HELD items — the kitchen fires nothing until /send.
+  const preorder = parseJson(w.preorder_json, []);
+  const insPre = db.prepare(
+    "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
+  );
+  const skipped = [];
+  withTransaction(() => {
+    for (const ln of preorder) {
+      const mi = db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ? AND active = 1').get(ln.menu_item_id, SITE_ID);
+      if (!mi) { skipped.push(ln.name || ('item ' + ln.menu_item_id)); continue; } // 86'd while they waited
+      const seat = Math.min(Math.max(1, ln.seat | 0), w.party_size);
+      const qty = Math.min(Math.max(1, ln.qty | 0), 20);
+      const unit = ln.unit_price_cents != null ? ln.unit_price_cents : mi.price_cents;
+      insPre.run(crypto.randomUUID(), opened.check.id, mi.id, seat, qty, unit,
+        JSON.stringify(Array.isArray(ln.modifiers) ? ln.modifiers : []), mi.course, nowIso());
+    }
+  });
+  if (preorder.length) persistTotals(opened.check.id);
   db.prepare("UPDATE waitlist SET status = 'seated' WHERE id = ?").run(w.id);
+  auditApproval(req, 'waitlist_seat', { check_id: opened.check.id }, { waitlist_id: w.id, preorder_attached: preorder.length - skipped.length, preorder_skipped: skipped });
   broadcastResvUpdated();
-  res.json({ entry: wlView(wlById(w.id)), check_id: opened.check.id });
+  res.json({ entry: wlPreorderView(wlById(w.id)), check_id: opened.check.id, preorder_attached: preorder.length - skipped.length, preorder_skipped: skipped });
 });
 
 app.patch('/api/waitlist/:id', serverPlus(), (req, res) => {
@@ -4051,6 +4349,741 @@ app.get('/api/floor/availability', serverPlus(), (req, res) => {
       suggested: suggested.has(t.id),
     })),
   });
+});
+
+/* ================= Phase 3C — competitor parity: back office =================
+   Cash drawer (blind-count closeout), scheduling with labor-vs-sales
+   projections, product-mix analytics, staff notes at login, review prompts,
+   multi-location dashboard, open API docs, inventory phase 1. */
+
+/* ------------------------------- cash drawer -------------------------------
+   One open drawer at a time per site. Expected cash is server-computed:
+   opening float + cash payments (net of cash refunds) + paid-ins − paid-outs.
+   Cash tips are kept by the server directly (see /api/finance/shift), so only
+   the house's amount_cents moves the drawer. Closeout is blind: non-managers
+   never see expected_cents; the manager enters the count and the server
+   computes the variance. */
+function currentDrawer() {
+  return db.prepare("SELECT * FROM cash_drawers WHERE site_id = ? AND status = 'open' ORDER BY opened_at DESC LIMIT 1").get(SITE_ID);
+}
+function drawerExpected(d) {
+  const close = d.closed_at || nowIso();
+  const pays = db.prepare(
+    `SELECT method, amount_cents, refunded_cents, status FROM payments
+     WHERE site_id = ? AND created_at >= ? AND created_at < ?`
+  ).all(SITE_ID, d.opened_at, close);
+  let cashNet = 0;
+  for (const p of pays) {
+    if (p.method !== 'cash') continue;
+    if (p.status === 'completed' || p.status === 'partial_refund') cashNet += p.amount_cents - (p.refunded_cents || 0);
+  }
+  const evts = db.prepare('SELECT kind, amount_cents FROM cash_drawer_events WHERE drawer_id = ?').all(d.id);
+  let paidIn = 0, paidOut = 0;
+  for (const e of evts) {
+    if (e.kind === 'paid_in') paidIn += e.amount_cents || 0;
+    else if (e.kind === 'paid_out') paidOut += e.amount_cents || 0;
+  }
+  return d.opening_float_cents + cashNet + paidIn - paidOut;
+}
+function drawerView(d, includeExpected) {
+  const v = {
+    id: d.id, uuid: d.uuid, status: d.status, opened_at: d.opened_at, closed_at: d.closed_at,
+    opened_by: d.opened_by, opening_float_cents: d.opening_float_cents,
+    counted_cents: d.counted_cents, variance_cents: d.variance_cents, counted_by: d.counted_by, notes: d.notes,
+  };
+  if (includeExpected) v.expected_cents = d.status === 'open' ? drawerExpected(d) : d.expected_cents;
+  return v;
+}
+function logDrawerEvent(drawerId, kind, amountCents, note, actor) {
+  db.prepare(
+    `INSERT INTO cash_drawer_events (drawer_id, site_id, kind, amount_cents, note, actor, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(drawerId, SITE_ID, kind, amountCents || 0, note || null, actor || null, nowIso());
+}
+
+app.post('/api/cash/drawer/open', managerOnly(), (req, res) => {
+  if (currentDrawer()) return res.status(409).json({ error: 'A drawer is already open' });
+  const b = req.body || {};
+  if (!isInt(b.opening_float_cents) || b.opening_float_cents < 0)
+    return res.status(400).json({ error: 'opening_float_cents must be a non-negative integer' });
+  const r = db.prepare(
+    `INSERT INTO cash_drawers (uuid, site_id, opened_at, opened_by, opening_float_cents, status)
+     VALUES (?, ?, ?, ?, ?, 'open')`
+  ).run(crypto.randomUUID(), SITE_ID, nowIso(), req.user.name, b.opening_float_cents);
+  logDrawerEvent(r.lastInsertRowid, 'open', b.opening_float_cents, 'Opening float', req.user.name);
+  auditApproval(req, 'drawer_open', {}, { drawer_id: r.lastInsertRowid, opening_float_cents: b.opening_float_cents });
+  res.status(201).json(drawerView(db.prepare('SELECT * FROM cash_drawers WHERE id = ?').get(r.lastInsertRowid), true));
+});
+
+/** Blind by role: managers see the live expected figure; servers/kitchen see
+ *  the drawer state and event log without it (blind count). */
+app.get('/api/cash/drawer', serverPlus(), (req, res) => {
+  const d = currentDrawer();
+  if (!d) return res.json({ drawer: null });
+  const events = db.prepare('SELECT id, kind, amount_cents, note, actor, created_at FROM cash_drawer_events WHERE drawer_id = ? ORDER BY created_at').all(d.id);
+  res.json({ drawer: drawerView(d, req.user.role === 'manager'), events });
+});
+
+app.post('/api/cash/drawer/event', serverPlus(), (req, res) => {
+  const d = currentDrawer();
+  if (!d) return res.status(409).json({ error: 'No drawer is open' });
+  const b = req.body || {};
+  const kinds = new Set(['paid_in', 'paid_out', 'no_sale', 'note']);
+  if (!kinds.has(b.kind)) return res.status(400).json({ error: 'kind must be paid_in, paid_out, no_sale, or note' });
+  const needsAmt = b.kind === 'paid_in' || b.kind === 'paid_out';
+  const amt = b.amount_cents == null ? 0 : b.amount_cents;
+  if (needsAmt && (!isInt(amt) || amt <= 0))
+    return res.status(400).json({ error: 'amount_cents must be a positive integer for paid_in/paid_out' });
+  if (!needsAmt && b.amount_cents != null && !isInt(b.amount_cents))
+    return res.status(400).json({ error: 'amount_cents must be an integer' });
+  const note = cleanLabel(b.note);
+  logDrawerEvent(d.id, b.kind, amt, note || null, req.user.name);
+  auditApproval(req, 'drawer_event', {}, { drawer_id: d.id, kind: b.kind, amount_cents: amt, note: note || null });
+  res.status(201).json({ ok: true, drawer: drawerView(db.prepare('SELECT * FROM cash_drawers WHERE id = ?').get(d.id), req.user.role === 'manager') });
+});
+
+/** Blind-count closeout: the manager enters the counted cash; the server —
+ *  not the counter — computes expected and the variance. */
+const drawerCloseGate = () => (req, res, next) =>
+  (getConfig().drawer_close_role === 'server' ? serverPlus() : managerOnly())(req, res, next);
+app.post('/api/cash/drawer/close', drawerCloseGate(), (req, res) => {
+  const d = currentDrawer();
+  if (!d) return res.status(409).json({ error: 'No drawer is open' });
+  const b = req.body || {};
+  if (!isInt(b.counted_cents) || b.counted_cents < 0)
+    return res.status(400).json({ error: 'counted_cents must be a non-negative integer' });
+  const expected = drawerExpected(d);
+  const variance = b.counted_cents - expected;
+  const closedAt = nowIso();
+  db.prepare(
+    `UPDATE cash_drawers SET status = 'closed', closed_at = ?, expected_cents = ?, counted_cents = ?, variance_cents = ?, counted_by = ?, notes = ? WHERE id = ?`
+  ).run(closedAt, expected, b.counted_cents, variance, req.user.name, cleanLabel(b.notes) || null, d.id);
+  logDrawerEvent(d.id, 'close', b.counted_cents, `Counted ${b.counted_cents}, expected ${expected}, variance ${variance}`, req.user.name);
+  auditApproval(req, 'drawer_close', {}, { drawer_id: d.id, expected_cents: expected, counted_cents: b.counted_cents, variance_cents: variance });
+  res.json({ drawer: drawerView(db.prepare('SELECT * FROM cash_drawers WHERE id = ?').get(d.id), true) });
+});
+
+app.get('/api/cash/log', managerOnly(), (req, res) => {
+  const drawers = db.prepare('SELECT * FROM cash_drawers WHERE site_id = ? ORDER BY opened_at DESC LIMIT 30').all(SITE_ID);
+  res.json(drawers.map((d) => drawerView(d, true)));
+});
+
+/* ------------------------------ scheduling --------------------------------
+   Weekly schedule with projected labor cost next to sales projections.
+   Sales projections come from the site's own closed-check history (same
+   weekday, trailing 8 weeks) — no invented numbers. */
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function validMinutes(v) { return isInt(v) && v >= 0 && v <= 1440; }
+
+app.get('/api/admin/schedule', managerOnly(), (req, res) => {
+  const week = req.query.week;
+  if (week != null && !DATE_RE.test(week)) return res.status(400).json({ error: 'week must be YYYY-MM-DD' });
+  const start = week || weekStartSite(todaySite() + 'T12:00:00Z');
+  const end = addDays(start, 6);
+  const rows = db.prepare(
+    'SELECT * FROM schedule_shifts WHERE site_id = ? AND work_date >= ? AND work_date <= ? ORDER BY work_date, start_min'
+  ).all(SITE_ID, start, end);
+  res.json({ week_start: start, week_end: end, shifts: rows });
+});
+
+app.post('/api/admin/schedule', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  if (!DATE_RE.test(b.work_date || '')) return res.status(400).json({ error: 'work_date must be YYYY-MM-DD' });
+  if (!validMinutes(b.start_min) || !validMinutes(b.end_min) || b.end_min <= b.start_min)
+    return res.status(400).json({ error: 'start_min/end_min must be 0–1440 with end after start' });
+  const user = b.user_id != null ? db.prepare('SELECT * FROM users WHERE id = ?').get(b.user_id) : null;
+  const name = cleanLabel(b.employee_name) || (user ? user.name : '');
+  if (!name) return res.status(400).json({ error: 'employee_name or a valid user_id is required' });
+  const role = ['server', 'kitchen', 'manager'].includes(b.role) ? b.role : (user ? user.role : 'server');
+  const rate = b.rate_cents != null ? b.rate_cents : (user ? (user.hourly_rate_cents || 0) : 0);
+  if (!isInt(rate) || rate < 0) return res.status(400).json({ error: 'rate_cents must be a non-negative integer' });
+  const r = db.prepare(
+    `INSERT INTO schedule_shifts (uuid, site_id, user_id, employee_name, role, work_date, start_min, end_min, rate_cents, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(crypto.randomUUID(), SITE_ID, user ? user.id : null, name, role, b.work_date, b.start_min, b.end_min, rate, req.user.name, nowIso());
+  auditApproval(req, 'schedule_create', {}, { shift_id: r.lastInsertRowid, employee_name: name, work_date: b.work_date });
+  res.status(201).json(db.prepare('SELECT * FROM schedule_shifts WHERE id = ?').get(r.lastInsertRowid));
+});
+
+app.put('/api/admin/schedule/:id', managerOnly(), (req, res) => {
+  const s = db.prepare('SELECT * FROM schedule_shifts WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!s) return res.status(404).json({ error: 'Scheduled shift not found' });
+  const b = req.body || {};
+  const upd = {
+    employee_name: b.employee_name != null ? cleanLabel(b.employee_name) : s.employee_name,
+    role: ['server', 'kitchen', 'manager'].includes(b.role) ? b.role : s.role,
+    work_date: b.work_date != null ? b.work_date : s.work_date,
+    start_min: b.start_min != null ? b.start_min : s.start_min,
+    end_min: b.end_min != null ? b.end_min : s.end_min,
+    rate_cents: b.rate_cents != null ? b.rate_cents : s.rate_cents,
+  };
+  if (!upd.employee_name) return res.status(400).json({ error: 'employee_name is required' });
+  if (!DATE_RE.test(upd.work_date)) return res.status(400).json({ error: 'work_date must be YYYY-MM-DD' });
+  if (!validMinutes(upd.start_min) || !validMinutes(upd.end_min) || upd.end_min <= upd.start_min)
+    return res.status(400).json({ error: 'start_min/end_min must be 0–1440 with end after start' });
+  if (!isInt(upd.rate_cents) || upd.rate_cents < 0) return res.status(400).json({ error: 'rate_cents must be a non-negative integer' });
+  db.prepare('UPDATE schedule_shifts SET employee_name = ?, role = ?, work_date = ?, start_min = ?, end_min = ?, rate_cents = ? WHERE id = ?')
+    .run(upd.employee_name, upd.role, upd.work_date, upd.start_min, upd.end_min, upd.rate_cents, s.id);
+  auditApproval(req, 'schedule_update', {}, { shift_id: s.id, before: { work_date: s.work_date, start_min: s.start_min, end_min: s.end_min }, after: upd });
+  res.json(db.prepare('SELECT * FROM schedule_shifts WHERE id = ?').get(s.id));
+});
+
+app.delete('/api/admin/schedule/:id', managerOnly(), (req, res) => {
+  const s = db.prepare('SELECT * FROM schedule_shifts WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!s) return res.status(404).json({ error: 'Scheduled shift not found' });
+  db.prepare('DELETE FROM schedule_shifts WHERE id = ?').run(s.id);
+  auditApproval(req, 'schedule_delete', {}, { shift_id: s.id, employee_name: s.employee_name, work_date: s.work_date });
+  res.json({ deleted: s.id });
+});
+
+/** Projected labor cost next to sales projections, per day of the week.
+ *  Projected sales = mean of that weekday's closed-check net sales over the
+ *  trailing 8 weeks. Labor = Σ scheduled hours × rate. */
+app.get('/api/admin/schedule/projection', managerOnly(), (req, res) => {
+  const week = req.query.week;
+  if (week != null && !DATE_RE.test(week)) return res.status(400).json({ error: 'week must be YYYY-MM-DD' });
+  const start = week || weekStartSite(todaySite() + 'T12:00:00Z');
+  // Trailing 8 weeks of closed-check daily sales, bucketed by site weekday.
+  const salesByDay = db.prepare(
+    `SELECT closed_at, total_cents FROM checks
+     WHERE site_id = ? AND status IN ('paid','closed') AND closed_at IS NOT NULL
+       AND closed_at >= ?`
+  ).all(SITE_ID, new Date(Date.now() - 56 * 86400000).toISOString());
+  const byDow = {}; // 0=Sun..6=Sat -> [daily totals]
+  const dayTotals = {};
+  for (const c of salesByDay) {
+    const d = tzDate(c.closed_at);
+    if (!DATE_RE.test(d)) continue;
+    dayTotals[d] = (dayTotals[d] || 0) + (c.total_cents || 0);
+  }
+  for (const [d, t] of Object.entries(dayTotals)) {
+    const dow = new Date(d + 'T12:00:00Z').getUTCDay();
+    (byDow[dow] = byDow[dow] || []).push(t);
+  }
+  const shifts = db.prepare(
+    'SELECT * FROM schedule_shifts WHERE site_id = ? AND work_date >= ? AND work_date <= ?'
+  ).all(SITE_ID, start, addDays(start, 6));
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const date = addDays(start, i);
+    const dow = new Date(date + 'T12:00:00Z').getUTCDay();
+    const samples = byDow[dow] || [];
+    const projected = samples.length ? Math.round(samples.reduce((a, b) => a + b, 0) / samples.length) : null;
+    const dayShifts = shifts.filter((s) => s.work_date === date);
+    const labor = dayShifts.reduce((a, s) => a + ((s.end_min - s.start_min) / 60) * (s.rate_cents || 0), 0);
+    days.push({
+      date, dow,
+      projected_sales_cents: projected,
+      projected_sales_samples: samples.length,
+      scheduled_labor_cents: Math.round(labor),
+      scheduled_shifts: dayShifts.length,
+      projected_labor_pct: projected ? +(100 * labor / projected).toFixed(1) : null,
+    });
+  }
+  res.json({ week_start: start, week_end: addDays(start, 6), days });
+});
+
+/* ------------------------- product-mix analytics --------------------------
+   Best/worst sellers from the same honest sales data — no separate analytics
+   SKU. Attribution: items on checks closed in the range (billable states).
+   Voids are counted separately so a popular-but-voided item can't hide. */
+app.get('/api/finance/product-mix', managerOnly(), (req, res) => {
+  let from = req.query.from, to = req.query.to;
+  const today = todaySite();
+  if (!from && !to) { to = today; from = addDays(today, -6); }
+  else { from = from || to; to = to || from; }
+  if (!DATE_RE.test(from) || !DATE_RE.test(to)) return res.status(400).json({ error: 'from/to must be YYYY-MM-DD' });
+  if (from > to) return res.status(400).json({ error: 'from must not be after to' });
+  if (Math.round((new Date(to + 'T00:00:00Z') - new Date(from + 'T00:00:00Z')) / 86400000) > 370)
+    return res.status(400).json({ error: 'range is limited to 370 days' });
+  // Filter in JS on site-timezone close date (tzDate is JS-side).
+  const byItem = new Map();
+  let grossTotal = 0, qtyTotal = 0, voidTotal = 0;
+  const closedRows = db.prepare(
+    `SELECT ci.menu_item_id, ci.qty, ci.unit_price_cents, ci.modifiers_json, ci.state,
+            mi.name, mi.course, mi.station, mc.name AS category, c.closed_at
+     FROM check_items ci
+     JOIN checks c ON c.id = ci.check_id
+     LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id
+     LEFT JOIN menu_categories mc ON mc.id = mi.category_id
+     WHERE c.site_id = ? AND c.status IN ('paid','closed') AND c.closed_at IS NOT NULL`
+  ).all(SITE_ID);
+  for (const r of closedRows) {
+    const d = tzDate(r.closed_at);
+    if (d < from || d > to) continue;
+    const mods = parseJson(r.modifiers_json, []);
+    const line = r.qty * r.unit_price_cents + r.qty * mods.reduce((a, m) => a + (m.price_delta_cents || 0), 0);
+    let e = byItem.get(r.menu_item_id);
+    if (!e) {
+      e = { menu_item_id: r.menu_item_id, name: r.name || ('Item ' + r.menu_item_id), category: r.category || null, course: r.course || null, station: r.station || null, qty_sold: 0, gross_cents: 0, voided_qty: 0 };
+      byItem.set(r.menu_item_id, e);
+    }
+    if (r.state === 'cancelled') { e.voided_qty += r.qty; voidTotal += r.qty; }
+    else { e.qty_sold += r.qty; e.gross_cents += line; qtyTotal += r.qty; grossTotal += line; }
+  }
+  const list = [...byItem.values()].map((e) => ({
+    ...e,
+    gross_share_pct: grossTotal ? +(100 * e.gross_cents / grossTotal).toFixed(2) : 0,
+    void_rate_pct: (e.qty_sold + e.voided_qty) ? +(100 * e.voided_qty / (e.qty_sold + e.voided_qty)).toFixed(1) : 0,
+  }));
+  const byQty = [...list].sort((a, b) => b.qty_sold - a.qty_sold);
+  const byGross = [...list].sort((a, b) => b.gross_cents - a.gross_cents);
+  res.json({
+    from, to,
+    totals: { items: list.length, qty_sold: qtyTotal, gross_cents: grossTotal, voided_qty: voidTotal },
+    best_by_qty: byQty.slice(0, 10), worst_by_qty: byQty.slice(-10).reverse(),
+    best_by_gross: byGross.slice(0, 10), worst_by_gross: byGross.slice(-10).reverse(),
+    items: list.sort((a, b) => b.gross_cents - a.gross_cents),
+  });
+});
+
+/* ------------------- staff notes pushed at POS login -----------------------
+   86s, specials (notes), and today's reservations surface at login — no
+   pre-shift meeting required. Notes are manager-authored with an active
+   window; the login summary merges them with live operational state. */
+app.post('/api/admin/notes', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const title = cleanLabel(b.title);
+  if (!title) return res.status(400).json({ error: 'title is required' });
+  const body = typeof b.body === 'string' ? b.body.slice(0, 2000) : '';
+  const priority = ['low', 'normal', 'high'].includes(b.priority) ? b.priority : 'normal';
+  for (const k of ['active_from', 'active_to']) {
+    if (b[k] != null && isNaN(Date.parse(b[k]))) return res.status(400).json({ error: k + ' must be a valid datetime' });
+  }
+  if (b.active_from && b.active_to && Date.parse(b.active_from) > Date.parse(b.active_to))
+    return res.status(400).json({ error: 'active_from must not be after active_to' });
+  const r = db.prepare(
+    `INSERT INTO staff_notes (uuid, site_id, title, body, priority, active_from, active_to, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(crypto.randomUUID(), SITE_ID, title, body, priority, b.active_from || null, b.active_to || null, req.user.name, nowIso());
+  auditApproval(req, 'note_create', {}, { note_id: r.lastInsertRowid, title });
+  res.status(201).json(db.prepare('SELECT * FROM staff_notes WHERE id = ?').get(r.lastInsertRowid));
+});
+
+app.get('/api/admin/notes', managerOnly(), (req, res) => {
+  res.json(db.prepare('SELECT * FROM staff_notes WHERE site_id = ? ORDER BY created_at DESC LIMIT 100').all(SITE_ID));
+});
+
+app.put('/api/admin/notes/:id', managerOnly(), (req, res) => {
+  const n = db.prepare('SELECT * FROM staff_notes WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!n) return res.status(404).json({ error: 'Note not found' });
+  const b = req.body || {};
+  const title = b.title != null ? cleanLabel(b.title) : n.title;
+  if (!title) return res.status(400).json({ error: 'title is required' });
+  const body = b.body != null ? String(b.body).slice(0, 2000) : n.body;
+  const priority = b.priority != null ? b.priority : n.priority;
+  if (!['low', 'normal', 'high'].includes(priority)) return res.status(400).json({ error: 'priority must be low, normal, or high' });
+  const af = b.active_from !== undefined ? b.active_from : n.active_from;
+  const at = b.active_to !== undefined ? b.active_to : n.active_to;
+  for (const [k, v] of [['active_from', af], ['active_to', at]]) {
+    if (v != null && isNaN(Date.parse(v))) return res.status(400).json({ error: k + ' must be a valid datetime' });
+  }
+  if (af && at && Date.parse(af) > Date.parse(at)) return res.status(400).json({ error: 'active_from must not be after active_to' });
+  db.prepare('UPDATE staff_notes SET title = ?, body = ?, priority = ?, active_from = ?, active_to = ? WHERE id = ?')
+    .run(title, body, priority, af, at, n.id);
+  res.json(db.prepare('SELECT * FROM staff_notes WHERE id = ?').get(n.id));
+});
+
+app.delete('/api/admin/notes/:id', managerOnly(), (req, res) => {
+  const n = db.prepare('SELECT * FROM staff_notes WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!n) return res.status(404).json({ error: 'Note not found' });
+  db.prepare('DELETE FROM staff_notes WHERE id = ?').run(n.id);
+  auditApproval(req, 'note_delete', {}, { note_id: n.id, title: n.title });
+  res.json({ deleted: n.id });
+});
+
+/** Everything a staff member needs to see at login: manager notes in their
+ *  active window, current 86s, today's reservations, waitlist depth. */
+app.get('/api/login-summary', (req, res) => {
+  const now = nowIso();
+  const prio = { high: 0, normal: 1, low: 2 };
+  const notes = db.prepare(
+    `SELECT id, title, body, priority, created_by, created_at FROM staff_notes
+     WHERE site_id = ? AND (active_from IS NULL OR active_from <= ?) AND (active_to IS NULL OR active_to >= ?)`
+  ).all(SITE_ID, now, now).sort((a, b) => (prio[a.priority] - prio[b.priority]) || (a.created_at < b.created_at ? 1 : -1));
+  const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  // Currently 86'd = inactive menu items (the 86 toggle flips active; un-86 restores it).
+  const eightysix = db.prepare(
+    `SELECT name FROM menu_items WHERE site_id = ? AND active = 0 ORDER BY name LIMIT 20`
+  ).all(SITE_ID).map((r) => r.name);
+  const today = todaySite();
+  const resv = db.prepare(
+    `SELECT id, customer_name, party_size, reserved_at, table_id, notes FROM reservations
+     WHERE site_id = ? AND status = 'booked' ORDER BY reserved_at LIMIT 50`
+  ).all(SITE_ID).filter((r) => tzDate(r.reserved_at) === today);
+  const upcoming = resv.filter((r) => r.reserved_at >= now).slice(0, 3);
+  const wlWaiting = db.prepare(
+    `SELECT COUNT(*) AS c FROM waitlist WHERE site_id = ? AND status IN ('waiting','notified')`
+  ).get(SITE_ID).c;
+  const reviewPrompt = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'review_prompt'").get(SITE_ID);
+  res.json({
+    notes, eighty_six: eightysix,
+    reservations_today: { count: resv.length, upcoming },
+    waitlist_waiting: wlWaiting,
+    review_prompt: (reviewPrompt ? reviewPrompt.value : '1') === '1',
+  });
+});
+
+/* --------------------- review prompts / guest marketing --------------------
+   Post-payment nudge: after a check is paid, the payment device MAY offer a
+   1–5 star rating. Guest-optional, shown once per check, never blocks
+   payment, and the manager can disable it site-wide. No nagging. */
+app.post('/api/reviews', serverPlus(), (req, res) => {
+  const rp = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'review_prompt'").get(SITE_ID);
+  if ((rp ? rp.value : '1') !== '1') return res.status(409).json({ error: 'Review prompts are disabled for this site' });
+  const b = req.body || {};
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(b.check_id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (!['paid', 'closed'].includes(check.status)) return res.status(400).json({ error: 'Reviews are only taken after payment' });
+  if (!isInt(b.rating) || b.rating < 1 || b.rating > 5) return res.status(400).json({ error: 'rating must be 1–5' });
+  const comment = typeof b.comment === 'string' ? b.comment.slice(0, 500) : null;
+  try {
+    const r = db.prepare(
+      `INSERT INTO guest_reviews (site_id, check_id, rating, comment, marketing_opt_in, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(SITE_ID, check.id, b.rating, comment, b.marketing_opt_in ? 1 : 0, nowIso());
+    res.status(201).json(db.prepare('SELECT * FROM guest_reviews WHERE id = ?').get(r.lastInsertRowid));
+  } catch (e) {
+    if (String(e.message || '').includes('UNIQUE')) return res.status(409).json({ error: 'This check already has a review' });
+    throw e;
+  }
+});
+
+app.get('/api/reviews', managerOnly(), (req, res) => {
+  const rows = db.prepare('SELECT * FROM guest_reviews WHERE site_id = ? ORDER BY created_at DESC LIMIT 200').all(SITE_ID);
+  const dist = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  let sum = 0;
+  for (const r of rows) { dist[r.rating] = (dist[r.rating] || 0) + 1; sum += r.rating; }
+  res.json({
+    count: rows.length,
+    average: rows.length ? +(sum / rows.length).toFixed(2) : null,
+    distribution: dist,
+    marketing_opt_ins: rows.filter((r) => r.marketing_opt_in).length,
+    reviews: rows,
+  });
+});
+
+/** Manager settings (whitelisted keys only). */
+const ADMIN_SETTINGS = new Set(['review_prompt']);
+app.put('/api/admin/settings', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  if (!ADMIN_SETTINGS.has(b.key)) return res.status(400).json({ error: 'key must be one of: ' + [...ADMIN_SETTINGS].join(', ') });
+  // review_prompt is boolean-ish: accept true/false, 1/0, and the strings
+  // "true"/"false"/"1"/"0"/"on"/"off"/"yes"/"no" — a bare "false" string disables.
+  let value;
+  if (b.key === 'review_prompt') {
+    const v = b.value;
+    const off = v === false || v === 0 ||
+      (typeof v === 'string' && ['0', 'false', 'off', 'no', ''].includes(v.trim().toLowerCase()));
+    value = off ? '0' : '1';
+  } else {
+    value = String(b.value ?? '');
+  }
+  db.prepare('INSERT INTO site_config (site_id, key, value) VALUES (?, ?, ?) ON CONFLICT(site_id, key) DO UPDATE SET value = excluded.value')
+    .run(SITE_ID, b.key, value);
+  auditApproval(req, 'setting_change', {}, { key: b.key, value });
+  res.json({ key: b.key, value });
+});
+
+/* ------------------------- multi-location dashboard -----------------------
+   Cross-site overview on top of per-site DB isolation. Each site DB is
+   opened READ-ONLY and wrapped in its own try/catch: one site's corrupt or
+   locked file degrades to an error card and never touches the others. */
+function multisiteFiles() {
+  try {
+    return fs.readdirSync(SITES_DIR)
+      .filter((f) => f.endsWith('.db') && !f.endsWith('-wal') && !f.endsWith('-shm') && !f.endsWith('-journal'))
+      .map((f) => path.join(SITES_DIR, f));
+  } catch { return []; }
+}
+function multisiteSiteSummary(file) {
+  const slug = path.basename(file, '.db');
+  const rdb = new DatabaseSync(file, { readOnly: true });
+  try {
+    const has = (t) => rdb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+    let name = slug;
+    try { const s = rdb.prepare('SELECT name FROM sites LIMIT 1').get(); if (s && s.name) name = s.name; } catch { /* older db */ }
+    const today = todaySite();
+    const closed = has('checks')
+      ? rdb.prepare("SELECT closed_at, total_cents FROM checks WHERE status IN ('paid','closed') AND closed_at IS NOT NULL").all()
+      : [];
+    let salesToday = 0, coversToday = 0;
+    for (const c of closed) {
+      if (tzDate(c.closed_at) === today) { salesToday += c.total_cents || 0; coversToday++; }
+    }
+    const openChecks = has('checks') ? rdb.prepare("SELECT COUNT(*) AS c FROM checks WHERE status = 'open'").get().c : 0;
+    let drawer = 'none';
+    if (has('cash_drawers')) {
+      const d = rdb.prepare("SELECT status FROM cash_drawers WHERE status = 'open' LIMIT 1").get();
+      drawer = d ? 'open' : 'closed';
+    }
+    let staffOn = 0;
+    if (has('clock_shifts')) {
+      try { staffOn = rdb.prepare('SELECT COUNT(*) AS c FROM clock_shifts WHERE clock_out IS NULL').get().c; } catch { staffOn = 0; }
+    }
+    return { slug, name, ok: true, sales_today_cents: salesToday, covers_today: coversToday, open_checks: openChecks, drawer, staff_clocked_in: staffOn };
+  } finally {
+    try { rdb.close(); } catch { /* ignore */ }
+  }
+}
+app.get('/api/admin/multisite/overview', managerOnly(), (req, res) => {
+  const sites = [];
+  for (const f of multisiteFiles()) {
+    try {
+      sites.push(multisiteSiteSummary(f));
+    } catch (e) {
+      // One site's failure (corrupt/locked/unreadable) never touches another.
+      sites.push({ slug: path.basename(f, '.db'), name: path.basename(f, '.db'), ok: false, error: 'unreadable: ' + String((e && e.message) || e).slice(0, 120) });
+    }
+  }
+  res.json({ sites });
+});
+
+/* ------------------------------ inventory (1) -----------------------------
+   Phase 1: ingredient records, per-menu-item recipes, depletion on fire
+   (/send), manual adjustments with audit, low-stock status. Honest scope —
+   vendor receiving/POs, waste tracking, and theoretical-vs-actual food cost
+   are NOT in phase 1 (see REMAINING note in the final report). */
+function ingredientById(id) {
+  return db.prepare('SELECT * FROM ingredients WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+app.get('/api/admin/inventory/ingredients', managerOnly(), (req, res) => {
+  const rows = db.prepare('SELECT * FROM ingredients WHERE site_id = ? AND active = 1 ORDER BY name').all(SITE_ID);
+  res.json(rows.map((r) => ({ ...r, low: r.on_hand <= r.par })));
+});
+app.post('/api/admin/inventory/ingredients', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const name = cleanLabel(b.name);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  const unit = cleanLabel(b.unit) || 'ea';
+  for (const [k, v] of [['on_hand', b.on_hand], ['par', b.par]]) {
+    if (v != null && (typeof v !== 'number' || !isFinite(v) || v < 0))
+      return res.status(400).json({ error: k + ' must be a non-negative number' });
+  }
+  if (b.cost_per_unit_cents != null && (!isInt(b.cost_per_unit_cents) || b.cost_per_unit_cents < 0))
+    return res.status(400).json({ error: 'cost_per_unit_cents must be a non-negative integer' });
+  const r = db.prepare(
+    `INSERT INTO ingredients (site_id, name, unit, on_hand, par, cost_per_unit_cents, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(SITE_ID, name, unit, b.on_hand || 0, b.par || 0, b.cost_per_unit_cents || 0, nowIso());
+  auditApproval(req, 'ingredient_create', {}, { ingredient_id: r.lastInsertRowid, name });
+  res.status(201).json(ingredientById(r.lastInsertRowid));
+});
+app.put('/api/admin/inventory/ingredients/:id', managerOnly(), (req, res) => {
+  const ing = ingredientById(req.params.id);
+  if (!ing) return res.status(404).json({ error: 'Ingredient not found' });
+  const b = req.body || {};
+  const name = b.name != null ? cleanLabel(b.name) : ing.name;
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  const unit = b.unit != null ? (cleanLabel(b.unit) || 'ea') : ing.unit;
+  const onHand = b.on_hand != null ? b.on_hand : ing.on_hand;
+  const par = b.par != null ? b.par : ing.par;
+  for (const [k, v] of [['on_hand', onHand], ['par', par]]) {
+    if (typeof v !== 'number' || !isFinite(v) || v < 0) return res.status(400).json({ error: k + ' must be a non-negative number' });
+  }
+  const cost = b.cost_per_unit_cents != null ? b.cost_per_unit_cents : ing.cost_per_unit_cents;
+  if (!isInt(cost) || cost < 0) return res.status(400).json({ error: 'cost_per_unit_cents must be a non-negative integer' });
+  db.prepare('UPDATE ingredients SET name = ?, unit = ?, on_hand = ?, par = ?, cost_per_unit_cents = ? WHERE id = ?')
+    .run(name, unit, onHand, par, cost, ing.id);
+  auditApproval(req, 'ingredient_update', {}, { ingredient_id: ing.id, name });
+  res.json(ingredientById(ing.id));
+});
+app.delete('/api/admin/inventory/ingredients/:id', managerOnly(), (req, res) => {
+  const ing = ingredientById(req.params.id);
+  if (!ing) return res.status(404).json({ error: 'Ingredient not found' });
+  db.prepare('UPDATE ingredients SET active = 0 WHERE id = ?').run(ing.id); // deactivate, keep history
+  auditApproval(req, 'ingredient_deactivate', {}, { ingredient_id: ing.id, name: ing.name });
+  res.json({ deactivated: ing.id });
+});
+/** Replace the recipe (ingredient lines) for one menu item. */
+app.post('/api/admin/inventory/recipes', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const item = b.menu_item_id != null
+    ? db.prepare('SELECT id, name FROM menu_items WHERE id = ? AND site_id = ?').get(b.menu_item_id, SITE_ID)
+    : null;
+  if (!item) return res.status(400).json({ error: 'Valid menu_item_id is required' });
+  const lines = b.lines == null ? [] : b.lines;
+  if (!Array.isArray(lines)) return res.status(400).json({ error: 'lines must be an array' });
+  const seen = new Set();
+  for (const [i, ln] of lines.entries()) {
+    const ing = ln && ln.ingredient_id != null ? ingredientById(ln.ingredient_id) : null;
+    if (!ing || !ing.active) return res.status(400).json({ error: `lines[${i}]: valid active ingredient_id is required` });
+    if (typeof ln.qty !== 'number' || !isFinite(ln.qty) || ln.qty <= 0)
+      return res.status(400).json({ error: `lines[${i}]: qty must be a positive number` });
+    if (seen.has(ing.id)) return res.status(400).json({ error: `lines[${i}]: duplicate ingredient ${ing.name}` });
+    seen.add(ing.id);
+  }
+  withTransaction(() => {
+    db.prepare('DELETE FROM recipes WHERE site_id = ? AND menu_item_id = ?').run(SITE_ID, item.id);
+    const ins = db.prepare('INSERT INTO recipes (site_id, menu_item_id, ingredient_id, qty) VALUES (?, ?, ?, ?)');
+    for (const ln of lines) ins.run(SITE_ID, item.id, ln.ingredient_id, ln.qty);
+  });
+  auditApproval(req, 'recipe_set', {}, { menu_item_id: item.id, lines: lines.length });
+  res.json({ menu_item_id: item.id, lines: lines.length });
+});
+app.get('/api/admin/inventory/recipes', managerOnly(), (req, res) => {
+  const q = req.query.menu_item_id;
+  let rows;
+  if (q != null) {
+    rows = db.prepare(
+      `SELECT r.*, i.name AS ingredient_name, i.unit FROM recipes r JOIN ingredients i ON i.id = r.ingredient_id
+       WHERE r.site_id = ? AND r.menu_item_id = ?`
+    ).all(SITE_ID, q);
+  } else {
+    rows = db.prepare(
+      `SELECT r.*, i.name AS ingredient_name, i.unit, mi.name AS item_name FROM recipes r
+       JOIN ingredients i ON i.id = r.ingredient_id JOIN menu_items mi ON mi.id = r.menu_item_id
+       WHERE r.site_id = ? ORDER BY mi.name`
+    ).all(SITE_ID);
+  }
+  res.json(rows);
+});
+app.post('/api/admin/inventory/adjust', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const ing = b.ingredient_id != null ? ingredientById(b.ingredient_id) : null;
+  if (!ing || !ing.active) return res.status(400).json({ error: 'Valid active ingredient_id is required' });
+  if (typeof b.delta !== 'number' || !isFinite(b.delta) || b.delta === 0)
+    return res.status(400).json({ error: 'delta must be a non-zero number' });
+  const reason = cleanLabel(b.reason) || 'manual adjustment';
+  withTransaction(() => {
+    db.prepare('UPDATE ingredients SET on_hand = on_hand + ? WHERE id = ?').run(b.delta, ing.id);
+    db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(SITE_ID, ing.id, b.delta, reason, req.user.name, nowIso());
+  });
+  auditApproval(req, 'inventory_adjust', {}, { ingredient_id: ing.id, delta: b.delta, reason });
+  res.json(ingredientById(ing.id));
+});
+app.get('/api/inventory/status', managerOnly(), (req, res) => {
+  const ings = db.prepare('SELECT * FROM ingredients WHERE site_id = ? AND active = 1 ORDER BY name').all(SITE_ID);
+  const recent = db.prepare(
+    `SELECT a.*, i.name AS ingredient_name FROM inventory_adjustments a
+     JOIN ingredients i ON i.id = a.ingredient_id
+     WHERE a.site_id = ? ORDER BY a.created_at DESC LIMIT 25`
+  ).all(SITE_ID);
+  res.json({
+    low_stock: ings.filter((r) => r.on_hand <= r.par).map((r) => ({ ...r, low: true })),
+    ingredient_count: ings.length,
+    recent_adjustments: recent,
+  });
+});
+/** Deplete inventory for fired items. Called inside the /send transaction. */
+function depleteInventoryForItems(heldItems) {
+  const lineStmt = db.prepare('SELECT ingredient_id, qty FROM recipes WHERE site_id = ? AND menu_item_id = ?');
+  const decStmt = db.prepare('UPDATE ingredients SET on_hand = on_hand - ? WHERE id = ? AND site_id = ?');
+  for (const it of heldItems) {
+    for (const ln of lineStmt.all(SITE_ID, it.menu_item_id)) {
+      decStmt.run(ln.qty * (it.qty || 1), ln.ingredient_id, SITE_ID);
+    }
+  }
+}
+
+/* ------------------------------ open API docs ------------------------------
+   Open API before an app store: every endpoint documented from a single
+   registry so docs can't drift from the code. Served as JSON for machines
+   and rendered HTML for humans. Stability note: this API is internal v0.1 —
+   third-party bearer scopes do not exist yet; staff PIN-login tokens only. */
+const API_DOCS = [
+  { method: 'GET', path: '/api/health', auth: 'none', summary: 'Liveness probe', params: '—' },
+  { method: 'POST', path: '/api/auth/login', auth: 'none', summary: 'PIN login → Bearer <redacted>', params: 'pin' },
+  { method: 'GET', path: '/api/config', auth: 'any staff', summary: 'Site config (tax, surcharge, service charge)', params: '—' },
+  { method: 'GET', path: '/api/menu', auth: 'any staff', summary: 'Full menu with categories, items, modifiers', params: '—' },
+  { method: 'GET', path: '/api/zones', auth: 'any staff', summary: 'Floor zones with tables', params: '—' },
+  { method: 'POST', path: '/api/checks', auth: 'server+', summary: 'Open a check on a table', params: 'table_id, guest_count, tab_name?' },
+  { method: 'GET', path: '/api/checks/open', auth: 'server+', summary: 'List open checks', params: '—' },
+  { method: 'GET', path: '/api/checks/:id', auth: 'server+', summary: 'Check with items, totals, payments', params: '—' },
+  { method: 'POST', path: '/api/checks/:id/items', auth: 'server+', summary: 'Add held item (server-side price lock)', params: 'menu_item_id, seat, qty, modifiers' },
+  { method: 'POST', path: '/api/checks/:id/send', auth: 'server+', summary: 'Fire held items → KDS, depletes inventory', params: '—' },
+  { method: 'POST', path: '/api/checks/:id/void-item', auth: 'server+ (+manager PIN approval)', summary: 'Void an item, audit-logged', params: 'item_id, manager_pin, reason' },
+  { method: 'POST', path: '/api/checks/:id/comp', auth: 'server+ (+manager PIN approval)', summary: 'Comp value on a check', params: 'amount_cents, manager_pin, reason' },
+  { method: 'POST', path: '/api/checks/:id/split', auth: 'server+', summary: 'Even / by-seat / by-item split', params: 'mode, ...' },
+  { method: 'POST', path: '/api/checks/:id/payments', auth: 'server+', summary: 'Take cash or card_demo payment', params: 'method, amount_cents, tip_cents, tendered_cents?' },
+  { method: 'POST', path: '/api/payments/:id/refund', auth: 'manager', summary: 'Refund a payment', params: 'amount_cents?' },
+  { method: 'POST', path: '/api/checks/:id/close', auth: 'server+', summary: 'Close a fully-paid check', params: '—' },
+  { method: 'GET', path: '/api/kds/tickets', auth: 'kitchen+', summary: 'KDS tickets by station', params: 'station?' },
+  { method: 'POST', path: '/api/kds/tickets/:id/bump', auth: 'kitchen+', summary: 'Bump a ticket', params: '—' },
+  { method: 'GET', path: '/api/kds/recall', auth: 'kitchen+', summary: 'Recall bumped tickets', params: '—' },
+  { method: 'GET', path: '/api/finance/payouts', auth: 'manager', summary: 'Honest payout reconciliation', params: 'date?' },
+  { method: 'GET', path: '/api/finance/shift', auth: 'manager', summary: 'Shift report: sales, tips, cash owed', params: 'date?, server_id?' },
+  { method: 'GET', path: '/api/finance/reports/:report', auth: 'manager', summary: 'sales|payouts|tax|labor|tips export', params: 'period|from&to, format=xlsx|csv|pdf|docx|json' },
+  { method: 'GET', path: '/api/finance/product-mix', auth: 'manager', summary: 'Best/worst sellers, void rates (NEW 3C)', params: 'from?, to?' },
+  { method: 'GET', path: '/api/manager/overview', auth: 'manager', summary: 'Today sales, open checks, covers', params: '—' },
+  { method: 'POST', path: '/api/clock/in', auth: 'any staff', summary: 'Clock in (own PIN)', params: 'pin' },
+  { method: 'POST', path: '/api/clock/out', auth: 'any staff', summary: 'Clock out with break attestation', params: '—' },
+  { method: 'POST', path: '/api/clock/break/start', auth: 'any staff', summary: 'Start meal/rest break', params: 'type' },
+  { method: 'POST', path: '/api/clock/break/end', auth: 'any staff', summary: 'End break', params: '—' },
+  { method: 'POST', path: '/api/clock/break/waive', auth: 'any staff', summary: 'Waive a break (CA rules)', params: 'type' },
+  { method: 'GET', path: '/api/clock/status', auth: 'any staff', summary: 'Current shift + break state', params: '—' },
+  { method: 'GET', path: '/api/admin/clock/shifts', auth: 'manager', summary: 'Shifts with CA premium math', params: 'date?' },
+  { method: 'POST', path: '/api/admin/clock/adjust', auth: 'manager', summary: 'Adjust a shift (PIN + audit)', params: 'shift_id, manager_pin, ...' },
+  { method: 'GET', path: '/api/admin/employees', auth: 'manager', summary: 'Employee records', params: '—' },
+  { method: 'POST', path: '/api/admin/employees', auth: 'manager', summary: 'Create employee (unique # + PIN)', params: 'name, role, pin, ...' },
+  { method: 'PUT', path: '/api/admin/employees/:id', auth: 'manager', summary: 'Update employee', params: '—' },
+  { method: 'DELETE', path: '/api/admin/employees/:id', auth: 'manager', summary: 'Deactivate employee', params: '—' },
+  { method: 'POST', path: '/api/reservations', auth: 'server+', summary: 'Book a reservation', params: 'customer_name, party_size, reserved_at, ...' },
+  { method: 'GET', path: '/api/reservations', auth: 'server+', summary: 'List reservations', params: 'date?' },
+  { method: 'PATCH', path: '/api/reservations/:id', auth: 'server+', summary: 'Update reservation', params: 'status, ...' },
+  { method: 'DELETE', path: '/api/reservations/:id', auth: 'server+', summary: 'Cancel reservation', params: '—' },
+  { method: 'POST', path: '/api/waitlist', auth: 'server+', summary: 'Add to waitlist — quote auto-computed from turn-time data; pre-order optional (NEW 3C)', params: 'customer_name, party_size, quoted_wait_min?, preorder_items?' },
+  { method: 'GET', path: '/api/waitlist', auth: 'server+', summary: 'Waiting/notified entries with pre-orders', params: '—' },
+  { method: 'GET', path: '/api/waitlist/quote', auth: 'server+', summary: 'Data-driven wait quote, no signup needed (NEW 3C)', params: 'party_size' },
+  { method: 'POST', path: '/api/waitlist/:id/notify', auth: 'server+', summary: 'Mark entry notified', params: '—' },
+  { method: 'POST', path: '/api/waitlist/:id/seat', auth: 'server+', summary: 'Seat entry → opens check, attaches pre-order as held items (NEW 3C)', params: 'table_id' },
+  { method: 'GET', path: '/api/floor/availability', auth: 'server+', summary: 'Table availability + suggestions', params: 'datetime?, party_size?, duration_min?' },
+  { method: 'POST', path: '/api/cash/drawer/open', auth: 'manager', summary: 'Open cash drawer with float (NEW 3C)', params: 'opening_float_cents' },
+  { method: 'GET', path: '/api/cash/drawer', auth: 'server+ (expected hidden from non-managers)', summary: 'Drawer state + events; blind count enforced by role (NEW 3C)', params: '—' },
+  { method: 'POST', path: '/api/cash/drawer/event', auth: 'server+', summary: 'Log paid_in / paid_out / no_sale / note (NEW 3C)', params: 'kind, amount_cents?, note?' },
+  { method: 'POST', path: '/api/cash/drawer/close', auth: 'manager', summary: 'Blind-count closeout → server-computed variance (NEW 3C)', params: 'counted_cents, notes?' },
+  { method: 'GET', path: '/api/cash/log', auth: 'manager', summary: 'Drawer history with expected/counted/variance (NEW 3C)', params: '—' },
+  { method: 'GET', path: '/api/admin/schedule', auth: 'manager', summary: 'Week of scheduled shifts (NEW 3C)', params: 'week?' },
+  { method: 'POST', path: '/api/admin/schedule', auth: 'manager', summary: 'Schedule a shift (NEW 3C)', params: 'employee_name|user_id, work_date, start_min, end_min, role?, rate_cents?' },
+  { method: 'PUT', path: '/api/admin/schedule/:id', auth: 'manager', summary: 'Edit a scheduled shift (NEW 3C)', params: '—' },
+  { method: 'DELETE', path: '/api/admin/schedule/:id', auth: 'manager', summary: 'Delete a scheduled shift (NEW 3C)', params: '—' },
+  { method: 'GET', path: '/api/admin/schedule/projection', auth: 'manager', summary: 'Projected labor cost vs projected sales per day (NEW 3C)', params: 'week?' },
+  { method: 'POST', path: '/api/admin/notes', auth: 'manager', summary: 'Create a staff note (NEW 3C)', params: 'title, body?, priority?, active_from?, active_to?' },
+  { method: 'GET', path: '/api/admin/notes', auth: 'manager', summary: 'List staff notes (NEW 3C)', params: '—' },
+  { method: 'PUT', path: '/api/admin/notes/:id', auth: 'manager', summary: 'Edit a staff note (NEW 3C)', params: '—' },
+  { method: 'DELETE', path: '/api/admin/notes/:id', auth: 'manager', summary: 'Delete a staff note (NEW 3C)', params: '—' },
+  { method: 'GET', path: '/api/login-summary', auth: 'any staff', summary: 'Notes + 86s + today reservations + waitlist depth at login (NEW 3C)', params: '—' },
+  { method: 'POST', path: '/api/reviews', auth: 'server+', summary: 'Post-payment 1–5★ review, once per check (NEW 3C)', params: 'check_id, rating, comment?, marketing_opt_in?' },
+  { method: 'GET', path: '/api/reviews', auth: 'manager', summary: 'Review summary + list (NEW 3C)', params: '—' },
+  { method: 'PUT', path: '/api/admin/settings', auth: 'manager', summary: 'Whitelisted site settings (review_prompt) (NEW 3C)', params: 'key, value' },
+  { method: 'GET', path: '/api/admin/multisite/overview', auth: 'manager', summary: 'Cross-site dashboard; one site failure never touches another (NEW 3C)', params: '—' },
+  { method: 'GET', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Ingredient records with low-stock flags (NEW 3C)', params: '—' },
+  { method: 'POST', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Create ingredient (NEW 3C)', params: 'name, unit?, on_hand?, par?, cost_per_unit_cents?' },
+  { method: 'PUT', path: '/api/admin/inventory/ingredients/:id', auth: 'manager', summary: 'Update ingredient (NEW 3C)', params: '—' },
+  { method: 'DELETE', path: '/api/admin/inventory/ingredients/:id', auth: 'manager', summary: 'Deactivate ingredient (NEW 3C)', params: '—' },
+  { method: 'GET', path: '/api/admin/inventory/recipes', auth: 'manager', summary: 'Recipe lines (NEW 3C)', params: 'menu_item_id?' },
+  { method: 'POST', path: '/api/admin/inventory/recipes', auth: 'manager', summary: 'Replace recipe lines for a menu item (NEW 3C)', params: 'menu_item_id, lines[]' },
+  { method: 'POST', path: '/api/admin/inventory/adjust', auth: 'manager', summary: 'Manual stock adjustment, audited (NEW 3C)', params: 'ingredient_id, delta, reason?' },
+  { method: 'GET', path: '/api/inventory/status', auth: 'manager', summary: 'Low-stock list + recent adjustments (NEW 3C)', params: '—' },
+  { method: 'GET', path: '/api/openapi.json', auth: 'manager', summary: 'Machine-readable endpoint registry (NEW 3C)', params: '—' },
+  { method: 'GET', path: '/api/docs', auth: 'manager', summary: 'Human-readable API documentation (NEW 3C)', params: '—' },
+];
+app.get('/api/openapi.json', managerOnly(), (req, res) => {
+  res.json({
+    name: 'expoline', version: '0.1.0', base_url: '/api',
+    auth: 'Bearer <token> from POST /api/auth/login (staff PIN). Roles: server, kitchen, manager. server+ = server or manager; kitchen+ = kitchen or manager.',
+    stability: 'internal v0.1 — endpoints may change; third-party OAuth scopes do not exist yet (staff tokens only).',
+    money: 'All money is integer cents. Dates are ISO-8601 strings; reporting buckets use the America/Los_Angeles site timezone.',
+    endpoints: API_DOCS,
+  });
+});
+app.get('/api/docs', managerOnly(), (req, res) => {
+  const escH = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const rows = API_DOCS.map((e) =>
+    `<tr><td><span class="m">${escH(e.method)}</span></td><td><code>${escH(e.path)}</code></td>` +
+    `<td>${escH(e.auth)}</td><td>${escH(e.summary)}</td><td class="mut">${escH(e.params)}</td></tr>`).join('');
+  res.type('html').send(
+    '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Expoline API docs</title><style>body{font-family:system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}' +
+    'table{border-collapse:collapse;width:100%;font-size:.85rem}th,td{border:1px solid #ddd;padding:.45rem .6rem;text-align:left;vertical-align:top}' +
+    'th{background:#f4f1ea}.m{font-weight:700;font-size:.75rem;background:#0f2a43;color:#fff;border-radius:4px;padding:.1rem .4rem}' +
+    'code{background:#f4f1ea;padding:.1rem .3rem;border-radius:3px}.mut{color:#666}.note{background:#fff8e6;border:1px solid #e8d9a0;padding:.8rem 1rem;border-radius:8px}</style></head><body>' +
+    '<h1>Expoline API documentation</h1><p class="note"><b>Internal v0.1.</b> Auth is <code>Authorization: Bearer &lt;token&gt;</code> from <code>POST /api/auth/login</code> (staff PIN; roles server/kitchen/manager). ' +
+    'All money is integer cents; dates are ISO-8601; reporting buckets use America/Los_Angeles. Third-party OAuth scopes do not exist yet — staff tokens only.</p>' +
+    '<p><a href="/api/openapi.json">openapi.json (machine-readable)</a></p>' +
+    '<table><thead><tr><th>Method</th><th>Path</th><th>Auth</th><th>What it does</th><th>Params</th></tr></thead><tbody>' + rows + '</tbody></table></body></html>'
+  );
 });
 
 /* --------------------------- 404 for unknown /api --------------------------- */

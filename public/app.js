@@ -36,7 +36,34 @@ const state = {
   route: null,
   kds: { station: 'expediter', tickets: [], ws: null, wsUp: false, recall: false, retryMs: 1000 },
   timers: { kds: null },
+  reviewNudged: {},    // checkId -> true (post-payment nudge shown once per check)
+  reviewPrompt: true,   // from /api/login-summary (manager can disable site-wide)
 };
+
+/** Phase 3C — staff notes pushed at POS login: 86s, specials (notes), and
+ *  today's reservations surface in one dismissible modal. Silent when empty. */
+async function showLoginSummary() {
+  let s = null;
+  try { s = await api('/api/login-summary'); } catch (e) { return; }
+  state.reviewPrompt = !!s.review_prompt;
+  const hasNotes = (s.notes || []).length > 0;
+  const has86 = (s.eighty_six || []).length > 0;
+  const hasResv = (s.reservations_today || {}).count > 0;
+  const hasWl = (s.waitlist_waiting || 0) > 0;
+  if (!hasNotes && !has86 && !hasResv && !hasWl) return;
+  const bd = openModal('<h2>Shift notes</h2>' +
+    (hasNotes ? '<h3>Notes</h3>' + s.notes.map((n) =>
+      '<div class="note-row"><span class="pill ' + esc(n.priority) + '">' + esc(n.priority) + '</span> <b>' + esc(n.title) + '</b>' +
+      (n.body ? '<div class="muted small">' + esc(n.body) + '</div>' : '') + '</div>').join('') : '') +
+    (has86 ? '<h3>86\u2019d right now</h3><p>' + s.eighty_six.map((x) => '<span class="pill low">' + esc(x) + '</span>').join(' ') + '</p>' : '') +
+    (hasResv ? '<h3>Reservations today (' + s.reservations_today.count + ')</h3>' +
+      (s.reservations_today.upcoming || []).map((r) =>
+        '<div class="small">' + esc(r.customer_name) + ' · party of ' + r.party_size + ' · ' +
+        new Date(r.reserved_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + '</div>').join('') : '') +
+    (hasWl ? '<h3>Waitlist</h3><p class="small">' + s.waitlist_waiting + ' parties waiting</p>' : '') +
+    '<div class="modal-actions"><button class="btn btn-primary" data-x="go">Got it</button></div>');
+  bd.querySelector('[data-x="go"]').onclick = closeModal;
+}
 
 const API = location.origin; // same origin, port 4317
 
@@ -447,21 +474,6 @@ async function flushOutboxLegacy(ops) {
             }
           } else if (o.op === 'send') {
             await rawApi('/api/checks/' + cid + '/send', 'POST');
-          } else if (o.op === 'edit_item') {
-            const iid = idmap[p.item_id] || p.item_id;
-            const ebody = { qty: p.qty, modifiers: p.modifiers };
-            if (p.approval_nonce) { ebody.manager_pin_hash = p.manager_pin_hash; ebody.approval_nonce = p.approval_nonce; }
-            try {
-              await rawApi('/api/checks/' + cid + '/items/' + iid, 'PATCH', ebody);
-            } catch (ee) {
-              // Approval failure (bad/expired PIN) is not a session problem —
-              // keep the op queued and tell the user instead of bouncing to login.
-              if (ee instanceof ApiError && ee.status === 403) {
-                toast('A queued edit needs a valid manager PIN — re-edit it from the check', 'err');
-                failed = true; break;
-              }
-              throw ee;
-            }
           } else if (o.op === 'payment') {
             await rawApi('/api/checks/' + cid + '/payments', 'POST',
               { method: p.method, amount_cents: p.amount_cents, tip_cents: p.tip_cents || 0, tendered_cents: p.tendered_cents, brand: p.brand, last4: p.last4 });
@@ -552,6 +564,7 @@ function renderHeader() {
   const links = [];
   if (role === 'server' || role === 'manager') links.push(['#/floor', 'Floor']);
   if (role === 'server' || role === 'manager') links.push(['#/reservations', 'Reservations']);
+  if (role === 'server' || role === 'manager') links.push(['#/waitlist', 'Waitlist']);
   if (role === 'server' || role === 'manager') links.push(['#/giftcards', 'Gift Cards']);
   if (role === 'server' || role === 'manager') links.push(['#/loyalty', 'Loyalty']);
   if (role === 'kitchen' || role === 'manager') links.push(['#/kds', 'KDS']);
@@ -673,15 +686,6 @@ function applyOps(check, ops, idmap) {
       const iid = String((idmap && (idmap[p.item_id] || p.item_id)) || p.item_id);
       check.items = check.items.filter((i) => String(i.id) !== iid);
       estimated = true;
-    } else if (o.op === 'edit_item') {
-      const iid = String((idmap && (idmap[p.item_id] || p.item_id)) || p.item_id);
-      const it = check.items.find((i) => String(i.temp_id || i.id) === iid);
-      if (it) {
-        if (p.qty != null) it.qty = p.qty;
-        if (p.modifiers !== undefined) it.modifiers = p.modifiers;
-        it.pending = true;
-      }
-      estimated = true;
     } else if (o.op === 'send') {
       check.items.forEach((i) => { if (i.state === 'held') i.state = 'sent'; });
     } else if (o.op === 'payment') {
@@ -778,6 +782,7 @@ async function renderRoute(soft) {
     if (!state.user) { location.hash = '#/login'; return; }
     if (r.view === 'floor') return renderFloor(app);
     if (r.view === 'reservations') return renderReservations(app);
+    if (r.view === 'waitlist') return renderWaitlist(app, api);
     if (r.view === 'giftcards') return renderGiftCards(app, api);
     if (r.view === 'loyalty') return renderLoyalty(app, api);
     if (r.view === 'order') return renderOrder(app, r.param);
@@ -794,6 +799,14 @@ async function renderRoute(soft) {
       if (sub === 'timeclock') return renderTimeClock(app);
       if (sub === 'employees') return renderEmployees(app);
       if (sub === 'settings') return renderSvcChargeSettings(app);
+      if (sub === 'cash') return renderCashDrawer(app, api);
+      if (sub === 'schedule') return renderSchedule(app, api);
+      if (sub === 'analytics') return renderProductMix(app, api);
+      if (sub === 'notes') return renderStaffNotes(app, api);
+      if (sub === 'reviews') return renderReviews(app, api);
+      if (sub === 'multisite') return renderMultisite(app, api);
+      if (sub === 'inventory') return renderInventory(app, api);
+      if (sub === 'apidocs') return renderApiDocs(app, api);
       return renderManager(app);
     }
     app.innerHTML = '<div class="empty">Unknown view.</div>';
@@ -861,6 +874,8 @@ function renderLogin(app) {
       location.hash = dest;
       // flush anything queued while we were logged out
       setTimeout(() => flushOutbox(), 800);
+      // phase 3C: staff notes pushed at login (86s, specials, reservations)
+      setTimeout(() => showLoginSummary(), 600);
     } catch (e) {
       if (e instanceof OfflineError) err('Offline — cannot log in without a connection');
       else err(e.message || 'Login failed');
@@ -1325,7 +1340,7 @@ async function renderOrder(app, checkId) {
           : (ref.state === 'sent'
             ? '<button class="icon-btn mgr-void" data-voidmgr="' + esc(String(ref.id)) + '" data-nm="' + esc(ref.name) + '" aria-label="Void sent item — manager approval required" title="Void (manager approval)">✕</button>'
             : '');
-        return '<div class="cart-line" data-eline="' + kind + ':' + esc(String(ref.temp_id || ref.id)) + '" title="Tap to edit item"><div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
+        return '<div class="cart-line"><div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
           (mods ? '<span class="mods">' + mods + '</span>' : '') + '</div>' + pill +
           '<span class="pr">' + fmt(lineTotal) + '</span>' + voidBtn + '</div>';
       }).join('') + '</div>').join('');
@@ -1343,18 +1358,6 @@ async function renderOrder(app, checkId) {
     });
     /* Sent items: same manager-approval modal. */
     $$('[data-voidmgr]', cartBody).forEach((b) => b.onclick = () => openVoidApproval(b.dataset.voidmgr, b.dataset.nm));
-    /* Tap a line (anywhere except the ✕) to edit qty / modifiers. */
-    $$('[data-eline]', cartBody).forEach((el) => {
-      el.onclick = (e) => {
-        if (e.target.closest('[data-void],[data-voidmgr]')) return;
-        const sep = el.dataset.eline.indexOf(':');
-        const kind = el.dataset.eline.slice(0, sep), id = el.dataset.eline.slice(sep + 1);
-        const ref = kind === 'staged'
-          ? staged.find((s) => String(s.temp_id) === id)
-          : (check.items || []).find((i) => String(i.temp_id || i.id) === id);
-        if (ref) openEditItemModal(kind, ref);
-      };
-    });
   }
 
   /* Manager-approved void (held or sent): the manager enters their PIN at
@@ -1411,94 +1414,6 @@ async function renderOrder(app, checkId) {
         await api('/api/checks/' + realId(cid) + '/void-item', 'POST', { item_id: Number(itemId), manager_pin: managerPin, reason });
         toast('Item voided — manager approved', 'ok');
       }
-    } catch (e) { handleApiError(e); }
-  }
-
-  /* Edit an item already on the order: tap its line to change qty and/or
-     modifiers. Staged items edit locally; held items PATCH directly; sent
-     items need a manager PIN (kitchen already fired) and are audit-logged. */
-  function openEditItemModal(kind, ref) {
-    const isStaged = kind === 'staged';
-    const isSent = !isStaged && ref.state !== 'held';
-    let menuItem = null;
-    for (const c of (menu || [])) {
-      const f = (c.items || []).find((x) => String(x.id) === String(ref.menu_item_id));
-      if (f) { menuItem = f; break; }
-    }
-    const mods = menuItem ? itemModifiers(menuItem) : [];
-    const current = {};
-    (ref.modifiers || []).forEach((m) => { current[m.name] = true; });
-    let qty = ref.qty || 1;
-    const bd = openModal(
-      '<h2>Edit item</h2>' +
-      '<p class="muted"><b>' + esc(ref.name) + '</b>' + (isSent ? ' · <span class="pill sent">sent to kitchen</span>' : '') + '</p>' +
-      (isSent ? '<p class="muted small">This item already fired to the kitchen — a manager PIN is required and the change is audit-logged.</p>' : '') +
-      '<div class="field"><label>Quantity</label><div class="stepper"><button data-q="dec">−</button><span class="val" id="e-qty">' + qty + '</span><button data-q="inc">+</button></div></div>' +
-      (mods.length
-        ? '<h3>Modifiers</h3><div id="emod-list">' +
-          mods.map((m, i) => '<label class="mod-row"><input type="checkbox" data-mi="' + i + '"' + (current[m.name] ? ' checked' : '') + '>' +
-            '<span class="mn">' + esc(m.name) + '</span><span class="mp">+' + fmt(m.price_delta_cents) + '</span></label>').join('') + '</div>'
-        : ((ref.modifiers || []).length
-          ? '<p class="muted small">Modifiers: ' + esc(ref.modifiers.map((m) => m.name).join(', ')) + ' <span class="muted">(menu unavailable offline — qty only)</span></p>'
-          : '')) +
-      (isSent ? '<label class="fld">Manager PIN <input id="em-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px"></label>' : '') +
-      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
-      '<button class="btn btn-primary" data-x="save">Save changes</button></div>');
-    $('[data-q="dec"]', bd).onclick = () => { qty = Math.max(1, qty - 1); $('#e-qty', bd).textContent = qty; };
-    $('[data-q="inc"]', bd).onclick = () => { qty = Math.min(24, qty + 1); $('#e-qty', bd).textContent = qty; };
-    $('[data-x="cancel"]', bd).onclick = closeModal;
-    $('[data-x="save"]', bd).onclick = async () => {
-      const picked = mods.length
-        ? $$('#emod-list input:checked', bd).map((c) => mods[Number(c.dataset.mi)]).map((m) => ({ name: m.name, price_delta_cents: m.price_delta_cents }))
-        : (ref.modifiers || []);
-      let managerPin = null;
-      if (isSent) {
-        managerPin = $('#em-pin', bd).value.trim();
-        if (!/^\d{4}$/.test(managerPin)) { toast("Enter the manager's 4-digit PIN", 'err'); return; }
-      }
-      closeModal();
-      await saveItemEdit(kind, ref, qty, picked, managerPin);
-    };
-  }
-
-  async function saveItemEdit(kind, ref, qty, modifiers, managerPin) {
-    try {
-      if (kind === 'staged') {
-        const s = staged.find((x) => x.temp_id === ref.temp_id);
-        if (s) { s.qty = qty; s.modifiers = modifiers; saveStaged(checkId, staged); drawCart(); toast('Item updated'); }
-        return;
-      }
-      const refKey = String(ref.temp_id || ref.id);
-      if (isOffline()) {
-        // If the item is itself a pending offline add, fold the edit into that op.
-        const ops = await Outbox.forCheck(realId(checkId));
-        let absorbed = false;
-        for (const o of ops) {
-          if (o.op === 'add_items') {
-            const it = (o.payload.items || []).find((x) => String(x.temp_id) === refKey);
-            if (it) { it.qty = qty; it.modifiers = modifiers; await Outbox.update(o); absorbed = true; break; }
-          }
-        }
-        if (!absorbed) {
-          const payload = { check_id: realId(checkId), item_id: ref.id, qty, modifiers };
-          if (managerPin) {
-            if (!window.crypto || !crypto.subtle || !crypto.getRandomValues) {
-              toast('Offline edit of a sent item needs a secure context — reconnect to edit', 'err');
-              return;
-            }
-            payload.manager_pin_hash = await sha256Hex(managerPin);
-            payload.approval_nonce = randomNonce();
-          }
-          await Outbox.enqueue('edit_item', payload);
-        }
-        toast('Edit queued — syncs on reconnect', 'ok');
-      } else {
-        const body = { qty, modifiers };
-        if (managerPin) body.manager_pin = managerPin;
-        await api('/api/checks/' + realId(checkId) + '/items/' + ref.id, 'PATCH', body);
-        toast('Item updated' + (managerPin ? ' — manager approved' : ''), 'ok');
-      }
-      renderRoute(true);
     } catch (e) { handleApiError(e); }
   }
 
@@ -1825,7 +1740,8 @@ async function renderPay(app, checkId) {
 
     '<div class="card"><button class="btn btn-green btn-big btn-block" id="close-check"' + (t.balance > 0 ? ' disabled' : '') + '>' +
     (t.balance > 0 ? 'Balance remaining — cannot close' : 'Close check ✓') + '</button>' +
-    (t.balance > 0 ? '' : '<p class="small muted" style="text-align:center;margin-top:8px">Balance is $0.00 — ready to close.</p>') + '</div>';
+    (t.balance > 0 ? '' : '<p class="small muted" style="text-align:center;margin-top:8px">Balance is $0.00 — ready to close.</p>') + '</div>' +
+    '<div id="review-nudge-slot"></div>';
 
   function paymentLabel(p) {
     if (p.method === 'cash') return 'Cash' + (p.tendered_cents ? ' (tendered ' + fmt(p.tendered_cents) + ')' : '');
@@ -2051,8 +1967,7 @@ async function renderPay(app, checkId) {
   };
 
   const closeBtn = $('#close-check');
-  if (closeBtn && !closeBtn.disabled) closeBtn.onclick = () => {
-    confirmDialog('Close check', 'Close this check? The table will become available.', 'Close check', async () => {
+  if (closeBtn && !closeBtn.disabled) closeBtn.onclick = () => {    confirmDialog('Close check', 'Close this check? The table will become available.', 'Close check', async () => {
       try {
         if (isOffline()) {
           if (String(checkId).startsWith('tmp-')) {
@@ -2070,6 +1985,13 @@ async function renderPay(app, checkId) {
       location.hash = '#/floor';
     });
   };
+
+  /* Phase 3C — post-payment review nudge: guest-optional, once per check,
+     dismissible, never blocks payment. */
+  if (t.balance <= 0 && state.reviewPrompt && !state.reviewNudged[checkId] && typeof reviewNudge === 'function') {
+    state.reviewNudged[checkId] = true;
+    try { reviewNudge($('#review-nudge-slot'), api, realId(checkId)); } catch (e) { /* non-fatal */ }
+  }
 }
 
 /* ============================================================
@@ -2133,6 +2055,10 @@ function mgrNav(active) {
      ['#/manager/shift', 'Shift report', active === 'shift'], ['#/manager/menu', 'Menu', active === 'menu'],
      ['#/manager/floorplan', 'Floor plan', active === 'floorplan'], ['#/manager/timeclock', 'Time clock', active === 'timeclock'],
      ['#/manager/employees', 'Employees', active === 'employees'],
+     ['#/manager/cash', 'Cash drawer', active === 'cash'], ['#/manager/schedule', 'Schedule', active === 'schedule'],
+     ['#/manager/analytics', 'Product mix', active === 'analytics'], ['#/manager/notes', 'Staff notes', active === 'notes'],
+     ['#/manager/reviews', 'Reviews', active === 'reviews'], ['#/manager/inventory', 'Inventory', active === 'inventory'],
+     ['#/manager/multisite', 'Locations', active === 'multisite'], ['#/manager/apidocs', 'API docs', active === 'apidocs'],
      ['#/manager/settings', 'Settings', active === 'settings']]
       .map(([h, l, a]) => '<a class="tab' + (a ? ' active' : '') + '" href="' + h + '">' + l + '</a>').join('') + '</div>';
 }
@@ -2174,6 +2100,13 @@ async function renderSvcChargeSettings(app) {
     '</div>' +
     '<p class="muted small">The percentage applies to the check subtotal for parties at or above the threshold. Set the threshold to <b>0</b> to disable the charge entirely. Sales tax is computed on subtotal + surcharge + service charge − comps.</p>' +
     '<button class="btn btn-primary" id="sc-save">Save changes</button></div>' +
+    '<div class="card mt"><h2>Cash drawer closeout</h2>' +
+    '<p class="muted small">Who may perform the blind drawer close. <b>Manager-only</b> is the safe default: only a manager enters the counted cash while the server computes expected vs. counted. Relaxing to <b>Servers too</b> lets servers close the drawer themselves (the count stays blind — they never see expected).</p>' +
+    '<div class="form-grid">' +
+    '<label>Who may close the drawer<select id="dr-role"><option value="manager">Manager-only</option><option value="server">Servers too</option></select></label>' +
+    '<label>Manager PIN<input type="password" id="dr-pin" inputmode="numeric" maxlength="8" placeholder="••••" style="max-width:140px"></label>' +
+    '</div>' +
+    '<button class="btn btn-primary" id="dr-save">Save drawer policy</button></div>' +
     '<div class="card mt"><h3>Change history</h3><p class="muted small">Every change is audit-logged with before/after values.</p>' +
     '<div class="t-scroll"><table class="t-table" id="sc-audit">' +
     '<thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Detail</th></tr></thead>' +
@@ -2225,7 +2158,27 @@ async function renderSvcChargeSettings(app) {
       await load();
     } catch (e) { handleApiError(e); }
   };
+
+  $('#dr-save').onclick = async () => {
+    const value = $('#dr-role').value;
+    const pin = $('#dr-pin').value;
+    if (!pin) { toast('Enter your manager PIN to save', 'err'); return; }
+    try {
+      await api('/api/admin/drawer/config', 'PUT', { value, manager_pin: pin });
+      $('#dr-pin').value = '';
+      toast('Drawer close policy updated', 'ok');
+      await load();
+    } catch (e) { handleApiError(e); }
+  };
+
+  const loadDrawer = async () => {
+    try {
+      const cfg = await api('/api/admin/drawer/config');
+      $('#dr-role').value = cfg.drawer_close_role === 'server' ? 'server' : 'manager';
+    } catch (e) { /* leave default */ }
+  };
   await load();
+  await loadDrawer();
 }
 
 /* ============================================================
