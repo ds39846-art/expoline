@@ -265,7 +265,7 @@ require('./routes/online').migrate(db);
 })();
 
 /* --------------------------------- config --------------------------------- */
-const PORT = parseInt(process.env.EXPOLINE_PORT || '4317', 10);
+const PORT = parseInt(process.env.EXPOLINE_PORT || process.env.PORT || '4317', 10);
 const SITE_TZ = 'America/Los_Angeles'; // Bali Hai pilot site timezone for date bucketing
 const SITE_ID = (() => {
   const r = db.prepare('SELECT id FROM sites WHERE slug = ?').get(SITE_SLUG)
