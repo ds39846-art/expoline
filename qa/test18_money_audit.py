@@ -103,6 +103,13 @@ ALLOW = [
     ("server.js", "Number(v).toFixed(2)", "display"),
     ("routes/loyalty.js", "(discount / 100).toFixed(2)", "display"),
     ("routes/loyalty.js", "(t0.total / 100).toFixed(2)", "display"),
+    # report percentages (labor %, gross share %, void rate %) — display-only,
+    # never fed back into money math; underlying values stay integer cents
+    ("server.js", "projected_labor_pct:", "report pct display"),
+    ("server.js", "gross_share_pct:", "report pct display"),
+    ("server.js", "void_rate_pct:", "report pct display"),
+    # guest-review star-rating average (1-5 scale, not money) — display-only
+    ("server.js", "average: rows.length ? +(sum / rows.length).toFixed(2)", "rating avg display"),
 ]
 violations = []
 for fn in ["server.js"] + [f"routes/{r}" for r in ("giftcards.js", "kiosk.js", "loyalty.js", "online.js")]:
