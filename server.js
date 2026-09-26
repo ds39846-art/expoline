@@ -317,6 +317,65 @@ require('./routes/parity_kds_pay').migrate(db);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_waitlist_site_status ON waitlist(site_id, status, created_at)`);
 })();
 
+/* OpenTable integration (phase 6): sync-layer tables + source column.
+   Runs on every boot; guarded via CREATE TABLE IF NOT EXISTS / PRAGMA. */
+(() => {
+  db.exec(`CREATE TABLE IF NOT EXISTS ot_links (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    opentable_rid TEXT,
+    environment TEXT DEFAULT 'sandbox',
+    status TEXT DEFAULT 'active',
+    frn_online INTEGER DEFAULT 1,
+    created_at TEXT,
+    updated_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS ot_reservation_map (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    reservation_uuid TEXT UNIQUE,
+    opentable_rid TEXT,
+    confirmation_number TEXT,
+    source TEXT,
+    sync_sequence INTEGER DEFAULT 0,
+    ot_state TEXT,
+    details_json TEXT,
+    last_request_id TEXT,
+    idempotency_response TEXT,
+    last_sync_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ot_map_conf ON ot_reservation_map(site_id, opentable_rid, confirmation_number)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS ot_locks (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    lock_id TEXT UNIQUE,
+    table_id INTEGER,
+    party_size INTEGER,
+    reserved_at TEXT,
+    duration_min INTEGER DEFAULT 90,
+    expires_at TEXT,
+    status TEXT DEFAULT 'held',
+    request_id TEXT,
+    created_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ot_locks_table ON ot_locks(site_id, table_id, status)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS ot_outbound (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    opentable_rid TEXT,
+    action TEXT,
+    confirmation_number TEXT,
+    payload_json TEXT,
+    request_id TEXT,
+    delivered TEXT DEFAULT 'sandbox',
+    response_json TEXT,
+    created_at TEXT
+  )`);
+  const rcols = new Set(db.prepare('PRAGMA table_info(reservations)').all().map((c) => c.name));
+  if (!rcols.has('source')) db.exec("ALTER TABLE reservations ADD COLUMN source TEXT DEFAULT 'native'");
+  db.exec("UPDATE reservations SET source = 'native' WHERE source IS NULL OR source = ''");
+})();
+
 /* Phase 3C — competitor parity: back office. Runs on every boot; guarded via
    CREATE TABLE IF NOT EXISTS / PRAGMA column checks. All money stays in
    integer cents; quantities (inventory) are REALs. */
@@ -1012,6 +1071,9 @@ function authMiddleware(req, res, next) {
       || req.path === '/menuboards') return next();
   // Public LAN brain discovery (devices find the brain before auth).
   if (req.path === '/brain/status') return next();
+  // OpenTable partner callbacks — authenticated via X-Partner-Key (otCallbackAuth),
+  // not staff Bearer tokens. The per-route otCallbackAuth middleware enforces it.
+  if (req.path.startsWith('/opentable/')) return next();
   const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
   const sess = m ? tokens.get(m[1]) : null;
   if (!sess) return res.status(401).json({ error: 'Unauthorized: valid Bearer token required' });
@@ -4722,11 +4784,13 @@ function siteDayBounds(dateStr) {
 
 function resvView(r) {
   const t = r.table_id != null ? tableById(r.table_id) : null;
+  const om = r ? otMapForReservation(r.id) : null;
   return {
     id: r.id, uuid: r.uuid, customer_name: r.customer_name, phone: r.phone,
     party_size: r.party_size, reserved_at: r.reserved_at, duration_min: r.duration_min,
     table_id: r.table_id, table_label: t ? t.label : null, status: r.status,
-    notes: r.notes, created_by: r.created_by, created_at: r.created_at,
+    notes: r.notes, source: r.source || 'native', created_by: r.created_by, created_at: r.created_at,
+    ot_confirmation_number: om ? om.confirmation_number : null,
     no_show_count: noShowCount(r.phone),
   };
 }
@@ -4751,6 +4815,9 @@ app.post('/api/reservations', serverPlus(), (req, res) => {
     tableId = t.id;
     const clash = resvOverlap(tableId, startMs, startMs + duration * 60000, null);
     if (clash) return res.status(409).json({ error: 'Table is already booked for that time', conflicting_reservation_id: clash.id });
+    // OpenTable integration: an active OT hold blocks native booking on the same slot.
+    const otClash = otLockClash(tableId, startMs, startMs + duration * 60000, null);
+    if (otClash) return res.status(409).json({ error: 'Table is held by an OpenTable party for that time', ot_lock_id: otClash.lock_id });
   }
   const phone = cleanPhone(b.phone);
   const r = db.prepare(
@@ -4830,6 +4897,9 @@ app.patch('/api/reservations/:id', serverPlus(), (req, res) => {
     auditApproval(req, newStatus === 'no_show' ? 'resv_no_show' : 'resv_cancel',
       {}, { reservation_id: r.id, before, after: { status: newStatus, table_id: tableId } });
   }
+  // OpenTable integration: native status changes sync back to OpenTable.
+  const om2 = otMapForReservation(r.id);
+  if (om2 && newStatus !== before.status) otNotifyStatus(resvById(r.id), om2);
   broadcastResvUpdated();
   const out = resvView(resvById(r.id));
   if (checkId) out.check_id = checkId;
@@ -4844,9 +4914,507 @@ app.delete('/api/reservations/:id', managerOnly(), (req, res) => {
     return res.status(400).json({ error: `Reservation is already ${r.status}` });
   db.prepare("UPDATE reservations SET status = 'cancelled' WHERE id = ?").run(r.id);
   auditApproval(req, 'resv_cancel', {}, { reservation_id: r.id, before: { status: r.status }, after: { status: 'cancelled' } });
+  const om = otMapForReservation(r.id); // native → OpenTable status update
+  if (om) otNotifyStatus(resvById(r.id), om);
   broadcastResvUpdated();
   res.json({ id: r.id, status: 'cancelled' });
 });
+
+/* ------------------------ OpenTable integration ------------------------
+   Locked rule: integrate OpenTable, don't replace it.
+   The production API is partner-gated (see build/opentable-integration-brief.md).
+   OPENTABLE_MODE=sandbox (the default) runs the ENTIRE flow against a local
+   stub: inbound callbacks work over HTTP exactly like the real lock → make →
+   update → cancel partner callbacks, and outbound posts are captured durably in
+   ot_outbound with delivered='sandbox'. OPENTABLE_MODE=production is a pure
+   config flip: credentials come ONLY from the environment
+   (OPENTABLE_CLIENT_ID / OPENTABLE_CLIENT_SECRET / OPENTABLE_PARTNER_KEY),
+   never from code. Without credentials, production-mode endpoints fail closed
+   (503) — they never pretend to work. */
+const OT_MODE = (process.env.OPENTABLE_MODE || 'sandbox').toLowerCase() === 'production' ? 'production' : 'sandbox';
+const OT_API_BASE = process.env.OPENTABLE_API_BASE || null; // portal-issued base URL; null until provisioned
+const OT_PARTNER_KEY = process.env.OPENTABLE_PARTNER_KEY || 'sandbox-partner-key';
+const OT_LOCK_TTL_SEC = Math.max(30, parseInt(process.env.OPENTABLE_LOCK_TTL_SEC || '180', 10) || 180);
+
+const OT_STATE_TO_NATIVE = {
+  BOOKED: 'booked', SEATED: 'seated', ASSUMED_SEATED: 'seated',
+  CANCELED: 'cancelled', NOSHOW: 'no_show', DONE: 'completed', PENDING: 'booked',
+};
+const NATIVE_TO_OT_STATE = { booked: 'BOOKED', seated: 'SEATED', cancelled: 'CANCELED', no_show: 'NOSHOW', completed: 'DONE' };
+
+function otLink() {
+  return db.prepare('SELECT * FROM ot_links WHERE site_id = ? ORDER BY id DESC LIMIT 1').get(SITE_ID) || null;
+}
+
+/** Production guard: fail closed + honestly when credentials are missing. */
+function otProdGuard(req, res, next) {
+  if (OT_MODE === 'sandbox') return next();
+  if (process.env.OPENTABLE_CLIENT_ID && process.env.OPENTABLE_CLIENT_SECRET) return next();
+  return res.status(503).json({
+    error: 'OPENTABLE_MODE=production requires OPENTABLE_CLIENT_ID and OPENTABLE_CLIENT_SECRET in the environment. Production integration is not functional without partner credentials (see opentable-integration-brief.md).',
+  });
+}
+
+/** Partner-callback auth: shared partner key header. In production the value
+    is the portal-issued key (env); the exact scheme is a config detail. */
+function otCallbackAuth(req, res, next) {
+  const key = req.get('X-Partner-Key') || req.get('X-OT-Partner-Key');
+  if (!key || key !== OT_PARTNER_KEY)
+    return res.status(401).json({ error: 'Invalid or missing partner key' });
+  next();
+}
+
+/** Live OpenTable hold on a table overlapping [startMs, endMs), or null. */
+function otLockClash(tableId, startMs, endMs, excludeLockId) {
+  return db.prepare(
+    `SELECT * FROM ot_locks
+     WHERE site_id = ? AND table_id = ? AND status = 'held'
+       AND lock_id != COALESCE(?, '')
+       AND strftime('%s', reserved_at) < strftime('%s', ?)
+       AND strftime('%s', reserved_at, '+' || duration_min || ' minutes') > strftime('%s', ?)
+       AND expires_at > ?
+     LIMIT 1`
+  ).get(SITE_ID, tableId, excludeLockId ?? null, new Date(endMs).toISOString(), new Date(startMs).toISOString(), nowIso()) || null;
+}
+
+/** Best-fit free table: smallest seats >= party_size with no native overlap
+    and no live OT lock. Returns the table row or null. */
+function otBestFitTable(partySize, startMs, endMs) {
+  const tables = db.prepare(
+    'SELECT id, label, seats, zone_id, x, y, shape FROM tables WHERE site_id = ? AND seats >= ? ORDER BY seats ASC, id ASC'
+  ).all(SITE_ID, partySize);
+  for (const t of tables) {
+    if (resvOverlap(t.id, startMs, endMs, null)) continue;
+    if (otLockClash(t.id, startMs, endMs, null)) continue;
+    return t;
+  }
+  return null;
+}
+
+/** Map an OpenTable party payload onto the native reservation shape. */
+function otMapPayload(b, conf) {
+  const name = cleanLabel(b.name || b.party_name || b.customer_name || b.guest_name);
+  const phone = cleanPhone(b.phone || b.guest_phone);
+  const prefs = cleanLabel(b.seating_preferences || b.preferences);
+  const dinerNotes = cleanLabel(b.notes || b.diner_notes || b.special_requests);
+  const parts = [`[OpenTable #${conf}]`];
+  if (dinerNotes) parts.push(dinerNotes);
+  if (prefs) parts.push('Seating: ' + prefs);
+  if (b.email) parts.push('email: ' + cleanLabel(b.email));
+  return {
+    customer_name: name,
+    phone,
+    party_size: b.party_size,
+    reserved_at: b.reserved_at || b.date_time || b.dateTime,
+    duration_min: b.duration_min == null ? 90 : b.duration_min,
+    notes: parts.join(' · '),
+  };
+}
+
+/** Outbound reservation update (Expoline → OpenTable). Sandbox: captured
+    durably in ot_outbound with delivered='sandbox' — echo-backs and
+    status updates are fully testable today. Production: queued durably with
+    delivered='production-queued' until the portal-issued endpoint mapping is
+    provisioned (no URLs are fabricated here). */
+function otOutbound(action, confirmationNumber, payload) {
+  const link = otLink();
+  const requestId = crypto.randomUUID();
+  const row = { request_id: requestId };
+  if (OT_MODE === 'sandbox') {
+    db.prepare(
+      `INSERT INTO ot_outbound (site_id, opentable_rid, action, confirmation_number, payload_json, request_id, delivered, response_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'sandbox', ?, ?)`
+    ).run(SITE_ID, link ? link.opentable_rid : null, action, confirmationNumber,
+      JSON.stringify(payload), requestId, JSON.stringify({ sandbox: true, delivered: true }), nowIso());
+    return { ...row, delivered: 'sandbox' };
+  }
+  db.prepare(
+    `INSERT INTO ot_outbound (site_id, opentable_rid, action, confirmation_number, payload_json, request_id, delivered, response_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'production-queued', ?, ?)`
+  ).run(SITE_ID, link ? link.opentable_rid : null, action, confirmationNumber,
+    JSON.stringify(payload), requestId,
+    JSON.stringify({ queued: true, reason: 'portal endpoint mapping not yet provisioned' }), nowIso());
+  return { ...row, delivered: 'production-queued' };
+}
+
+/** Post a status update for an OT-linked reservation (native → OT direction). */
+function otNotifyStatus(resv, mapRow) {
+  const link = otLink();
+  if (!link || !mapRow) return null;
+  const otState = NATIVE_TO_OT_STATE[resv.status] || resv.status;
+  const out = otOutbound('reservation_update', mapRow.confirmation_number, {
+    confirmation_number: mapRow.confirmation_number,
+    state: otState,
+    party_size: resv.party_size,
+    reserved_at: resv.reserved_at,
+    table_id: resv.table_id,
+  });
+  db.prepare('UPDATE ot_reservation_map SET ot_state = ?, sync_sequence = sync_sequence + 1, last_sync_at = ? WHERE id = ?')
+    .run(otState, nowIso(), mapRow.id);
+  return out;
+}
+
+function otMapForReservation(resvId) {
+  const r = resvById(resvId);
+  if (!r) return null;
+  return db.prepare('SELECT * FROM ot_reservation_map WHERE reservation_uuid = ? AND site_id = ?').get(r.uuid, SITE_ID) || null;
+}
+
+function siteLocalParts(utcMs) {
+  const off = tzOffsetMs(SITE_TZ, utcMs);
+  const d = new Date(utcMs + off);
+  return { h: d.getUTCHours(), m: d.getUTCMinutes() };
+}
+
+/* ---- admin: link / status / unlink ---- */
+
+app.post('/api/admin/opentable/link', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const rid = cleanLabel(b.opentable_rid || b.rid);
+  if (!rid) return res.status(400).json({ error: 'opentable_rid is required' });
+  const env = b.environment === 'production' ? 'production' : 'sandbox';
+  const existing = otLink();
+  if (existing) {
+    db.prepare('UPDATE ot_links SET opentable_rid = ?, environment = ?, status = ?, updated_at = ? WHERE id = ?')
+      .run(rid, env, 'active', nowIso(), existing.id);
+  } else {
+    db.prepare(`INSERT INTO ot_links (site_id, opentable_rid, environment, status, frn_online, created_at, updated_at)
+                VALUES (?, ?, ?, 'active', 1, ?, ?)`)
+      .run(SITE_ID, rid, env, nowIso(), nowIso());
+  }
+  const link = otLink();
+  const creds = !!(process.env.OPENTABLE_CLIENT_ID && process.env.OPENTABLE_CLIENT_SECRET);
+  res.json({
+    linked: true, opentable_rid: link.opentable_rid, environment: link.environment,
+    mode: OT_MODE, credentials_present: creds,
+    note: OT_MODE === 'production' && !creds
+      ? 'Production credentials are not configured; callbacks fail closed (503) until OPENTABLE_CLIENT_ID/OPENTABLE_CLIENT_SECRET are set.'
+      : undefined,
+  });
+});
+
+app.get('/api/admin/opentable/status', serverPlus(), (req, res) => {
+  const link = otLink();
+  const out = db.prepare("SELECT COUNT(*) AS c FROM ot_outbound WHERE site_id = ? AND delivered = 'sandbox'").get(SITE_ID).c;
+  res.json({
+    mode: OT_MODE,
+    linked: !!link,
+    opentable_rid: link ? link.opentable_rid : null,
+    environment: link ? link.environment : null,
+    frn_online: link ? !!link.frn_online : null,
+    credentials_present: !!(process.env.OPENTABLE_CLIENT_ID && process.env.OPENTABLE_CLIENT_SECRET),
+    partner_key_configured: OT_PARTNER_KEY !== 'sandbox-partner-key',
+    sandbox_outbound_captured: out,
+  });
+});
+
+app.delete('/api/admin/opentable/link', managerOnly(), (req, res) => {
+  db.prepare('DELETE FROM ot_links WHERE site_id = ?').run(SITE_ID);
+  res.json({ linked: false });
+});
+
+/** Recent outbound sync messages (durable queue view for ops / QA). */
+app.get('/api/admin/opentable/outbound', managerOnly(), (req, res) => {
+  const rows = db.prepare(
+    `SELECT id, opentable_rid, action, confirmation_number, payload_json, request_id, delivered, response_json, created_at
+     FROM ot_outbound WHERE site_id = ? ORDER BY id DESC LIMIT 200`
+  ).all(SITE_ID);
+  res.json(rows);
+});
+
+/* ---- partner-hosted callbacks (OpenTable → Expoline) ---- */
+
+/** LOCK: hold a slot for the make step (best-efforts inventory hold, per OT
+    docs). 409 when nothing fits — never silently double-book. */
+app.post('/api/opentable/lock', otCallbackAuth, otProdGuard, (req, res) => {
+  const b = req.body || {};
+  const requestId = req.get('X-Request-Id') || null;
+  if (requestId) {
+    const prior = db.prepare("SELECT * FROM ot_locks WHERE site_id = ? AND request_id = ? AND status = 'held' AND expires_at > ?")
+      .get(SITE_ID, requestId, nowIso());
+    if (prior) {
+      const t = tableById(prior.table_id);
+      return res.status(200).json({
+        lock_id: prior.lock_id, table_id: prior.table_id, table_label: t ? t.label : null,
+        expires_at: prior.expires_at,
+        expires_in_sec: Math.max(0, Math.round((Date.parse(prior.expires_at) - Date.now()) / 1000)),
+        replayed: true,
+      });
+    }
+  }
+  if (!isInt(b.party_size) || b.party_size < 1 || b.party_size > 24)
+    return res.status(400).json({ error: 'party_size must be a whole number from 1 to 24' });
+  const startMs = parseSlot(b.reserved_at || b.date_time);
+  if (startMs == null) return res.status(400).json({ error: 'reserved_at must be a valid ISO datetime' });
+  if (startMs < Date.now() - 2 * 3600e3) return res.status(400).json({ error: 'reserved_at is too far in the past' });
+  const duration = b.duration_min == null ? 90 : b.duration_min;
+  if (!isInt(duration) || duration < 15 || duration > 480)
+    return res.status(400).json({ error: 'duration_min must be 15–480' });
+  const endMs = startMs + duration * 60000;
+
+  let table = null;
+  if (b.preferred_table_id != null) {
+    const t = tableById(b.preferred_table_id);
+    if (!t) return res.status(400).json({ error: 'Valid preferred_table_id is required' });
+    if (t.seats < b.party_size) return res.status(400).json({ error: 'Preferred table is too small for the party' });
+    if (resvOverlap(t.id, startMs, endMs, null))
+      return res.status(409).json({ error: 'Requested table is already booked for that time' });
+    const lclash = otLockClash(t.id, startMs, endMs, null);
+    if (lclash) return res.status(409).json({ error: 'Requested table is already held for that time', lock_id: lclash.lock_id });
+    table = t;
+  }
+  if (!table) table = otBestFitTable(b.party_size, startMs, endMs);
+  if (!table) return res.status(409).json({ error: 'No table available for that party size and time' });
+
+  const lockId = 'otlk_' + crypto.randomUUID().slice(0, 12);
+  const expiresAt = new Date(Date.now() + OT_LOCK_TTL_SEC * 1000).toISOString();
+  db.prepare(
+    `INSERT INTO ot_locks (site_id, lock_id, table_id, party_size, reserved_at, duration_min, expires_at, status, request_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'held', ?, ?)`
+  ).run(SITE_ID, lockId, table.id, b.party_size, new Date(startMs).toISOString(), duration, expiresAt, requestId, nowIso());
+  res.status(201).json({ lock_id: lockId, table_id: table.id, table_label: table.label, expires_at: expiresAt, expires_in_sec: OT_LOCK_TTL_SEC });
+});
+
+/** MAKE: create the reservation. Idempotent on (opentable_rid,
+    confirmation_number) — a retried make returns the original row, never a
+    duplicate. */
+app.post('/api/opentable/reservations', otCallbackAuth, otProdGuard, (req, res) => {
+  const b = req.body || {};
+  const requestId = req.get('X-Request-Id') || null;
+  const link = otLink();
+  const rid = cleanLabel(b.opentable_rid) || (link ? link.opentable_rid : null);
+  const conf = cleanLabel(b.confirmation_number || b.confirmation);
+  if (!rid) return res.status(400).json({ error: 'opentable_rid is required (or link the restaurant first)' });
+  if (!conf) return res.status(400).json({ error: 'confirmation_number is required' });
+
+  const dup = db.prepare('SELECT * FROM ot_reservation_map WHERE site_id = ? AND opentable_rid = ? AND confirmation_number = ?')
+    .get(SITE_ID, rid, conf);
+  if (dup) {
+    if (requestId && dup.last_request_id !== requestId)
+      db.prepare('UPDATE ot_reservation_map SET last_request_id = ?, last_sync_at = ? WHERE id = ?').run(requestId, nowIso(), dup.id);
+    const r = db.prepare('SELECT * FROM reservations WHERE uuid = ?').get(dup.reservation_uuid);
+    if (r) return res.status(200).json({ ...resvView(r), confirmation_number: conf, replayed: true });
+    // Map row exists but the reservation row vanished — rebuild instead of duplicating.
+    db.prepare('DELETE FROM ot_reservation_map WHERE id = ?').run(dup.id);
+  }
+
+  const m = otMapPayload(b, conf);
+  if (!m.customer_name) return res.status(400).json({ error: 'guest name is required' });
+  if (!isInt(m.party_size) || m.party_size < 1 || m.party_size > 24)
+    return res.status(400).json({ error: 'party_size must be a whole number from 1 to 24' });
+  const startMs = parseSlot(m.reserved_at);
+  if (startMs == null) return res.status(400).json({ error: 'reserved_at must be a valid ISO datetime' });
+  if (startMs < Date.now() - 2 * 3600e3) return res.status(400).json({ error: 'reserved_at is too far in the past' });
+  const endMs = startMs + m.duration_min * 60000;
+
+  // Resolve table: consume the lock if supplied, else best-fit with conflict checks.
+  let table = null;
+  if (b.lock_id) {
+    const lock = db.prepare("SELECT * FROM ot_locks WHERE site_id = ? AND lock_id = ? AND status = 'held' AND expires_at > ?")
+      .get(SITE_ID, cleanLabel(b.lock_id), nowIso());
+    if (lock) {
+      table = tableById(lock.table_id);
+      if (!table || resvOverlap(table.id, startMs, endMs, null))
+        return res.status(409).json({ error: 'Locked table is no longer available', lock_id: lock.lock_id });
+      db.prepare("UPDATE ot_locks SET status = 'consumed' WHERE id = ?").run(lock.id);
+    }
+  }
+  if (!table && b.preferred_table_id != null) {
+    const t = tableById(b.preferred_table_id);
+    if (!t) return res.status(400).json({ error: 'Valid preferred_table_id is required' });
+    if (t.seats < m.party_size) return res.status(400).json({ error: 'Preferred table is too small for the party' });
+    if (resvOverlap(t.id, startMs, endMs, null))
+      return res.status(409).json({ error: 'Requested table is already booked for that time' });
+    const lclash = otLockClash(t.id, startMs, endMs, null);
+    if (lclash) return res.status(409).json({ error: 'Requested table is held by an OpenTable lock for that time', lock_id: lclash.lock_id });
+    table = t;
+  }
+  if (!table) table = otBestFitTable(m.party_size, startMs, endMs);
+  if (!table) return res.status(409).json({ error: 'No table available for that party size and time' });
+
+  const r = db.prepare(
+    `INSERT INTO reservations (uuid, site_id, customer_name, phone, party_size, reserved_at, duration_min,
+       table_id, status, notes, source, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, 'opentable', ?, ?)`
+  ).run(crypto.randomUUID(), SITE_ID, m.customer_name, m.phone || null, m.party_size,
+    new Date(startMs).toISOString(), m.duration_min, table.id, m.notes,
+    'opentable-sync', nowIso());
+  const row = resvById(r.lastInsertRowid);
+  db.prepare(
+    `INSERT INTO ot_reservation_map (site_id, reservation_uuid, opentable_rid, confirmation_number, source,
+       sync_sequence, ot_state, details_json, last_request_id, idempotency_response, last_sync_at)
+     VALUES (?, ?, ?, ?, 'opentable', 1, 'BOOKED', ?, ?, ?, ?)`
+  ).run(SITE_ID, row.uuid, rid, conf, JSON.stringify({ raw: b }), requestId, null, nowIso());
+  const view = { ...resvView(row), confirmation_number: conf };
+  db.prepare('UPDATE ot_reservation_map SET idempotency_response = ? WHERE site_id = ? AND opentable_rid = ? AND confirmation_number = ?')
+    .run(JSON.stringify(view), SITE_ID, rid, conf);
+
+  // Echo-back (anti-ghost-booking): tell OT the booking exists in our system.
+  otOutbound('reservation_update', conf, {
+    confirmation_number: conf, state: 'BOOKED', party_size: m.party_size,
+    reserved_at: row.reserved_at, table_id: table.id,
+  });
+
+  broadcastResvUpdated();
+  res.status(201).json(view);
+});
+
+/** UPDATE: party size / time / state changes. Sequence-based last-writer-wins
+    (mirrors OT's own sequence_id semantics): stale sequences are ignored. */
+app.patch('/api/opentable/reservations/:confirmation', otCallbackAuth, otProdGuard, (req, res) => {
+  const conf = cleanLabel(req.params.confirmation);
+  const b = req.body || {};
+  const link = otLink();
+  const rid = cleanLabel(b.opentable_rid) || (link ? link.opentable_rid : null);
+  const map = db.prepare('SELECT * FROM ot_reservation_map WHERE site_id = ? AND opentable_rid = ? AND confirmation_number = ?')
+    .get(SITE_ID, rid, conf);
+  if (!map) return res.status(404).json({ error: 'Unknown OpenTable confirmation number' });
+  const r = db.prepare('SELECT * FROM reservations WHERE uuid = ?').get(map.reservation_uuid);
+  if (!r) return res.status(404).json({ error: 'Linked reservation not found' });
+
+  const seq = b.sequence == null ? null : parseInt(b.sequence, 10);
+  if (seq != null && (!Number.isInteger(seq) || seq < 0))
+    return res.status(400).json({ error: 'sequence must be a non-negative integer' });
+  if (seq != null && seq <= map.sync_sequence)
+    return res.status(200).json({ ...resvView(r), confirmation_number: conf, ignored_stale: true, sync_sequence: map.sync_sequence });
+
+  let tableId = r.table_id, partySize = r.party_size;
+  let startMs = Date.parse(r.reserved_at), duration = r.duration_min, newState = r.status;
+  if (b.party_size !== undefined) {
+    if (!isInt(b.party_size) || b.party_size < 1 || b.party_size > 24)
+      return res.status(400).json({ error: 'party_size must be a whole number from 1 to 24' });
+    partySize = b.party_size;
+  }
+  if (b.reserved_at !== undefined) {
+    const t = parseSlot(b.reserved_at);
+    if (t == null) return res.status(400).json({ error: 'reserved_at must be a valid ISO datetime' });
+    startMs = t;
+  }
+  if (b.duration_min !== undefined) {
+    if (!isInt(b.duration_min) || b.duration_min < 15 || b.duration_min > 480)
+      return res.status(400).json({ error: 'duration_min must be 15–480' });
+    duration = b.duration_min;
+  }
+  if (b.ot_state !== undefined || b.status !== undefined) {
+    const otState = cleanLabel(b.ot_state || b.status).toUpperCase();
+    if (!OT_STATE_TO_NATIVE[otState]) return res.status(400).json({ error: 'Unknown OT state' });
+    newState = OT_STATE_TO_NATIVE[otState];
+  }
+  if (b.table_id !== undefined) {
+    if (b.table_id == null) return res.status(400).json({ error: 'OpenTable bookings require a table' });
+    const t = tableById(b.table_id);
+    if (!t) return res.status(400).json({ error: 'Valid table_id is required' });
+    tableId = t.id;
+  }
+  const tbl = tableById(tableId);
+  if (tbl && partySize > tbl.seats) return res.status(400).json({ error: 'party_size exceeds table seats' });
+  if (tableId != null) {
+    const clash = resvOverlap(tableId, startMs, startMs + duration * 60000, r.id);
+    if (clash) return res.status(409).json({ error: 'Table is already booked for that time', conflicting_reservation_id: clash.id });
+    const lclash = otLockClash(tableId, startMs, startMs + duration * 60000, null);
+    if (lclash) return res.status(409).json({ error: 'Table is held by an OpenTable lock for that time', lock_id: lclash.lock_id });
+  }
+  if (['cancelled', 'no_show', 'completed'].includes(r.status) && newState !== r.status)
+    return res.status(400).json({ error: `Reservation is already ${r.status}` });
+
+  const newSeq = seq != null ? seq : map.sync_sequence + 1;
+  const newOtState = (b.ot_state !== undefined || b.status !== undefined)
+    ? cleanLabel(b.ot_state || b.status).toUpperCase() : map.ot_state;
+  db.prepare('UPDATE reservations SET party_size = ?, reserved_at = ?, duration_min = ?, table_id = ?, status = ? WHERE id = ?')
+    .run(partySize, new Date(startMs).toISOString(), duration, tableId, newState, r.id);
+  db.prepare('UPDATE ot_reservation_map SET sync_sequence = ?, ot_state = ?, last_sync_at = ?, last_request_id = ? WHERE id = ?')
+    .run(newSeq, newOtState, nowIso(), req.get('X-Request-Id') || null, map.id);
+  broadcastResvUpdated();
+  res.json({ ...resvView(resvById(r.id)), confirmation_number: conf, sync_sequence: newSeq });
+});
+
+/** CANCEL: OpenTable-initiated cancellation. */
+app.delete('/api/opentable/reservations/:confirmation', otCallbackAuth, otProdGuard, (req, res) => {
+  const conf = cleanLabel(req.params.confirmation);
+  const link = otLink();
+  const rid = cleanLabel((req.body || {}).opentable_rid) || (link ? link.opentable_rid : null);
+  const map = db.prepare('SELECT * FROM ot_reservation_map WHERE site_id = ? AND opentable_rid = ? AND confirmation_number = ?')
+    .get(SITE_ID, rid, conf);
+  if (!map) return res.status(404).json({ error: 'Unknown OpenTable confirmation number' });
+  const r = db.prepare('SELECT * FROM reservations WHERE uuid = ?').get(map.reservation_uuid);
+  if (!r) return res.status(404).json({ error: 'Linked reservation not found' });
+  if (['cancelled', 'no_show', 'completed'].includes(r.status))
+    return res.status(400).json({ error: `Reservation is already ${r.status}` });
+  db.prepare("UPDATE reservations SET status = 'cancelled' WHERE id = ?").run(r.id);
+  db.prepare("UPDATE ot_reservation_map SET ot_state = 'CANCELED', sync_sequence = sync_sequence + 1, last_sync_at = ? WHERE id = ?")
+    .run(nowIso(), map.id);
+  otOutbound('reservation_update', conf, { confirmation_number: conf, state: 'CANCELED' });
+  auditApproval({ user: { name: 'opentable-sync' } }, 'resv_cancel', {},
+    { reservation_id: r.id, before: { status: r.status }, after: { status: 'cancelled' }, via: 'opentable' });
+  broadcastResvUpdated();
+  res.json({ confirmation_number: conf, status: 'cancelled' });
+});
+
+/** FRN recovery: OpenTable polls this after our endpoints fail. Reports online
+    so the restaurant becomes bookable again on OpenTable. */
+app.get('/api/opentable/recovery', otCallbackAuth, (req, res) => {
+  db.prepare('UPDATE ot_links SET frn_online = 1, updated_at = ? WHERE site_id = ?').run(nowIso(), SITE_ID);
+  res.json({ online: true, mode: OT_MODE, ts: nowIso() });
+});
+
+/* ---- admin: reconcile + availability publish ---- */
+
+/** RECONCILE: safety-net compare. The caller (QA harness / ops; production
+    pulls by modified_at once the partner pull endpoint is provisioned) supplies
+    the OT-side booking list. Never auto-creates — mismatches are reported for
+    a manager to resolve. */
+app.post('/api/admin/opentable/reconcile', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const otBookings = Array.isArray(b.ot_bookings) ? b.ot_bookings : [];
+  const link = otLink();
+  const maps = db.prepare('SELECT confirmation_number, ot_state FROM ot_reservation_map WHERE site_id = ?').all(SITE_ID);
+  const byConf = new Map(maps.map((m) => [m.confirmation_number, m]));
+  const seen = new Set();
+  const missing_local = [], state_mismatches = [];
+  for (const ob of otBookings) {
+    const conf = cleanLabel(ob.confirmation_number);
+    seen.add(conf);
+    const m = byConf.get(conf);
+    if (!m) { missing_local.push(conf); continue; }
+    const want = cleanLabel(ob.ot_state || ob.state || '').toUpperCase();
+    if (want && m.ot_state && want !== m.ot_state)
+      state_mismatches.push({ confirmation_number: conf, ot: want, local: m.ot_state });
+  }
+  const missing_ot = maps.filter((m) => !seen.has(m.confirmation_number)).map((m) => m.confirmation_number);
+  res.json({
+    opentable_rid: link ? link.opentable_rid : null, mode: OT_MODE,
+    missing_local, missing_ot, state_mismatches, checked: otBookings.length,
+  });
+});
+
+/** AVAILABILITY PUBLISH: derive OT 15-min slot buckets from live floor-plan
+    availability (the floor plan is the single arbiter) and publish. Sandbox:
+    captured to ot_outbound. */
+app.post('/api/admin/opentable/publish-availability', managerOnly(), (req, res) => {
+  const date = cleanLabel((req.body || {}).date) || siteTodayStr();
+  const bounds = siteDayBounds(date);
+  if (!bounds) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  const PARTY_SIZES = [1, 2, 3, 4, 5, 6, 7, 8];
+  const tables = db.prepare('SELECT id, seats FROM tables WHERE site_id = ?').all(SITE_ID);
+  const slots = [];
+  const t0 = Date.parse(bounds[0]);
+  for (let ms = t0; ms < t0 + 86400000; ms += 900000) {
+    const { h } = siteLocalParts(ms);
+    if (h < 17 || h >= 22) continue; // dinner service window, site-local
+    for (const ps of PARTY_SIZES) {
+      const free = tables.some((t) => t.seats >= ps
+        && !resvOverlap(t.id, ms, ms + 90 * 60000, null)
+        && !otLockClash(t.id, ms, ms + 90 * 60000, null));
+      if (free) slots.push({ time: new Date(ms).toISOString(), party_size: ps });
+    }
+  }
+  const out = otOutbound('availability_publish', null, { date, slot_count: slots.length, slots });
+  res.json({
+    date, slots_published: slots.length, delivered: out.delivered, request_id: out.request_id,
+    note: 'Last-writer-wins by sequence_id per OT docs; omit-a-time means not bookable.',
+  });
+});
+
 
 /* --------------------------------- waitlist -------------------------------- */
 function wlView(w) {
