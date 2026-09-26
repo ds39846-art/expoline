@@ -4,7 +4,7 @@ import json, sys, urllib.request, urllib.error
 import os
 from playwright.sync_api import sync_playwright
 
-BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4317"))
+BASE = os.environ.get("EXPOLINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4317"))
 OUT = "qa/screenshots"
 
 def api(method, path, token=None, body=None):

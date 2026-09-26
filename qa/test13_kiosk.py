@@ -3,7 +3,7 @@
 import json, sys, urllib.request, urllib.error
 import os
 
-BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4333"))
+BASE = os.environ.get("EXPOLINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4333"))
 M = "2580"  # manager PIN
 
 checks = 0

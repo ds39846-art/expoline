@@ -2,7 +2,7 @@
 import json, urllib.request, urllib.error, sys
 import os
 
-BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4321"))
+BASE = os.environ.get("EXPOLINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4321"))
 passed, failed = [], []
 def check(name, cond, detail=''):
     (passed if cond else failed).append(name)

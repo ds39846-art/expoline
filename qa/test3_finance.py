@@ -6,7 +6,7 @@ assertions derive "yesterday"/"today"/"payout day" from /api/config.
 """
 import json, sys, datetime, urllib.request, urllib.error
 import os
-BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4317"))
+BASE = os.environ.get("EXPOLINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4317"))
 def api(method, path, token, body=None):
     req = urllib.request.Request(BASE+path, method=method,
         data=json.dumps(body).encode() if body is not None else None,

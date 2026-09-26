@@ -24,7 +24,7 @@ Date-agnostic: uses the site date from /api/config.
 """
 import io, json, sys, urllib.request, urllib.error, zipfile
 
-BASE = os.environ.get("EXPLOINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4328"))
+BASE = os.environ.get("EXPOLINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4328"))
 S, M = "1111", "2580"
 
 def api(method, path, token=None, body=None, raw=False):

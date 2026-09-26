@@ -20,7 +20,7 @@ Runs against EXPOLINE_BASE (default http://localhost:4322, the audit port).
 """
 import json, os, re, sys, threading, urllib.request, urllib.error
 
-BASE = os.environ.get("EXPLOINE_BASE", "http://localhost:4322")
+BASE = os.environ.get("EXPOLINE_BASE", "http://localhost:4322")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 S, K, M = "1111", "2222", "2580"
 
