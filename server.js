@@ -510,28 +510,131 @@ function paymentView(p) {
 }
 
 /* ------------------------------- auth / roles ------------------------------ */
-/** In-memory token map: token (32 hex chars) -> {id, name, role}. */
+/**
+ * In-memory token map: token (32 hex chars) -> {id, name, role, expires_at}.
+ * Sessions expire TOKEN_TTL_MS after issue (a long restaurant shift + margin);
+ * there is deliberately no "remember me" — a lost/stolen device stops working
+ * on its own. POST /api/auth/logout revokes immediately.
+ */
 const tokens = new Map();
+const TOKEN_TTL_MS = 12 * 3600 * 1000;
 
 function issueToken(user) {
   const token = crypto.randomBytes(16).toString('hex');
-  tokens.set(token, { id: user.id, name: user.name, role: user.role });
+  tokens.set(token, { id: user.id, name: user.name, role: user.role, expires_at: Date.now() + TOKEN_TTL_MS });
   return token;
 }
 
+// Reap expired sessions so the map cannot grow without bound.
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, s] of tokens) {
+    if (s.expires_at && s.expires_at <= now) tokens.delete(t);
+  }
+}, 5 * 60_000).unref();
+
+/* ---- login brute-force protection (4-digit PINs are guessable) ----
+   Per-IP: LOGIN_MAX failed attempts inside LOGIN_WINDOW_MS locks the IP out
+   of /api/auth/login for LOGIN_LOCK_MS (429). A success resets the counter. */
+const LOGIN_MAX = 10;
+const LOGIN_WINDOW_MS = 60_000;
+const LOGIN_LOCK_MS = 5 * 60_000;
+const loginAttempts = new Map(); // ip -> {count, firstAt, lockedUntil}
+function loginThrottled(ip) {
+  const now = Date.now();
+  const e = loginAttempts.get(ip);
+  if (!e) return false;
+  if (e.lockedUntil > now) return true;
+  if (now - e.firstAt > LOGIN_WINDOW_MS) { loginAttempts.delete(ip); return false; }
+  return false;
+}
+function recordLoginAttempt(ip, ok) {
+  const now = Date.now();
+  if (ok) { loginAttempts.delete(ip); return; }
+  let e = loginAttempts.get(ip);
+  if (!e || now - e.firstAt > LOGIN_WINDOW_MS) e = { count: 0, firstAt: now, lockedUntil: 0 };
+  e.count += 1;
+  if (e.count >= LOGIN_MAX) e.lockedUntil = now + LOGIN_LOCK_MS;
+  loginAttempts.set(ip, e);
+}
+// Prevent unbounded growth of the limiter map.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, e] of loginAttempts) {
+    if (e.lockedUntil <= now && now - e.firstAt > LOGIN_WINDOW_MS) loginAttempts.delete(ip);
+  }
+}, 5 * 60_000).unref();
+
+/* ---- manager-PIN brute-force protection ----
+   Voids, comps, and time-clock adjustments require the manager's 4-digit PIN
+   at the point of action. An authenticated insider (any server token) could
+   otherwise guess it at full speed. Per (actor, IP): PIN_MAX failed attempts
+   inside PIN_WINDOW_MS locks PIN verification for PIN_LOCK_MS (429). */
+const PIN_MAX = 8;
+const PIN_WINDOW_MS = 5 * 60_000;
+const PIN_LOCK_MS = 5 * 60_000;
+const pinAttempts = new Map(); // `${ip}|${actorId}` -> {count, firstAt, lockedUntil}
+function pinKey(req) {
+  const ip = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
+  return `${ip}|${req.user ? req.user.id : '?'}`;
+}
+function managerPinThrottled(req) {
+  const now = Date.now();
+  const e = pinAttempts.get(pinKey(req));
+  if (!e) return false;
+  if (e.lockedUntil > now) return true;
+  if (now - e.firstAt > PIN_WINDOW_MS) { pinAttempts.delete(pinKey(req)); return false; }
+  return false;
+}
+function recordManagerPinAttempt(req, ok) {
+  const key = pinKey(req);
+  const now = Date.now();
+  if (ok) { pinAttempts.delete(key); return; }
+  let e = pinAttempts.get(key);
+  if (!e || now - e.firstAt > PIN_WINDOW_MS) e = { count: 0, firstAt: now, lockedUntil: 0 };
+  e.count += 1;
+  if (e.count >= PIN_MAX) e.lockedUntil = now + PIN_LOCK_MS;
+  pinAttempts.set(key, e);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, e] of pinAttempts) {
+    if (e.lockedUntil <= now && now - e.firstAt > PIN_WINDOW_MS) pinAttempts.delete(k);
+  }
+}, 5 * 60_000).unref();
+
 /** 401 unless a valid Bearer token is present. Mounted on /api with public paths. */
 function authMiddleware(req, res, next) {
-  if (req.path === '/health' || req.path === '/auth/login') return next();
+  if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/logout') return next();
   // Public online-ordering endpoints (customer's phone — no staff token).
   if (req.path === '/online/menu'
       || (req.path === '/online/orders' && req.method === 'POST')
       || req.path === '/online/last') return next();
+  // Public kiosk (customer device) + TV menu boards — no staff token.
+  // (The staff-facing kiosk call-flag endpoints are registered after this
+  // wall and gated per-route with requireRole.)
+  if (req.path === '/kiosk/menu'
+      || (req.path === '/kiosk/order' && req.method === 'POST')
+      || (req.path === '/kiosk/call-staff' && req.method === 'POST')
+      || req.path === '/menuboards') return next();
   // Public LAN brain discovery (devices find the brain before auth).
   if (req.path === '/brain/status') return next();
   const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
-  const user = m ? tokens.get(m[1]) : null;
-  if (!user) return res.status(401).json({ error: 'Unauthorized: valid Bearer token required' });
-  req.user = user;
+  const sess = m ? tokens.get(m[1]) : null;
+  if (!sess) return res.status(401).json({ error: 'Unauthorized: valid Bearer token required' });
+  if (sess.expires_at && Date.now() > sess.expires_at) {
+    tokens.delete(m[1]);
+    return res.status(401).json({ error: 'Unauthorized: session expired — please log in again' });
+  }
+  // A token must not outlive the account behind it. Re-read the live user row
+  // on every request: a deactivated staffer's token stops working immediately,
+  // and a role change (promote/demote) applies to the live session at once.
+  const live = db.prepare('SELECT id, name, role FROM users WHERE id = ? AND COALESCE(active, 1) = 1').get(sess.id);
+  if (!live) {
+    tokens.delete(m[1]);
+    return res.status(401).json({ error: 'Unauthorized: this account is no longer active' });
+  }
+  req.user = { id: live.id, name: live.name, role: live.role };
   next();
 }
 
@@ -595,18 +698,31 @@ function consumeOfflineApproval(nonce, checkId, itemId, mgr) {
       manager_id = excluded.manager_id, manager_name = excluded.manager_name`)
     .run(SITE_ID, nonce, checkId, itemId, mgr.id, mgr.name, new Date().toISOString());
 }
-/* Resolve an item approval from either the online path (raw manager PIN,
+/* Resolve a void approval from either the online path (raw manager PIN,
    verified live) or the offline path (PIN hash + one-time nonce). Returns
-   { mgr, offline, replay, nonce } or sends 403 and returns null. */
-function resolveVoidApproval(b, checkId, itemId, res, actionLabel) {
-  const label = actionLabel || 'void';
+   { mgr, offline, replay, nonce } or sends 403/429 and returns null. */
+function resolveVoidApproval(req, b, checkId, itemId, res) {
+  if (managerPinThrottled(req)) {
+    res.status(429).json({ error: 'Too many failed manager-PIN attempts — please wait a few minutes' });
+    return null;
+  }
   if (b.approval_nonce !== undefined || b.manager_pin_hash !== undefined) {
     const v = verifyOfflineApproval(b.approval_nonce, b.manager_pin_hash, checkId, itemId);
-    if (!v) { res.status(403).json({ error: `Invalid or already-used offline approval — re-${label} from the check with a manager PIN` }); return null; }
+    if (!v) {
+      recordManagerPinAttempt(req, false);
+      res.status(403).json({ error: 'Invalid or already-used offline approval — re-void from the check with a manager PIN' });
+      return null;
+    }
+    recordManagerPinAttempt(req, true);
     return { mgr: v.mgr, offline: true, replay: v.replay, nonce: v.nonce };
   }
   const mgr = verifyManagerPin(b.manager_pin);
-  if (!mgr) { res.status(403).json({ error: `Manager PIN required to ${label} an item` }); return null; }
+  if (!mgr) {
+    recordManagerPinAttempt(req, false);
+    res.status(403).json({ error: 'Manager PIN required to void an item' });
+    return null;
+  }
+  recordManagerPinAttempt(req, true);
   return { mgr, offline: false, replay: false, nonce: null };
 }
 
@@ -636,14 +752,19 @@ app.use((req, res, next) => {
   next();
 });
 
-/* Kiosk + menu boards: PUBLIC customer/TV endpoints — registered before the
-   auth wall so they stay token-free (Express matches in registration order).
-   All staff routes below keep Bearer auth. */
+app.use('/api', authMiddleware);
+
+/* Kiosk: registered AFTER the auth wall. The customer flows
+   (/kiosk/menu, POST /kiosk/order, POST /kiosk/call-staff, /menuboards) stay
+   token-free via the wall's public-path early return; the staff-facing
+   call-flag endpoints are gated by ctx.serverPlus (req.user is populated by
+   the wall, so role checks work). */
 require('./routes/kiosk').register(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated,
+  // Staff-facing call-flag endpoints are gated server-side; the customer
+  // kiosk flows (menu/order/call-staff) stay public by design.
+  serverPlus,
 });
-
-app.use('/api', authMiddleware);
 
 /* ------------------------------- public routes ----------------------------- */
 app.get('/api/health', (req, res) => {
@@ -672,13 +793,27 @@ app.get('/api/brain/status', (req, res) => {
 });
 
 app.post('/api/auth/login', (req, res) => {
+  const ip = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
+  if (loginThrottled(ip)) {
+    return res.status(429).json({ error: 'Too many login attempts — please wait a few minutes and try again' });
+  }
   const pin = req.body && req.body.pin != null ? String(req.body.pin) : '';
-  if (!pin) return res.status(401).json({ error: 'PIN required' });
+  if (!pin) { recordLoginAttempt(ip, false); return res.status(401).json({ error: 'PIN required' }); }
   // PINs compared as strings. Deactivated staff cannot log in.
   const user = db.prepare('SELECT id, name, role FROM users WHERE pin = ? AND site_id = ? AND COALESCE(active, 1) = 1').get(pin, SITE_ID);
-  if (!user) return res.status(401).json({ error: 'Invalid PIN' });
+  if (!user) { recordLoginAttempt(ip, false); return res.status(401).json({ error: 'Invalid PIN' }); }
+  recordLoginAttempt(ip, true);
   const token = issueToken(user);
   res.json({ token, user: { id: user.id, name: user.name, role: user.role } });
+});
+
+/* POST /api/auth/logout — revoke the presented Bearer token immediately.
+   Always 200 (logging out of an already-dead session is a no-op); the token
+   is deleted when present so a copied token cannot be reused afterwards. */
+app.post('/api/auth/logout', (req, res) => {
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  if (m) tokens.delete(m[1]);
+  res.json({ ok: true });
 });
 
 /* --------------------------------- config ---------------------------------- */
@@ -761,6 +896,7 @@ function zoneById(id) {
   return db.prepare('SELECT id, name FROM zones WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function tableById(id) {
+  if (id == null) return undefined; // untrusted callers may omit table_id; never let undefined reach sqlite
   return db.prepare('SELECT id, site_id, zone_id, label, seats, x, y, shape FROM tables WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function cleanLabel(v) { return typeof v === 'string' ? v.trim() : ''; }
@@ -1152,7 +1288,7 @@ app.delete('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
   const b = req.body || {};
   const checkId = Number(req.params.id);
   const itemId = Number(req.params.item_id);
-  const approval = resolveVoidApproval(b, checkId, itemId, res);
+  const approval = resolveVoidApproval(req, b, checkId, itemId, res);
   if (!approval) return;
   const mgr = approval.mgr;
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
@@ -1188,7 +1324,7 @@ app.post('/api/checks/:id/void-item', serverPlus(), (req, res) => {
   const checkId = Number(req.params.id);
   const itemId = b.item_id != null ? Number(b.item_id) : NaN;
   if (!Number.isFinite(itemId)) return res.status(400).json({ error: 'item_id is required' });
-  const approval = resolveVoidApproval(b, checkId, itemId, res);
+  const approval = resolveVoidApproval(req, b, checkId, itemId, res);
   if (!approval) return;
   const mgr = approval.mgr;
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
@@ -1264,7 +1400,7 @@ app.patch('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
   }
   let approval = null;
   if (item.state !== 'held') {
-    approval = resolveVoidApproval(b, checkId, itemId, res, 'edit');
+    approval = resolveVoidApproval(req, b, checkId, itemId, res);
     if (!approval) return;
     if (approval.offline && approval.replay) {
       // Idempotent retry after a dropped response — the edit already applied.
@@ -1296,8 +1432,12 @@ app.patch('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
  */
 app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
   const b = req.body || {};
+  if (managerPinThrottled(req)) {
+    return res.status(429).json({ error: 'Too many failed manager-PIN attempts — please wait a few minutes' });
+  }
   const mgr = verifyManagerPin(b.manager_pin);
-  if (!mgr) return res.status(403).json({ error: 'Manager PIN required to comp a check' });
+  if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Manager PIN required to comp a check' }); }
+  recordManagerPinAttempt(req, true);
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot comp a ${check.status} check` });
@@ -2667,8 +2807,12 @@ app.post('/api/admin/clock/adjust', managerOnly(), (req, res) => {
   // Point-of-action approval FIRST: a valid session alone is NOT enough — the
   // manager must enter their PIN at the device for every adjustment. Checked
   // before anything else so no information leaks without approval either.
+  if (managerPinThrottled(req)) {
+    return res.status(429).json({ error: 'Too many failed manager-PIN attempts — please wait a few minutes' });
+  }
   const mgr = verifyManagerPin(b.manager_pin);
-  if (!mgr) return res.status(403).json({ error: 'Manager PIN required for time-clock adjustments' });
+  if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Manager PIN required for time-clock adjustments' }); }
+  recordManagerPinAttempt(req, true);
   const shift = b.shift_id != null ? shiftById(b.shift_id) : null;
   if (!shift) return res.status(400).json({ error: 'Unknown shift_id' });
   const approver = mgr.name;
@@ -2953,6 +3097,7 @@ function wlById(id) {
   return db.prepare('SELECT * FROM waitlist WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function tableById(id) {
+  if (id == null) return undefined; // untrusted callers may omit table_id; never let undefined reach sqlite
   return db.prepare('SELECT id, label, seats, zone_id, x, y, shape FROM tables WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 

@@ -6,8 +6,15 @@
  *
  *   const kiosk = require('./routes/kiosk');
  *   kiosk.migrate(db);          // place with the other boot-time migrations
+ *   // in authMiddleware's public-path early return, add the kiosk paths:
+ *   //   if (req.path === '/kiosk/menu'
+ *   //       || (req.path === '/kiosk/order' && req.method === 'POST')
+ *   //       || (req.path === '/kiosk/call-staff' && req.method === 'POST')
+ *   //       || req.path === '/menuboards') return next();
+ *   // AFTER app.use('/api', authMiddleware) (the staff call-flag endpoints
+ *   // need req.user populated by the wall for their serverPlus role check):
  *   kiosk.register(app, { db, SITE_ID, nowIso, crypto, persistTotals,
- *                          checkResponse, broadcastCheckUpdated });
+ *                          checkResponse, broadcastCheckUpdated, serverPlus });
  *   // Optional (enables real-time KDS push for kiosk orders):
  *   //   pass broadcastTicket too — register() uses ctx.broadcastTicket if present.
  *
@@ -15,9 +22,13 @@
  * - No new tables except kiosk_calls (staff-call flags). Checks, check_items,
  *   menu_items and kds_tickets are reused; kiosk orders land on a virtual
  *   'KIOSK' table created lazily by ensureKioskTable().
- * - Kiosk endpoints are intentionally unauthenticated (customer device) but
+ * - Customer endpoints (/kiosk/menu, /kiosk/order, /kiosk/call-staff,
+ *   /menuboards) are intentionally unauthenticated (customer device) but
  *   hardened: per-IP rate limiting, server-side re-pricing (client prices are
  *   never trusted), market-price items excluded, 86'd items excluded.
+ * - The STAFF-facing endpoints (GET /kiosk/calls, POST /kiosk/calls/:id/clear)
+ *   are server-side role-gated via ctx.serverPlus — an unauthenticated caller
+ *   must not read or silently clear staff-call flags.
  * - Kiosk items go straight to state='sent' (fire immediately) with KDS
  *   tickets created via the same station-grouping pattern as the send flow.
  * ========================================================================== */
@@ -151,7 +162,10 @@ function splitBoards(cats, board, boards) {
 
 /* -------------------------------- register -------------------------------- */
 function register(app, ctx) {
-  const { db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated } = ctx;
+  const { db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated, serverPlus } = ctx;
+  // serverPlus is required: the staff-facing call-flag endpoints below must
+  // reject unauthenticated/wrong-role callers server-side.
+  if (typeof serverPlus !== 'function') throw new Error('kiosk.register requires ctx.serverPlus');
 
   /* GET /api/kiosk/menu — orderable menu for the kiosk. 86'd items are
      EXCLUDED (not flagged); market-price items excluded (need a manager). */
@@ -284,8 +298,10 @@ function register(app, ctx) {
     res.status(201).json({ id: r.lastInsertRowid, status: 'active' });
   });
 
-  /* GET /api/kiosk/calls — active staff-call flags (for the floor view). */
-  app.get('/api/kiosk/calls', (req, res) => {
+  /* GET /api/kiosk/calls — active staff-call flags (for the staff floor view).
+     Staff-only: any authenticated floor role can read; customers must not see
+     (or poll) internal staff-call state. */
+  app.get('/api/kiosk/calls', serverPlus(), (req, res) => {
     res.json(db.prepare(
       `SELECT kc.id, kc.uuid, kc.table_id, t.label AS table_label, kc.created_at
          FROM kiosk_calls kc JOIN tables t ON t.id = kc.table_id
@@ -293,8 +309,10 @@ function register(app, ctx) {
     ).all(SITE_ID));
   });
 
-  /* POST /api/kiosk/calls/:id/clear — staff clears the flag. */
-  app.post('/api/kiosk/calls/:id/clear', (req, res) => {
+  /* POST /api/kiosk/calls/:id/clear — staff clears the flag. Staff-only:
+     an unauthenticated caller must not be able to silently drop staff-call
+     flags (or the floor view would never light up). */
+  app.post('/api/kiosk/calls/:id/clear', serverPlus(), (req, res) => {
     const call = db.prepare('SELECT * FROM kiosk_calls WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
     if (!call) return res.status(404).json({ error: 'Call not found' });
     db.prepare("UPDATE kiosk_calls SET status = 'cleared', cleared_at = ? WHERE id = ?").run(nowIso(), call.id);
