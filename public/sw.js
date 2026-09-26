@@ -1,5 +1,5 @@
 /* Expoline service worker — caches the app shell; API/WS always hit network. */
-const CACHE = 'expoline-shell-v1';
+const CACHE = 'expoline-shell-v2';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
