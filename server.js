@@ -595,17 +595,18 @@ function consumeOfflineApproval(nonce, checkId, itemId, mgr) {
       manager_id = excluded.manager_id, manager_name = excluded.manager_name`)
     .run(SITE_ID, nonce, checkId, itemId, mgr.id, mgr.name, new Date().toISOString());
 }
-/* Resolve a void approval from either the online path (raw manager PIN,
+/* Resolve an item approval from either the online path (raw manager PIN,
    verified live) or the offline path (PIN hash + one-time nonce). Returns
    { mgr, offline, replay, nonce } or sends 403 and returns null. */
-function resolveVoidApproval(b, checkId, itemId, res) {
+function resolveVoidApproval(b, checkId, itemId, res, actionLabel) {
+  const label = actionLabel || 'void';
   if (b.approval_nonce !== undefined || b.manager_pin_hash !== undefined) {
     const v = verifyOfflineApproval(b.approval_nonce, b.manager_pin_hash, checkId, itemId);
-    if (!v) { res.status(403).json({ error: 'Invalid or already-used offline approval — re-void from the check with a manager PIN' }); return null; }
+    if (!v) { res.status(403).json({ error: `Invalid or already-used offline approval — re-${label} from the check with a manager PIN` }); return null; }
     return { mgr: v.mgr, offline: true, replay: v.replay, nonce: v.nonce };
   }
   const mgr = verifyManagerPin(b.manager_pin);
-  if (!mgr) { res.status(403).json({ error: 'Manager PIN required to void an item' }); return null; }
+  if (!mgr) { res.status(403).json({ error: `Manager PIN required to ${label} an item` }); return null; }
   return { mgr, offline: false, replay: false, nonce: null };
 }
 
@@ -1216,6 +1217,75 @@ app.post('/api/checks/:id/void-item', serverPlus(), (req, res) => {
     { approver: mgr.name, approver_id: mgr.id, before, after: { state: 'cancelled' }, reason: reason || null,
       offline: approval.offline || undefined, approval_nonce: approval.offline ? approval.nonce : undefined });
   res.json({ voided: item.id, state: 'cancelled', approved_by: mgr.name, totals: t });
+});
+
+/**
+ * PATCH /api/checks/:id/items/:item_id {qty?, modifiers?, manager_pin?, manager_pin_hash?, approval_nonce?}
+ * Edit an item on an open check: change qty and/or modifiers.
+ * - held items: the server/kitchen can edit directly (nothing fired yet).
+ * - sent/fulfilled items: the kitchen already fired — requires manager
+ *   approval (same live-PIN or offline hash+nonce mechanism as void-item),
+ *   and the change is audit-logged with before/after.
+ * Modifier validation mirrors POST /items. Fixed-price items keep the menu
+ * price; market-price items keep their manager-entered price (price itself
+ * is never editable here — void and re-add instead).
+ */
+app.patch('/api/checks/:id/items/:item_id', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const checkId = Number(req.params.id);
+  const itemId = Number(req.params.item_id);
+  if (!Number.isFinite(itemId)) return res.status(400).json({ error: 'item_id is required' });
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot edit items on a ${check.status} check` });
+  const item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ? AND ci.check_id = ?')
+    .get(itemId, check.id);
+  if (!item) return res.status(404).json({ error: 'Item not found on this check' });
+  if (item.state === 'cancelled') return res.status(400).json({ error: 'Item is voided — re-add it instead' });
+  if (!['held', 'sent', 'fulfilled'].includes(item.state)) {
+    return res.status(400).json({ error: `Cannot edit an item in state ${item.state}` });
+  }
+  const patch = {};
+  if (b.qty !== undefined) {
+    if (!isInt(b.qty) || b.qty < 1 || b.qty > 24) return res.status(400).json({ error: 'qty must be an integer between 1 and 24' });
+    patch.qty = b.qty;
+  }
+  if (b.modifiers !== undefined) {
+    if (!Array.isArray(b.modifiers)) return res.status(400).json({ error: 'modifiers must be an array' });
+    for (const m of b.modifiers) {
+      if (!m || typeof m.name !== 'string' || !isInt(m.price_delta_cents)) {
+        return res.status(400).json({ error: 'Each modifier needs {name, price_delta_cents}' });
+      }
+    }
+    patch.modifiers = b.modifiers.map((m) => ({ name: m.name.trim().slice(0, 80), price_delta_cents: m.price_delta_cents }));
+  }
+  if (!('qty' in patch) && !('modifiers' in patch)) {
+    return res.status(400).json({ error: 'Nothing to update — send qty and/or modifiers' });
+  }
+  let approval = null;
+  if (item.state !== 'held') {
+    approval = resolveVoidApproval(b, checkId, itemId, res, 'edit');
+    if (!approval) return;
+    if (approval.offline && approval.replay) {
+      // Idempotent retry after a dropped response — the edit already applied.
+      const cur = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(item.id);
+      return res.json(Object.assign(itemView(cur), { already_applied: true, approved_by: approval.mgr.name }));
+    }
+  }
+  const before = { qty: item.qty, modifiers: parseJson(item.modifiers_json, []) };
+  if (patch.qty !== undefined) db.prepare('UPDATE check_items SET qty = ? WHERE id = ?').run(patch.qty, item.id);
+  if (patch.modifiers !== undefined) db.prepare('UPDATE check_items SET modifiers_json = ? WHERE id = ?').run(JSON.stringify(patch.modifiers), item.id);
+  if (approval && approval.offline && !approval.replay) consumeOfflineApproval(approval.nonce, check.id, item.id, approval.mgr);
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  const updated = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(item.id);
+  if (approval) {
+    auditApproval(req, 'edit_item', { check_id: check.id, item_id: item.id },
+      { approver: approval.mgr.name, approver_id: approval.mgr.id,
+        before, after: { qty: updated.qty, modifiers: parseJson(updated.modifiers_json, []) },
+        offline: approval.offline || undefined, approval_nonce: approval.offline ? approval.nonce : undefined });
+  }
+  res.json(Object.assign(itemView(updated), approval ? { approved_by: approval.mgr.name } : {}, { totals: t }));
 });
 
 /**

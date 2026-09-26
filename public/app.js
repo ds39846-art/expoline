@@ -275,6 +275,21 @@ async function flushOutbox() {
             }
           } else if (o.op === 'send') {
             await rawApi('/api/checks/' + cid + '/send', 'POST');
+          } else if (o.op === 'edit_item') {
+            const iid = idmap[p.item_id] || p.item_id;
+            const ebody = { qty: p.qty, modifiers: p.modifiers };
+            if (p.approval_nonce) { ebody.manager_pin_hash = p.manager_pin_hash; ebody.approval_nonce = p.approval_nonce; }
+            try {
+              await rawApi('/api/checks/' + cid + '/items/' + iid, 'PATCH', ebody);
+            } catch (ee) {
+              // Approval failure (bad/expired PIN) is not a session problem —
+              // keep the op queued and tell the user instead of bouncing to login.
+              if (ee instanceof ApiError && ee.status === 403) {
+                toast('A queued edit needs a valid manager PIN — re-edit it from the check', 'err');
+                failed = true; break;
+              }
+              throw ee;
+            }
           } else if (o.op === 'payment') {
             await rawApi('/api/checks/' + cid + '/payments', 'POST',
               { method: p.method, amount_cents: p.amount_cents, tip_cents: p.tip_cents || 0, tendered_cents: p.tendered_cents, brand: p.brand, last4: p.last4 });
@@ -485,6 +500,15 @@ function applyOps(check, ops, idmap) {
     } else if (o.op === 'void_item') {
       const iid = String((idmap && (idmap[p.item_id] || p.item_id)) || p.item_id);
       check.items = check.items.filter((i) => String(i.id) !== iid);
+      estimated = true;
+    } else if (o.op === 'edit_item') {
+      const iid = String((idmap && (idmap[p.item_id] || p.item_id)) || p.item_id);
+      const it = check.items.find((i) => String(i.temp_id || i.id) === iid);
+      if (it) {
+        if (p.qty != null) it.qty = p.qty;
+        if (p.modifiers !== undefined) it.modifiers = p.modifiers;
+        it.pending = true;
+      }
       estimated = true;
     } else if (o.op === 'send') {
       check.items.forEach((i) => { if (i.state === 'held') i.state = 'sent'; });
@@ -1098,7 +1122,7 @@ async function renderOrder(app, checkId) {
           : (ref.state === 'sent'
             ? '<button class="icon-btn mgr-void" data-voidmgr="' + esc(String(ref.id)) + '" data-nm="' + esc(ref.name) + '" aria-label="Void sent item — manager approval required" title="Void (manager approval)">✕</button>'
             : '');
-        return '<div class="cart-line"><div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
+        return '<div class="cart-line" data-eline="' + kind + ':' + esc(String(ref.temp_id || ref.id)) + '" title="Tap to edit item"><div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
           (mods ? '<span class="mods">' + mods + '</span>' : '') + '</div>' + pill +
           '<span class="pr">' + fmt(lineTotal) + '</span>' + voidBtn + '</div>';
       }).join('') + '</div>').join('');
@@ -1116,6 +1140,18 @@ async function renderOrder(app, checkId) {
     });
     /* Sent items: same manager-approval modal. */
     $$('[data-voidmgr]', cartBody).forEach((b) => b.onclick = () => openVoidApproval(b.dataset.voidmgr, b.dataset.nm));
+    /* Tap a line (anywhere except the ✕) to edit qty / modifiers. */
+    $$('[data-eline]', cartBody).forEach((el) => {
+      el.onclick = (e) => {
+        if (e.target.closest('[data-void],[data-voidmgr]')) return;
+        const sep = el.dataset.eline.indexOf(':');
+        const kind = el.dataset.eline.slice(0, sep), id = el.dataset.eline.slice(sep + 1);
+        const ref = kind === 'staged'
+          ? staged.find((s) => String(s.temp_id) === id)
+          : (check.items || []).find((i) => String(i.temp_id || i.id) === id);
+        if (ref) openEditItemModal(kind, ref);
+      };
+    });
   }
 
   /* Manager-approved void (held or sent): the manager enters their PIN at
@@ -1172,6 +1208,94 @@ async function renderOrder(app, checkId) {
         await api('/api/checks/' + realId(cid) + '/void-item', 'POST', { item_id: Number(itemId), manager_pin: managerPin, reason });
         toast('Item voided — manager approved', 'ok');
       }
+    } catch (e) { handleApiError(e); }
+  }
+
+  /* Edit an item already on the order: tap its line to change qty and/or
+     modifiers. Staged items edit locally; held items PATCH directly; sent
+     items need a manager PIN (kitchen already fired) and are audit-logged. */
+  function openEditItemModal(kind, ref) {
+    const isStaged = kind === 'staged';
+    const isSent = !isStaged && ref.state !== 'held';
+    let menuItem = null;
+    for (const c of (menu || [])) {
+      const f = (c.items || []).find((x) => String(x.id) === String(ref.menu_item_id));
+      if (f) { menuItem = f; break; }
+    }
+    const mods = menuItem ? itemModifiers(menuItem) : [];
+    const current = {};
+    (ref.modifiers || []).forEach((m) => { current[m.name] = true; });
+    let qty = ref.qty || 1;
+    const bd = openModal(
+      '<h2>Edit item</h2>' +
+      '<p class="muted"><b>' + esc(ref.name) + '</b>' + (isSent ? ' · <span class="pill sent">sent to kitchen</span>' : '') + '</p>' +
+      (isSent ? '<p class="muted small">This item already fired to the kitchen — a manager PIN is required and the change is audit-logged.</p>' : '') +
+      '<div class="field"><label>Quantity</label><div class="stepper"><button data-q="dec">−</button><span class="val" id="e-qty">' + qty + '</span><button data-q="inc">+</button></div></div>' +
+      (mods.length
+        ? '<h3>Modifiers</h3><div id="emod-list">' +
+          mods.map((m, i) => '<label class="mod-row"><input type="checkbox" data-mi="' + i + '"' + (current[m.name] ? ' checked' : '') + '>' +
+            '<span class="mn">' + esc(m.name) + '</span><span class="mp">+' + fmt(m.price_delta_cents) + '</span></label>').join('') + '</div>'
+        : ((ref.modifiers || []).length
+          ? '<p class="muted small">Modifiers: ' + esc(ref.modifiers.map((m) => m.name).join(', ')) + ' <span class="muted">(menu unavailable offline — qty only)</span></p>'
+          : '')) +
+      (isSent ? '<label class="fld">Manager PIN <input id="em-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px"></label>' : '') +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="save">Save changes</button></div>');
+    $('[data-q="dec"]', bd).onclick = () => { qty = Math.max(1, qty - 1); $('#e-qty', bd).textContent = qty; };
+    $('[data-q="inc"]', bd).onclick = () => { qty = Math.min(24, qty + 1); $('#e-qty', bd).textContent = qty; };
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    $('[data-x="save"]', bd).onclick = async () => {
+      const picked = mods.length
+        ? $$('#emod-list input:checked', bd).map((c) => mods[Number(c.dataset.mi)]).map((m) => ({ name: m.name, price_delta_cents: m.price_delta_cents }))
+        : (ref.modifiers || []);
+      let managerPin = null;
+      if (isSent) {
+        managerPin = $('#em-pin', bd).value.trim();
+        if (!/^\d{4}$/.test(managerPin)) { toast("Enter the manager's 4-digit PIN", 'err'); return; }
+      }
+      closeModal();
+      await saveItemEdit(kind, ref, qty, picked, managerPin);
+    };
+  }
+
+  async function saveItemEdit(kind, ref, qty, modifiers, managerPin) {
+    try {
+      if (kind === 'staged') {
+        const s = staged.find((x) => x.temp_id === ref.temp_id);
+        if (s) { s.qty = qty; s.modifiers = modifiers; saveStaged(checkId, staged); drawCart(); toast('Item updated'); }
+        return;
+      }
+      const refKey = String(ref.temp_id || ref.id);
+      if (isOffline()) {
+        // If the item is itself a pending offline add, fold the edit into that op.
+        const ops = await Outbox.forCheck(realId(checkId));
+        let absorbed = false;
+        for (const o of ops) {
+          if (o.op === 'add_items') {
+            const it = (o.payload.items || []).find((x) => String(x.temp_id) === refKey);
+            if (it) { it.qty = qty; it.modifiers = modifiers; await Outbox.update(o); absorbed = true; break; }
+          }
+        }
+        if (!absorbed) {
+          const payload = { check_id: realId(checkId), item_id: ref.id, qty, modifiers };
+          if (managerPin) {
+            if (!window.crypto || !crypto.subtle || !crypto.getRandomValues) {
+              toast('Offline edit of a sent item needs a secure context — reconnect to edit', 'err');
+              return;
+            }
+            payload.manager_pin_hash = await sha256Hex(managerPin);
+            payload.approval_nonce = randomNonce();
+          }
+          await Outbox.enqueue('edit_item', payload);
+        }
+        toast('Edit queued — syncs on reconnect', 'ok');
+      } else {
+        const body = { qty, modifiers };
+        if (managerPin) body.manager_pin = managerPin;
+        await api('/api/checks/' + realId(checkId) + '/items/' + ref.id, 'PATCH', body);
+        toast('Item updated' + (managerPin ? ' — manager approved' : ''), 'ok');
+      }
+      renderRoute(true);
     } catch (e) { handleApiError(e); }
   }
 
