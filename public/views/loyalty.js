@@ -8,6 +8,9 @@
  * app's api helper.
  * ========================================================================== */
 
+(function () {
+'use strict';
+
 function esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -117,3 +120,5 @@ async function renderLoyalty(container, api) {
 }
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { renderLoyalty };
+else if (typeof window !== 'undefined') window.renderLoyalty = renderLoyalty;
+})();
