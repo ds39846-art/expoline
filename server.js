@@ -2669,6 +2669,14 @@ function fireHeldItemsToKdsCore(check, held) {
       JSON.stringify(items), sentAt
     );
     tickets.push(ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid)));
+    /* QA hook (test-scoped, env-gated): EXPOLINE_TEST_FAIL_KDS=1 forces a
+       mid-fire failure AFTER the first ticket insert — so forced-failure
+       tests can prove the course-fire transaction rolls back atomically
+       (items stay HELD, inventory restored, no fire/audit rows). Inert in
+       production unless the env var is explicitly set. */
+    if (process.env.EXPOLINE_TEST_FAIL_KDS === '1') {
+      throw new Error('EXPOLINE_TEST_FAIL_KDS: forced KDS ticket-insertion failure mid-fire');
+    }
   }
   return { sent: held.length, tickets };
 }
