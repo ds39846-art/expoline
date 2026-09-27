@@ -13,6 +13,11 @@ const ROOT = path.join(__dirname, '..', '..');
 const SOAK_DIR = __dirname;
 const BASE = 'http://localhost:4320';
 const DB_FILE = path.join(ROOT, 'db', 'soak.db');
+// Direct-DB chaos checks must inspect the database the live server is actually
+// using. In our deployment the server runs separately with the persistent DB,
+// so point the read-only chaos checks at it via SOAK_CHAOS_DB. (Default keeps
+// the harness self-contained: its own spawned server uses DB_FILE.)
+const CHAOS_DB_FILE = process.env.SOAK_CHAOS_DB || DB_FILE;
 const DURATION_MS = parseInt(process.env.SOAK_DURATION_MS || String(7 * 24 * 3600 * 1000), 10);
 const SPIKE_EVERY_MS = parseInt(process.env.SOAK_SPIKE_EVERY_MS || String(6 * 3600 * 1000), 10);
 const SPIKE_ORDERS = parseInt(process.env.SOAK_SPIKE_ORDERS || '400', 10);
@@ -45,6 +50,79 @@ function saveMetrics() {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// ---- Disk-space guard (2026-09-27) ----
+// /tmp exhaustion silently killed a soak run on 2026-09-26. df-based, no new
+// dependencies. At startup, refuse to run below the hard floor (clear FATAL
+// on stderr instead of dying mid-run). Below the soft threshold, rotate the
+// runaway logs (truncate to last ROTATE_KEEP_LINES lines — append-mode
+// writers keep working after truncation) and sweep only our own
+// /tmp/soak-scratch-* files older than 24h. Thresholds are env-overridable.
+const DISK_WARN_MB = parseFloat(process.env.SOAK_DISK_WARN_MB || '500');
+const DISK_FATAL_MB = parseFloat(process.env.SOAK_DISK_FATAL_MB || '100');
+const ROTATE_KEEP_LINES = 2000;
+const stdoutLogFile = path.join(SOAK_DIR, 'soak_stdout.log');
+function diskFreeMB(dir) {
+  try {
+    const out = execFileSync('df', ['-k', '--output=avail', dir],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const last = out.trim().split('\n').pop().trim();
+    const kb = parseInt(last, 10);
+    return Number.isNaN(kb) ? null : kb / 1024;
+  } catch { return null; } // df unavailable: skip rather than crash
+}
+function diskCheckDirs() {
+  // Colon-separated override exists for unit tests.
+  if (process.env.SOAK_DISK_CHECK_DIRS) return process.env.SOAK_DISK_CHECK_DIRS.split(':');
+  return ['/tmp', SOAK_DIR];
+}
+function rotateLogs(files) {
+  for (const f of files || [logFile, stdoutLogFile]) {
+    try {
+      if (!fs.existsSync(f)) continue;
+      const lines = fs.readFileSync(f, 'utf8').split('\n');
+      if (lines.length > ROTATE_KEEP_LINES) {
+        fs.writeFileSync(f, lines.slice(-ROTATE_KEEP_LINES).join('\n'));
+        log('WARN', `DISK: rotated ${path.basename(f)} to last ${ROTATE_KEEP_LINES} lines`);
+      }
+    } catch { /* best effort: rotation must never crash the harness */ }
+  }
+  try {
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    for (const name of fs.readdirSync('/tmp')) {
+      if (!name.startsWith('soak-scratch-')) continue;
+      const p = path.join('/tmp', name);
+      const st = fs.statSync(p);
+      if (st.isFile() && st.mtimeMs < cutoff) {
+        fs.unlinkSync(p);
+        log('WARN', `DISK: removed stale scratch ${name}`);
+      }
+    }
+  } catch { /* best effort */ }
+}
+// Returns 'ok' | 'warn' | 'unknown'. fatalOk=true only at startup: below the
+// hard floor we exit(1) with a FATAL instead of starting and dying mid-run.
+function diskGuard(fatalOk) {
+  let dir = null, free = Infinity;
+  for (const d of diskCheckDirs()) {
+    const f = diskFreeMB(d);
+    if (f === null) continue;
+    if (f < free) { dir = d; free = f; }
+  }
+  if (dir === null) return 'unknown';
+  if (free < DISK_FATAL_MB && fatalOk) {
+    const msg = `DISK FATAL: only ${free.toFixed(0)}MB free on ${dir} (floor ${DISK_FATAL_MB}MB) — refusing to start soak`;
+    try { log('FATAL', msg); } catch {}
+    console.error(msg);
+    process.exit(1);
+  }
+  if (free < DISK_WARN_MB) {
+    log('WARN', `DISK: only ${free.toFixed(0)}MB free on ${dir} (warn ${DISK_WARN_MB}MB) — rotating runaway logs`);
+    rotateLogs();
+    return 'warn';
+  }
+  return 'ok';
+}
 
 let serverProc = null;
 function startServer() {
@@ -282,7 +360,7 @@ async function chaos() {
   // integrity check
   try {
     const out = execFileSync(process.execPath, ['-e',
-      `const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(${JSON.stringify(DB_FILE)});console.log(JSON.stringify(db.prepare('PRAGMA integrity_check').get()));`
+      `const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(${JSON.stringify(CHAOS_DB_FILE)});console.log(JSON.stringify(db.prepare('PRAGMA integrity_check').get()));`
     ], { cwd: ROOT }).toString();
     if (!out.includes('ok')) critical('chaos: integrity_check failed: ' + out);
     else log('INFO', 'CHAOS: integrity_check ok');
@@ -291,7 +369,7 @@ async function chaos() {
   try {
     const out = execFileSync(process.execPath, ['-e', `
 const {DatabaseSync}=require('node:sqlite');
-const db=new DatabaseSync(${JSON.stringify(DB_FILE)});
+const db=new DatabaseSync(${JSON.stringify(CHAOS_DB_FILE)});
 const bad=db.prepare("SELECT id,total_cents FROM checks WHERE status IN ('paid','closed') AND (total_cents - (SELECT COALESCE(SUM(amount_cents),0)-COALESCE(SUM(refunded_cents),0) FROM payments WHERE payments.check_id=checks.id)) > 0").all();
 console.log(JSON.stringify(bad));`], { cwd: ROOT }).toString();
     const bad = JSON.parse(out);
@@ -320,7 +398,10 @@ async function worker(id) {
 }
 
 const END = Date.now() + DURATION_MS;
-(async () => {
+async function main() {
+  // Disk guard FIRST: refuse to start below the hard floor rather than
+  // dying mid-run. (Writes FATAL to stderr + exits before any server/DB work.)
+  diskGuard(true);
   setStatus('RUNNING');
   log('INFO', `soak starting: ${DURATION_MS / 3600 / 1000}h, ${WORKERS} workers`);
   // fresh DB
@@ -330,6 +411,9 @@ const END = Date.now() + DURATION_MS;
   await startServer();
   await loadMenu();
   log('INFO', 'server healthy, menu loaded');
+
+  // Periodic disk guard (warn + rotate only; never exits mid-run).
+  setInterval(() => { try { diskGuard(false); } catch {} }, 15 * 60 * 1000).unref();
 
   let nextSpike = Date.now() + SPIKE_EVERY_MS;
   let nextChaos = Date.now() + CHAOS_EVERY_MS;
@@ -354,8 +438,16 @@ const END = Date.now() + DURATION_MS;
   }
   await killServer();
   process.exit(0);
-})().catch(e => {
-  log('FATAL', e.stack || e.message);
-  setStatus('FAILED:' + e.message);
-  process.exit(1);
-});
+}
+
+// Gate the entry point so the disk-guard helpers are unit-testable via
+// require() without launching a soak run.
+if (require.main === module) {
+  main().catch(e => {
+    try { log('FATAL', e.stack || e.message); } catch {}
+    try { setStatus('FAILED:' + e.message); } catch {}
+    process.exit(1);
+  });
+} else {
+  module.exports = { diskFreeMB, diskGuard, rotateLogs, diskCheckDirs, DISK_WARN_MB, DISK_FATAL_MB };
+}
