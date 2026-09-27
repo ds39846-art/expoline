@@ -6665,6 +6665,13 @@ require('./routes/online').register(app, {
   persistTotals, checkResponse, broadcastCheckUpdated,
 });
 
+/* Phase 4: proactive P&L insights + "Ask the restaurant anything" (manager-only).
+   Same honest sales data as finance; server performance, movers, labor watch,
+   anomaly alerts, and deterministic NL Q&A — no separate analytics SKU. */
+require('./routes/insights').register(app, {
+  db, SITE_ID, managerOnly, nowIso, tzDate, todaySite, addDays, dayLabor, SITE_TZ,
+});
+
 /* Phase 3B staff routes: KDS aging settings/alerts, tip-out rules + report,
    delivery aggregation, cash-collect requests, guest-split reverse, table QR. */
 require('./routes/parity_kds_pay').registerStaff(app, {

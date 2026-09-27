@@ -801,6 +801,7 @@ async function renderRoute(soft) {
       if (sub === 'cash') return renderCashDrawer(app, api);
       if (sub === 'schedule') return renderSchedule(app, api);
       if (sub === 'analytics') return renderProductMix(app, api);
+      if (sub === 'insights') return renderInsights(app, api);
       if (sub === 'notes') return renderStaffNotes(app, api);
       if (sub === 'reviews') return renderReviews(app, api);
       if (sub === 'multisite') return renderMultisite(app, api);
@@ -2944,7 +2945,7 @@ function mgrNav(active) {
      ['#/manager/floorplan', 'Floor plan', active === 'floorplan'], ['#/manager/timeclock', 'Time clock', active === 'timeclock'],
      ['#/manager/employees', 'Employees', active === 'employees'],
      ['#/manager/cash', 'Cash drawer', active === 'cash'], ['#/manager/schedule', 'Schedule', active === 'schedule'],
-     ['#/manager/analytics', 'Product mix', active === 'analytics'], ['#/manager/notes', 'Staff notes', active === 'notes'],
+     ['#/manager/analytics', 'Product mix', active === 'analytics'], ['#/manager/insights', 'Insights', active === 'insights'], ['#/manager/notes', 'Staff notes', active === 'notes'],
      ['#/manager/reviews', 'Reviews', active === 'reviews'], ['#/manager/inventory', 'Inventory', active === 'inventory'],
      ['#/manager/multisite', 'Locations', active === 'multisite'], ['#/manager/apidocs', 'API docs', active === 'apidocs'],
      ['#/manager/settings', 'Settings', active === 'settings']]
