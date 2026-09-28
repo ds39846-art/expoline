@@ -475,6 +475,11 @@ def test_notes():
 # ---------------------------------------------------------------- 6. reviews
 def test_reviews():
     print("--- 6. post-payment reviews ---")
+    # LOCKED POLICY (2026-09-27): review nudge defaults OFF. Enable it for
+    # this test via the manager setting.
+    call("PUT", "/api/admin/settings", {"key": "review_prompt", "value": "true"}, MT, expect=(200,))
+    s, ls0 = get("/api/login-summary", ST)
+    check("login-summary reflects enabled prompt", ls0.get("review_prompt") is True)
     cid = new_check(ST)
     add_item(ST, cid, MENU_ITEM["id"], qty=1)
     try:

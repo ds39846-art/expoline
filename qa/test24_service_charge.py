@@ -22,7 +22,7 @@ Covers phase 4:
 
 Date-agnostic: uses the site date from /api/config.
 """
-import io, json, sys, urllib.request, urllib.error, zipfile
+import io, json, os, sys, urllib.request, urllib.error, zipfile
 
 BASE = os.environ.get("EXPOLINE_BASE", os.environ.get("EXPLOINE_BASE", "http://localhost:4328"))
 S, M = "1111", "2580"

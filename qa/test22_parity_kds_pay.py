@@ -632,7 +632,10 @@ check("J5 card auth code is demo-shaped",
       bool(b["payment"].get("auth_code", "").startswith("DEMO")), str(b["payment"].get("auth_code")))
 cents_ints(b, "J split tender")
 
-# J6: house account needs a memo
+# J6: house account needs a memo (LOCKED POLICY 2026-09-27: manager-created
+# only — create the account first via the manager endpoint)
+s, b = call("POST", "/api/admin/house-accounts", AUTH["mt"], {"name": "Bali Hai — Daniel Silva"})
+check("J6a manager creates house account", s == 201, f"got {s} {str(b)[:120]}")
 hc = mk_check(AUTH["st"], table_id=21, name="T22 house")
 add_item(AUTH["st"], hc, 14)
 s, b = call("GET", f"/api/checks/{hc}", AUTH["mt"])
