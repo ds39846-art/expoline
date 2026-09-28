@@ -223,6 +223,19 @@ db.exec('PRAGMA busy_timeout=5000;');
     details TEXT,
     created_at TEXT
   )`);
+  /* House accounts (LOCKED POLICY 2026-09-27: manager-created only).
+     A house_account tender must name an existing ACTIVE account; servers
+     cannot invent accounts at payment time. */
+  db.exec(`CREATE TABLE IF NOT EXISTS house_accounts (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT,
+    site_id TEXT,
+    name TEXT,
+    active INTEGER DEFAULT 1,
+    created_by TEXT,
+    created_at TEXT,
+    UNIQUE(site_id, name)
+  )`);
   /* One-time offline manager approvals. When a void is queued offline, the
      client stores sha256(manager PIN) + a random nonce — NEVER the raw PIN.
      The nonce is bound to (check, item) on first use; replays and retargets
@@ -2982,12 +2995,17 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
   }
   /* House account is a real charge-to-account tender: the named account owes
    * the house; the payment row (with memo = account name) is the ledger
-   * entry and shows up in finance reporting. */
+   * entry and shows up in finance reporting.
+   * LOCKED POLICY 2026-09-27 (A — manager-created only): the memo must name
+   * an existing ACTIVE house account. Servers cannot invent accounts at
+   * payment time; accounts are created by managers via /api/admin/house-accounts. */
   let memoVal = null;
   if (method === 'house_account') {
     memoVal = String(memo || '').trim();
     if (!memoVal) return res.status(400).json({ error: 'memo (account name) is required for house account payments' });
     if (memoVal.length > 80) return res.status(400).json({ error: 'memo must be 80 characters or fewer' });
+    const acct = db.prepare("SELECT id FROM house_accounts WHERE site_id = ? AND name = ? AND COALESCE(active, 1) = 1").get(SITE_ID, memoVal);
+    if (!acct) return res.status(400).json({ error: 'Unknown or inactive house account — ask a manager to create it first' });
   }
   if (!isInt(amount_cents) || amount_cents <= 0) {
     return res.status(400).json({ error: 'amount_cents must be a positive integer' });
@@ -4821,6 +4839,45 @@ app.get('/api/admin/approvals/audit', managerOnly(), (req, res) => {
   res.json(db.prepare('SELECT id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at FROM approval_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
 });
 
+/* ------------------------- house accounts -------------------------
+   LOCKED POLICY 2026-09-27 (A — manager-created only): house accounts are
+   created (and deactivated) by managers only. The house_account payment
+   tender requires the memo to name an existing active account. */
+
+/** GET /api/admin/house-accounts — list accounts (managers; servers see active names for the tender picker). */
+app.get('/api/admin/house-accounts', serverPlus(), (req, res) => {
+  const rows = db.prepare('SELECT id, uuid, name, active, created_by, created_at FROM house_accounts WHERE site_id = ? ORDER BY name').all(SITE_ID);
+  res.json(rows);
+});
+
+/** POST /api/admin/house-accounts {name} — manager-only creation. */
+app.post('/api/admin/house-accounts', managerOnly(), (req, res) => {
+  const name = String((req.body && req.body.name) || '').trim();
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  if (name.length > 80) return res.status(400).json({ error: 'name must be 80 characters or fewer' });
+  const dup = db.prepare('SELECT id, active FROM house_accounts WHERE site_id = ? AND name = ?').get(SITE_ID, name);
+  if (dup) {
+    if (dup.active) return res.status(409).json({ error: 'House account already exists', id: dup.id });
+    db.prepare('UPDATE house_accounts SET active = 1 WHERE id = ?').run(dup.id);
+    auditApproval(req, 'house_account_reactivate', {}, { house_account_id: dup.id, name });
+    return res.json({ id: dup.id, name, active: 1, reactivated: true });
+  }
+  const r = db.prepare('INSERT INTO house_accounts (uuid, site_id, name, active, created_by, created_at) VALUES (?, ?, ?, 1, ?, ?)')
+    .run(crypto.randomUUID(), SITE_ID, name, req.user ? req.user.name : '?', new Date().toISOString());
+  auditApproval(req, 'house_account_create', {}, { house_account_id: r.lastInsertRowid, name });
+  res.status(201).json({ id: r.lastInsertRowid, name, active: 1 });
+});
+
+/** PATCH /api/admin/house-accounts/:id {active} — manager-only deactivate/reactivate. */
+app.patch('/api/admin/house-accounts/:id', managerOnly(), (req, res) => {
+  const row = db.prepare('SELECT id, name, active FROM house_accounts WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!row) return res.status(404).json({ error: 'House account not found' });
+  const active = req.body && req.body.active !== undefined ? (req.body.active ? 1 : 0) : 1;
+  db.prepare('UPDATE house_accounts SET active = ? WHERE id = ?').run(active, row.id);
+  auditApproval(req, active ? 'house_account_reactivate' : 'house_account_deactivate', {}, { house_account_id: row.id, name: row.name });
+  res.json({ id: row.id, name: row.name, active });
+});
+
 /* --------------------- reservations + waitlist ----------------------
    Native reservations + waitlist, deeply integrated with the floor plan.
    Differentiators vs Toast/TouchBistro:
@@ -6496,7 +6553,10 @@ const API_DOCS = [
   { method: 'POST', path: '/api/checks/:id/void-item', auth: 'server+ (+manager PIN approval)', summary: 'Void an item, audit-logged', params: 'item_id, manager_pin, reason' },
   { method: 'POST', path: '/api/checks/:id/comp', auth: 'server+ (+manager PIN approval)', summary: 'Comp value on a check', params: 'amount_cents, manager_pin, reason' },
   { method: 'POST', path: '/api/checks/:id/split', auth: 'server+', summary: 'Even / by-seat / by-item split', params: 'mode, ...' },
-  { method: 'POST', path: '/api/checks/:id/payments', auth: 'server+', summary: 'Take cash or card_demo payment', params: 'method, amount_cents, tip_cents, tendered_cents?' },
+  { method: 'POST', path: '/api/checks/:id/payments', auth: 'server+', summary: 'Take cash, card_demo, or house_account payment (house_account requires a manager-created account)', params: 'method, amount_cents, tip_cents, tendered_cents?, memo?' },
+  { method: 'GET', path: '/api/admin/house-accounts', auth: 'server+', summary: 'List house accounts (manager-created only)', params: '—' },
+  { method: 'POST', path: '/api/admin/house-accounts', auth: 'manager', summary: 'Create a house account', params: 'name' },
+  { method: 'PATCH', path: '/api/admin/house-accounts/:id', auth: 'manager', summary: 'Activate/deactivate a house account', params: 'active' },
   { method: 'POST', path: '/api/payments/:id/refund', auth: 'manager', summary: 'Refund a payment', params: 'amount_cents?' },
   { method: 'POST', path: '/api/checks/:id/close', auth: 'server+', summary: 'Close a fully-paid check', params: '—' },
   { method: 'GET', path: '/api/kds/tickets', auth: 'kitchen+', summary: 'KDS tickets by station', params: 'station?' },

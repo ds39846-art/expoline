@@ -130,6 +130,20 @@ CREATE TABLE payments (
   created_at TEXT
 );
 
+/* House accounts (LOCKED POLICY 2026-09-27: manager-created only).
+   A house_account tender must name an existing ACTIVE account; servers
+   cannot invent accounts at payment time. */
+CREATE TABLE house_accounts (
+  id INTEGER PRIMARY KEY,
+  uuid TEXT,
+  site_id TEXT,
+  name TEXT,
+  active INTEGER DEFAULT 1,
+  created_by TEXT,
+  created_at TEXT,
+  UNIQUE(site_id, name)
+);
+
 CREATE TABLE kds_tickets (
   id INTEGER PRIMARY KEY,
   uuid TEXT,
