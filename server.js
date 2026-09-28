@@ -2392,6 +2392,125 @@ app.post('/api/checks/:id/void', serverPlus(), (req, res) => {
 
 
 /**
+ * POST /api/checks/:id/transfer {to_server_id, from_server_id, manager_pin?, reason?, idempotency_key?}
+ * Check transfer / server re-claim (claim/overlap design §3.6).
+ * - Moves an OPEN check to another server (shift change, section handoff) or
+ *   lets a server claim an unassigned (kiosk/QR) check: from_server_id null
+ *   means "I expect it to be unassigned".
+ * - Optimistic concurrency on the current holder: the conditional UPDATE is
+ *   the arbiter — exactly one contender wins a race. A lost race returns 409
+ *   with the current holder's identity (§3.4 contract), never a silent 200.
+ * - Who may transfer: the check's current holder, anyone claiming an
+ *   unassigned check, or — for someone else's check — a FRESH manager PIN
+ *   (verifyManagerPin, same bar as whole-check void; always audit-logged).
+ * - Accepts Idempotency-Key (header or body) via the idemReserve framework:
+ *   a retried transfer replays the stored outcome instead of 409ing.
+ */
+app.post('/api/checks/:id/transfer', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const checkId = Number(req.params.id);
+  const ikey = req.get('Idempotency-Key') || b.idempotency_key || null;
+  let idem = null;
+  if (ikey) {
+    const rsv = idemReserve('transfers', ikey);
+    if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+    if (rsv.state === 'processing')
+      return res.status(409).json({ error: 'Duplicate request in progress' });
+    idem = ikey;
+  }
+  const fail = (status, body) => {
+    if (idem) idemClear('transfers', idem);
+    return res.status(status).json(body);
+  };
+  try {
+    const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(checkId, SITE_ID);
+    if (!check) return fail(404, { error: 'Check not found' });
+    if (check.status !== 'open')
+      return fail(400, { error: `Cannot transfer a ${check.status} check` });
+
+    const toId = b.to_server_id;
+    if (!isInt(toId) || toId < 1)
+      return fail(400, { error: 'to_server_id must be a user id' });
+    const target = db.prepare(
+      "SELECT id, name, role FROM users WHERE id = ? AND site_id = ? AND role IN ('server','manager') AND COALESCE(active, 1) = 1"
+    ).get(toId, SITE_ID);
+    if (!target)
+      return fail(400, { error: 'to_server_id must be an active server or manager' });
+
+    // from_server_id is required (null = "I expect it unassigned") so the
+    // client states the holder it saw; the UPDATE below enforces it.
+    if (!('from_server_id' in b) || (b.from_server_id !== null && (!isInt(b.from_server_id) || b.from_server_id < 1)))
+      return fail(400, { error: 'from_server_id is required (null when the check is unassigned)' });
+    const fromId = b.from_server_id;
+
+    if (toId === check.server_id)
+      return fail(200, { transferred: check.id, server_id: check.server_id, noop: true });
+
+    /* Authorization (claim/overlap design §3.6):
+       - from_server_id === caller: acting as the (believed) holder — a handoff.
+         The conditional UPDATE below arbitrates; a stale view loses with 409.
+       - from_server_id === null: claiming an unassigned check. The UPDATE's
+         `server_id IS NULL` arbitrates; losers get 409 naming the holder.
+       - from_server_id === someone else: acting on another holder's check —
+         needs a FRESH manager PIN (override mode, bypasses the holder check,
+         always audit-logged). Without it: 403.
+       A valid manager PIN always selects override mode. */
+    const callerId = req.user ? req.user.id : null;
+    let mgr = null, override = false;
+    if (fromId !== null && fromId !== callerId) {
+      mgr = verifyManagerPin(b.manager_pin);
+      if (!mgr)
+        return fail(403, { error: "Transferring another server's check needs a manager's PIN", need_manager_pin: true });
+      override = true;
+    }
+
+    const holderName = (id) => id == null ? null
+      : (db.prepare('SELECT name FROM users WHERE id = ?').get(id) || {}).name || null;
+    const lostRace = () => {
+      const cur = db.prepare('SELECT server_id, status FROM checks WHERE id = ?').get(checkId);
+      if (!cur || cur.status !== 'open')
+        return fail(409, { error: 'Check changed during transfer', check_id: checkId, status: cur ? cur.status : 'gone' });
+      const hid = cur.server_id;
+      return fail(409, {
+        error: hid == null ? 'Check is unassigned' : 'Check holder changed',
+        check_id: checkId, held_by_id: hid, held_by: holderName(hid),
+      });
+    };
+
+    let changes;
+    if (override) {
+      changes = db.prepare(
+        "UPDATE checks SET server_id = ? WHERE id = ? AND site_id = ? AND status = 'open'"
+      ).run(toId, checkId, SITE_ID).changes;
+    } else if (fromId == null) {
+      changes = db.prepare(
+        "UPDATE checks SET server_id = ? WHERE id = ? AND site_id = ? AND status = 'open' AND server_id IS NULL"
+      ).run(toId, checkId, SITE_ID).changes;
+    } else {
+      changes = db.prepare(
+        "UPDATE checks SET server_id = ? WHERE id = ? AND site_id = ? AND status = 'open' AND server_id = ?"
+      ).run(toId, checkId, SITE_ID, fromId).changes;
+    }
+    if (changes !== 1) return lostRace();
+
+    const reason = cleanLabel(b.reason || '');
+    broadcastCheckUpdated(checkId);
+    auditApproval(req, 'check_transfer', { check_id: checkId },
+      { before: { server_id: check.server_id, server_name: holderName(check.server_id) },
+        after: { server_id: toId, server_name: target.name },
+        override, approver: mgr ? mgr.name : null, reason: reason || undefined });
+    const out = { transferred: checkId, server_id: toId, server_name: target.name,
+      from_server_id: check.server_id, override, approved_by: mgr ? mgr.name : undefined };
+    if (idem) idemStore('transfers', idem, 200, out);
+    return res.json(out);
+  } catch (e) {
+    if (idem) idemClear('transfers', idem);
+    throw e;
+  }
+});
+
+
+/**
  * PATCH /api/checks/:id/items/:item_id {qty?, modifiers?, seat?, course?, note?, allergy?, allergy_detail?,
  *   manager_pin?, manager_pin_hash?, approval_nonce?}
  * Edit an item on an open check: change qty and/or modifiers.
@@ -6727,6 +6846,7 @@ const API_DOCS = [
   { method: 'POST', path: '/api/checks/:id/send', auth: 'server+', summary: 'Fire held items → KDS, depletes inventory', params: '—' },
   { method: 'POST', path: '/api/checks/:id/void-item', auth: 'server+ (+manager PIN approval)', summary: 'Void an item, audit-logged', params: 'item_id, manager_pin, reason' },
   { method: 'POST', path: '/api/checks/:id/comp', auth: 'server+ (+manager PIN approval)', summary: 'Comp value on a check', params: 'amount_cents, manager_pin, reason' },
+  { method: 'POST', path: '/api/checks/:id/transfer', auth: 'server+ (+manager PIN to take another server\'s check)', summary: 'Transfer check to another server / claim unassigned (NEW 3.6)', params: 'to_server_id, from_server_id, manager_pin?, reason?' },
   { method: 'POST', path: '/api/checks/:id/split', auth: 'server+', summary: 'Even / by-seat / by-item split', params: 'mode, ...' },
   { method: 'POST', path: '/api/checks/:id/payments', auth: 'server+', summary: 'Take cash, card_demo, or house_account payment (house_account requires a manager-created account)', params: 'method, amount_cents, tip_cents, tendered_cents?, memo?' },
   { method: 'GET', path: '/api/admin/house-accounts', auth: 'server+', summary: 'List house accounts (manager-created only)', params: '—' },
