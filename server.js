@@ -1024,75 +1024,25 @@ setInterval(() => {
   }
 }, 5 * 60_000).unref();
 
-/* ---- login brute-force protection (4-digit PINs are guessable) ----
-   Per-IP: LOGIN_MAX failed attempts inside LOGIN_WINDOW_MS locks the IP out
-   of /api/auth/login for LOGIN_LOCK_MS (429). A success resets the counter. */
-const LOGIN_MAX = 10;
-const LOGIN_WINDOW_MS = 60_000;
-const LOGIN_LOCK_MS = 5 * 60_000;
-const loginAttempts = new Map(); // ip -> {count, firstAt, lockedUntil}
-function loginThrottled(ip) {
-  const now = Date.now();
-  const e = loginAttempts.get(ip);
-  if (!e) return false;
-  if (e.lockedUntil > now) return true;
-  if (now - e.firstAt > LOGIN_WINDOW_MS) { loginAttempts.delete(ip); return false; }
-  return false;
+/* ---- auth audit (LOCKED POLICY 2026-09-27: audit-only, NO strict lockout) ----
+   Failed logins and failed manager-PIN verifications are written to the
+   approval audit log. There is deliberately NO lockout: a busy restaurant
+   must never be locked out of its own POS during service. Managers review
+   repeated failures in the audit log. */
+function auditAuthEvent(req, action, details) {
+  try {
+    db.prepare(`INSERT INTO approval_audit (site_id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at)
+      VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`)
+      .run(SITE_ID, req.user ? req.user.name : '?', req.user ? req.user.name : '?',
+        action, JSON.stringify(details || {}), new Date().toISOString());
+  } catch (e) { /* audit is best-effort; never break the auth flow */ }
 }
-function recordLoginAttempt(ip, ok) {
-  const now = Date.now();
-  if (ok) { loginAttempts.delete(ip); return; }
-  let e = loginAttempts.get(ip);
-  if (!e || now - e.firstAt > LOGIN_WINDOW_MS) e = { count: 0, firstAt: now, lockedUntil: 0 };
-  e.count += 1;
-  if (e.count >= LOGIN_MAX) e.lockedUntil = now + LOGIN_LOCK_MS;
-  loginAttempts.set(ip, e);
-}
-// Prevent unbounded growth of the limiter map.
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, e] of loginAttempts) {
-    if (e.lockedUntil <= now && now - e.firstAt > LOGIN_WINDOW_MS) loginAttempts.delete(ip);
-  }
-}, 5 * 60_000).unref();
-
-/* ---- manager-PIN brute-force protection ----
-   Voids, comps, and time-clock adjustments require the manager's 4-digit PIN
-   at the point of action. An authenticated insider (any server token) could
-   otherwise guess it at full speed. Per (actor, IP): PIN_MAX failed attempts
-   inside PIN_WINDOW_MS locks PIN verification for PIN_LOCK_MS (429). */
-const PIN_MAX = 8;
-const PIN_WINDOW_MS = 5 * 60_000;
-const PIN_LOCK_MS = 5 * 60_000;
-const pinAttempts = new Map(); // `${ip}|${actorId}` -> {count, firstAt, lockedUntil}
-function pinKey(req) {
-  const ip = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
-  return `${ip}|${req.user ? req.user.id : '?'}`;
-}
-function managerPinThrottled(req) {
-  const now = Date.now();
-  const e = pinAttempts.get(pinKey(req));
-  if (!e) return false;
-  if (e.lockedUntil > now) return true;
-  if (now - e.firstAt > PIN_WINDOW_MS) { pinAttempts.delete(pinKey(req)); return false; }
-  return false;
+function recordLoginAttempt(req, ip, ok) {
+  if (!ok) auditAuthEvent(req, 'auth_login_failed', { ip });
 }
 function recordManagerPinAttempt(req, ok) {
-  const key = pinKey(req);
-  const now = Date.now();
-  if (ok) { pinAttempts.delete(key); return; }
-  let e = pinAttempts.get(key);
-  if (!e || now - e.firstAt > PIN_WINDOW_MS) e = { count: 0, firstAt: now, lockedUntil: 0 };
-  e.count += 1;
-  if (e.count >= PIN_MAX) e.lockedUntil = now + PIN_LOCK_MS;
-  pinAttempts.set(key, e);
+  if (!ok) auditAuthEvent(req, 'auth_manager_pin_failed', { ip: req.ip || (req.socket && req.socket.remoteAddress) || 'unknown' });
 }
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, e] of pinAttempts) {
-    if (e.lockedUntil <= now && now - e.firstAt > PIN_WINDOW_MS) pinAttempts.delete(k);
-  }
-}, 5 * 60_000).unref();
 
 /** 401 unless a valid Bearer token is present. Mounted on /api with public paths. */
 function authMiddleware(req, res, next) {
@@ -1194,12 +1144,9 @@ function consumeOfflineApproval(nonce, checkId, itemId, mgr) {
 }
 /* Resolve a void approval from either the online path (raw manager PIN,
    verified live) or the offline path (PIN hash + one-time nonce). Returns
-   { mgr, offline, replay, nonce } or sends 403/429 and returns null. */
+   { mgr, offline, replay, nonce } or sends 403 and returns null.
+   Policy: audit-only — failed PIN attempts are audit-logged, never lock out. */
 function resolveVoidApproval(req, b, checkId, itemId, res) {
-  if (managerPinThrottled(req)) {
-    res.status(429).json({ error: 'Too many failed manager-PIN attempts — please wait a few minutes' });
-    return null;
-  }
   if (b.approval_nonce !== undefined || b.manager_pin_hash !== undefined) {
     const v = verifyOfflineApproval(b.approval_nonce, b.manager_pin_hash, checkId, itemId);
     if (!v) {
@@ -1326,15 +1273,12 @@ app.get('/api/brain/status', (req, res) => {
 
 app.post('/api/auth/login', (req, res) => {
   const ip = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
-  if (loginThrottled(ip)) {
-    return res.status(429).json({ error: 'Too many login attempts — please wait a few minutes and try again' });
-  }
   const pin = req.body && req.body.pin != null ? String(req.body.pin) : '';
-  if (!pin) { recordLoginAttempt(ip, false); return res.status(401).json({ error: 'PIN required' }); }
+  if (!pin) { recordLoginAttempt(req, ip, false); return res.status(401).json({ error: 'PIN required' }); }
   // PINs compared as strings. Deactivated staff cannot log in.
   const user = db.prepare('SELECT id, name, role, COALESCE(split_allowed, 1) AS split_allowed FROM users WHERE pin = ? AND site_id = ? AND COALESCE(active, 1) = 1').get(pin, SITE_ID);
-  if (!user) { recordLoginAttempt(ip, false); return res.status(401).json({ error: 'Invalid PIN' }); }
-  recordLoginAttempt(ip, true);
+  if (!user) { recordLoginAttempt(req, ip, false); return res.status(401).json({ error: 'Invalid PIN' }); }
+  recordLoginAttempt(req, ip, true);
   const token = issueToken(user);
   res.json({ token, user: { id: user.id, name: user.name, role: user.role } });
 });
@@ -2574,9 +2518,6 @@ app.post('/api/checks/:id/items/:item_id/duplicate', serverPlus(), (req, res) =>
  */
 app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
   const b = req.body || {};
-  if (managerPinThrottled(req)) {
-    return res.status(429).json({ error: 'Too many failed manager-PIN attempts — please wait a few minutes' });
-  }
   const mgr = verifyManagerPin(b.manager_pin);
   if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Manager PIN required to comp a check' }); }
   recordManagerPinAttempt(req, true);
@@ -4520,9 +4461,6 @@ app.post('/api/admin/clock/adjust', managerOnly(), (req, res) => {
   // Point-of-action approval FIRST: a valid session alone is NOT enough — the
   // manager must enter their PIN at the device for every adjustment. Checked
   // before anything else so no information leaks without approval either.
-  if (managerPinThrottled(req)) {
-    return res.status(429).json({ error: 'Too many failed manager-PIN attempts — please wait a few minutes' });
-  }
   const mgr = verifyManagerPin(b.manager_pin);
   if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Manager PIN required for time-clock adjustments' }); }
   recordManagerPinAttempt(req, true);

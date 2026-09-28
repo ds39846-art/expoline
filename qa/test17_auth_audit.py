@@ -13,7 +13,8 @@ Phases:
   5. session/token handling: logout revokes, deactivation kills the token,
      garbage auth headers rejected
   6. manager-PIN point-of-action checks (void/comp/adjust require the PIN)
-  7. brute-force throttles: login 429, manager-PIN 429 (LAST — trips locks)
+  7. auth audit-only (LOCKED POLICY): bad logins/PINs are audit-logged,
+     never locked out — no 429s, service always available
 """
 import json, os, subprocess, sys, time, urllib.request, urllib.error
 
@@ -285,19 +286,26 @@ call("POST", "/api/clock/out", ST)
 call("POST", f"/api/checks/{chk}/close", ST)
 
 # ------------------------------------------------------------------ phase 7
-print("--- phase 7: brute-force throttles (LAST — trips locks) ---")
-# Fresh process so the attempt buckets start empty (earlier phases used a few
-# failed logins/PINs); the exact 401->429 transition is what we assert.
+print("--- phase 7: auth audit-only (LOCKED POLICY: no lockout) ---")
+# Policy B (2026-09-27): failed logins / manager-PIN attempts are AUDIT-LOGGED,
+# never locked out. Hammering with bad credentials must never yield 429, and
+# the failures must appear in the approval audit log.
 boot(fresh_db=False)
 MT = login("2580")
-codes = [call("POST", "/api/auth/login", body={"pin": "0101"})[0] for _ in range(12)]
-check("login: 10 bad PINs all 401", all(c == 401 for c in codes[:10]), codes)
-check("login: 11th+ bad PIN -> 429", all(c == 429 for c in codes[10:]), codes)
-check("login: good PIN also 429 while locked",
-      call("POST", "/api/auth/login", body={"pin": "1111"})[0] == 429)
-codes = [call("POST", "/api/admin/clock/adjust", MT, {"shift_id": 1, "manager_pin": "0202"})[0] for _ in range(10)]
-check("manager PIN: 8 bad attempts all 403", all(c == 403 for c in codes[:8]), codes)
-check("manager PIN: 9th+ bad attempt -> 429", all(c == 429 for c in codes[8:]), codes)
+codes = [call("POST", "/api/auth/login", body={"pin": "0101"})[0] for _ in range(15)]
+check("login: 15 bad PINs all 401, never 429 (no lockout)", all(c == 401 for c in codes), codes)
+check("login: good PIN still works immediately after bad attempts",
+      call("POST", "/api/auth/login", body={"pin": "1111"})[0] == 200)
+codes = [call("POST", "/api/admin/clock/adjust", MT, {"shift_id": 1, "manager_pin": "0202"})[0] for _ in range(12)]
+check("manager PIN: 12 bad attempts all 403, never 429 (no lockout)", all(c == 403 for c in codes), codes)
+check("manager PIN: good PIN still works immediately after bad attempts",
+      call("POST", "/api/admin/clock/adjust", MT, {"shift_id": 1, "manager_pin": "2580", "clock_in": "2026-09-26T09:00:00Z"})[0] == 200)
+s, audit = call("GET", "/api/admin/approvals/audit?limit=500", MT)
+actions = [r["action"] for r in (audit if isinstance(audit, list) else [])]
+check("audit log records failed logins",
+      s == 200 and "auth_login_failed" in actions, actions[-5:] if isinstance(audit, list) else s)
+check("audit log records failed manager-PIN attempts",
+      s == 200 and "auth_manager_pin_failed" in actions, actions[-5:] if isinstance(audit, list) else s)
 
 # ------------------------------------------------------------------ cleanup
 print("--- cleanup: reboot to clear rate-limit buckets ---")
