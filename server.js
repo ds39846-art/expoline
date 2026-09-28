@@ -538,11 +538,12 @@ const SITE_ID = (() => {
   return r.id;
 })();
 
-/* Phase 3C defaults: post-payment review nudge is ON unless the manager
-   turns it off (PUT /api/admin/settings). Set once per site. */
+/* Phase 3C defaults: post-payment review nudge is OFF by default (LOCKED
+   POLICY 2026-09-27: review nudge B — off). The manager can turn it on via
+   PUT /api/admin/settings. Set once per site. */
 (() => {
   const cur = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'review_prompt'").get(SITE_ID);
-  if (!cur) db.prepare("INSERT INTO site_config (site_id, key, value) VALUES (?, 'review_prompt', '1')").run(SITE_ID);
+  if (!cur) db.prepare("INSERT INTO site_config (site_id, key, value) VALUES (?, 'review_prompt', '0')").run(SITE_ID);
 })();
 
 /* Synchronized course-fire timing defaults: seed per-course eat/prep
@@ -6219,7 +6220,7 @@ app.get('/api/login-summary', (req, res) => {
     notes, eighty_six: eightysix,
     reservations_today: { count: resv.length, upcoming },
     waitlist_waiting: wlWaiting,
-    review_prompt: (reviewPrompt ? reviewPrompt.value : '1') === '1',
+    review_prompt: (reviewPrompt ? reviewPrompt.value : '0') === '1',
   });
 });
 
@@ -6229,7 +6230,7 @@ app.get('/api/login-summary', (req, res) => {
    payment, and the manager can disable it site-wide. No nagging. */
 app.post('/api/reviews', serverPlus(), (req, res) => {
   const rp = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'review_prompt'").get(SITE_ID);
-  if ((rp ? rp.value : '1') !== '1') return res.status(409).json({ error: 'Review prompts are disabled for this site' });
+  if ((rp ? rp.value : '0') !== '1') return res.status(409).json({ error: 'Review prompts are disabled for this site' });
   const b = req.body || {};
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(b.check_id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
