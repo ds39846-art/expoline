@@ -682,6 +682,17 @@ function getConfig() {
 
 /* --------------------------------- helpers -------------------------------- */
 const nowIso = () => new Date().toISOString();
+/* SQLite datetime('now') stores UTC as 'YYYY-MM-DD HH:MM:SS' (no zone).
+   Date.parse() reads that as LOCAL time, shifting it by the server TZ offset
+   (7h in PDT) whenever it is compared against Date.now(). Parse naive DB
+   timestamps as UTC; pass real ISO strings (with Z/offset) through. */
+const parseDbUtc = (s) => {
+  if (typeof s !== 'string' || !s.trim()) return NaN;
+  const t = s.trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?(\.\d+)?$/.test(t))
+    return Date.parse(t.replace(' ', 'T') + 'Z');
+  return Date.parse(t);
+};
 /* Sentinel for "fail this request with a 409" thrown from inside a
    transaction (the rollback is harmless — nothing was written yet). */
 class FireConflict extends Error {}
@@ -5789,7 +5800,7 @@ function turnTimeStats() {
   ).all(SITE_ID, cutoff);
   const per = {};
   for (const r of rows) {
-    const mins = (Date.parse(r.closed_at) - Date.parse(r.opened_at)) / 60000;
+    const mins = (parseDbUtc(r.closed_at) - parseDbUtc(r.opened_at)) / 60000;
     if (!isFinite(mins) || mins <= 0 || mins > 720) continue;
     const b = partyBucket(r.guest_count || 2);
     (per[b] = per[b] || []).push(mins);
@@ -5822,7 +5833,7 @@ function quoteWaitlist(party) {
     const oc = openStmt.get(t.id, 'open');
     if (!oc || !oc.opened_at) { freeNow++; continue; }
     const st = stats[partyBucket(oc.guest_count || 2)];
-    const elapsed = (nowMs - Date.parse(oc.opened_at)) / 60000;
+    const elapsed = (nowMs - parseDbUtc(oc.opened_at)) / 60000;
     const remain = Math.max(0, st.median_min - (isFinite(elapsed) ? elapsed : 0));
     soonestFreeMin = Math.min(soonestFreeMin, remain);
   }
