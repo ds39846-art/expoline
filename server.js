@@ -3412,6 +3412,53 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
 }
 });
 
+/* Reopen a 'paid' check that still carries a positive balance (e.g. a refund
+   that could not auto-reopen because the table had been re-seated, and the
+   re-seating check has since been voided). Manager-only: a paid check with
+   balance > 0 is otherwise unpayable ('Cannot take payment on a paid check')
+   and unclosable ('outstanding balance remains') — a zombie with no exit.
+   The same re-seat guard as the refund auto-reopen applies: if the table now
+   has an open staff claim, the reopen is refused (409) to protect the
+   one-open-staff-claim-per-table index (claim/overlap P0). */
+app.post('/api/checks/:id/reopen', managerOnly(), (req, res) => {
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'paid') {
+    return res.status(400).json({ error: `Only a paid check can be reopened (status: ${check.status})` });
+  }
+  const totals = persistTotals(check.id);
+  if (totals.balance <= 0) {
+    return res.status(400).json({ error: 'Check has no outstanding balance — nothing to reopen for' });
+  }
+  /* Reopening a check requires a FRESH manager PIN every time, like void —
+     this is a state-machine override, not routine flow. */
+  const b = req.body || {};
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) {
+    return res.status(403).json({ error: 'Reopening a paid check needs a manager PIN — enter it fresh every time', need_manager_pin: true });
+  }
+  const occupant = db.prepare(
+    `SELECT id FROM checks WHERE table_id = ? AND status = 'open'
+     AND split_from IS NULL AND server_id IS NOT NULL LIMIT 1`
+  ).get(check.table_id);
+  if (occupant) {
+    return res.status(409).json({
+      error: 'Table has been re-seated — cannot reopen while another open check holds the table',
+      open_check_id: occupant.id,
+    });
+  }
+  const upd = db.prepare("UPDATE checks SET status = 'open', closed_at = NULL WHERE id = ? AND status = 'paid'").run(check.id);
+  if (upd.changes !== 1) {
+    return res.status(409).json({ error: 'Check changed while reopening — please retry' });
+  }
+  auditApproval(req, 'reopen_check', { check_id: check.id },
+    { approver: mgr.name, approver_id: mgr.id,
+      before: { status: 'paid' }, after: { status: 'open' },
+      reason: 'manual reopen of paid-with-balance zombie (re-seat block cleared)' });
+  broadcastCheckUpdated(check.id);
+  return res.json({ id: check.id, status: 'open', balance: totals.balance });
+});
+
 app.post('/api/checks/:id/close', serverPlus(), (req, res) => {
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
@@ -6847,6 +6894,7 @@ const API_DOCS = [
   { method: 'POST', path: '/api/checks/:id/void-item', auth: 'server+ (+manager PIN approval)', summary: 'Void an item, audit-logged', params: 'item_id, manager_pin, reason' },
   { method: 'POST', path: '/api/checks/:id/comp', auth: 'server+ (+manager PIN approval)', summary: 'Comp value on a check', params: 'amount_cents, manager_pin, reason' },
   { method: 'POST', path: '/api/checks/:id/transfer', auth: 'server+ (+manager PIN to take another server\'s check)', summary: 'Transfer check to another server / claim unassigned (NEW 3.6)', params: 'to_server_id, from_server_id, manager_pin?, reason?' },
+  { method: 'POST', path: '/api/checks/:id/reopen', auth: 'manager (+fresh manager PIN)', summary: 'Reopen a paid check that still has a positive balance (e.g. refund could not auto-reopen because table was re-seated)', params: 'manager_pin' },
   { method: 'POST', path: '/api/checks/:id/split', auth: 'server+', summary: 'Even / by-seat / by-item split', params: 'mode, ...' },
   { method: 'POST', path: '/api/checks/:id/payments', auth: 'server+', summary: 'Take cash, card_demo, or house_account payment (house_account requires a manager-created account)', params: 'method, amount_cents, tip_cents, tendered_cents?, memo?' },
   { method: 'GET', path: '/api/admin/house-accounts', auth: 'server+', summary: 'List house accounts (manager-created only)', params: '—' },
