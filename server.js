@@ -452,6 +452,70 @@ require('./routes/parity_kds_pay').migrate(db);
   db.exec(`DELETE FROM course_fires WHERE id NOT IN (SELECT MIN(id) FROM course_fires GROUP BY site_id, check_id, course)`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_course_fires_unique ON course_fires(site_id, check_id, course)`);
 
+  /* Claim/overlap P0 (DESIGN hidden_files/claim-overlap-20260927, implemented
+     2026-09-28): one open STAFF claim per table, enforced by SQLite itself so
+     two processes (LAN site-brain failover) can't both win a read-then-write
+     race. Scope notes:
+       - split_from IS NULL: check splits legitimately keep several open
+         checks on one table (staff split flow + soak harness); split children
+         carry split_from = source check id.
+       - server_id IS NOT NULL: kiosk orders (server_id NULL, one check per
+         order on the kiosk pseudo-table) and QR-guest self-orders
+         (server_id NULL, channel='qr_guest') legitimately stack checks and
+         are out of scope.
+     Claim endpoints therefore INSERT first and convert the constraint
+     violation into the 409 lost-race contract; the friendly pre-check SELECT
+     stays as an advisory fast path. */
+  (() => {
+    const ccols = new Set(db.prepare('PRAGMA table_info(checks)').all().map((c) => c.name));
+    if (!ccols.has('split_from')) db.exec('ALTER TABLE checks ADD COLUMN split_from INTEGER');
+    // Grandfather pre-existing split children (tab_name like '%split N'): link
+    // them to the earliest other open check on the table so the new index
+    // (which excludes split_from rows) doesn't fail on real split data.
+    try {
+      db.exec(`UPDATE checks SET split_from = (
+          SELECT MIN(o.id) FROM checks o
+          WHERE o.table_id = checks.table_id AND o.status = 'open' AND o.id <> checks.id
+        )
+        WHERE status = 'open' AND split_from IS NULL AND tab_name LIKE '%split%'
+        AND (SELECT COUNT(*) FROM checks o2
+             WHERE o2.table_id = checks.table_id AND o2.status = 'open') > 1`);
+    } catch { /* checks table without tab_name on exotic DBs */ }
+    // Genuine double-claims from the racy era: keep the earliest-opened,
+    // void the rest (audit-logged). The index can't be created on dirty data.
+    try {
+      const dupes = db.prepare(
+        `SELECT table_id FROM checks
+         WHERE status = 'open' AND split_from IS NULL AND server_id IS NOT NULL
+         GROUP BY table_id HAVING COUNT(*) > 1`
+      ).all();
+      const voidStmt = db.prepare(`UPDATE checks SET status = 'void', closed_at = ? WHERE id = ?`);
+      const auditStmt = db.prepare(
+        `INSERT INTO approval_audit (site_id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at)
+         VALUES (?, 'system', 'system', 'upgrade.duplicate_open_check_voided', ?, NULL, NULL, ?, ?, ?, ?)`
+      );
+      for (const d of dupes) {
+        const ids = db.prepare(
+          `SELECT id, site_id FROM checks
+           WHERE status = 'open' AND split_from IS NULL AND server_id IS NOT NULL
+             AND table_id = ? ORDER BY id`
+        ).all(d.table_id);
+        for (const extra of ids.slice(1)) {
+          const at = new Date().toISOString();
+          voidStmt.run(at, extra.id);
+          try {
+            auditStmt.run(extra.site_id, extra.id,
+              JSON.stringify({ status: 'open' }), JSON.stringify({ status: 'void' }),
+              JSON.stringify({ reason: 'upgrade: duplicate open check', table_id: d.table_id, kept_check_id: ids[0].id }), at);
+          } catch { /* approval_audit absent on exotic DBs */ }
+        }
+      }
+    } catch { /* checks table absent on exotic DBs */ }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_checks_one_open_per_table
+      ON checks(table_id)
+      WHERE status = 'open' AND split_from IS NULL AND server_id IS NOT NULL`);
+  })();
+
   db.exec(`CREATE TABLE IF NOT EXISTS schedule_shifts (
     id INTEGER PRIMARY KEY,
     uuid TEXT UNIQUE,
@@ -1799,6 +1863,41 @@ app.get('/api/admin/menu/audit', managerOnly(), (req, res) => {
 });
 
 /* --------------------------------- checks ---------------------------------- */
+
+/* Claim/overlap P0: the partial unique index idx_checks_one_open_per_table
+ * (see boot migration) is the arbiter for staff table claims. node:sqlite
+ * reports the violation against the TABLE+COLUMN, not the index name:
+ *   "UNIQUE constraint failed: checks.table_id"
+ * (verified 2026-09-28 against node:sqlite; the index name never appears).
+ * This message is unambiguous here: the partial claim index is the only
+ * UNIQUE constraint on checks.table_id (uuid/id violations name their own
+ * columns). */
+function isClaimConflict(err) {
+  return !!err && typeof err.message === 'string' &&
+    err.message.includes('UNIQUE constraint failed: checks.table_id');
+}
+
+/* Winner identity for the 409 lost-race contract (DESIGN.md 3.4): the winning
+ * check's id, the server's display name (never a PIN or id), and when the
+ * claim was made. Prefers the primary staff claim; falls back to any open
+ * check so the loser always gets something actionable. */
+function claimWinnerOnTable(tableId) {
+  return db.prepare(
+    `SELECT c.id, c.opened_at, u.name AS server_name FROM checks c
+     LEFT JOIN users u ON u.id = c.server_id
+     WHERE c.table_id = ? AND c.status = 'open'
+       AND c.split_from IS NULL AND c.server_id IS NOT NULL
+     ORDER BY c.id LIMIT 1`
+  ).get(tableId)
+    || db.prepare(
+      `SELECT c.id, c.opened_at, u.name AS server_name FROM checks c
+       LEFT JOIN users u ON u.id = c.server_id
+       WHERE c.table_id = ? AND c.status = 'open'
+       ORDER BY c.id LIMIT 1`
+    ).get(tableId)
+    || null;
+}
+
 app.post('/api/checks', serverPlus(), (req, res) => {
   const { table_id, guest_count, tab_name } = req.body || {};
   const table = table_id != null
@@ -1808,14 +1907,30 @@ app.post('/api/checks', serverPlus(), (req, res) => {
   if (!isInt(guest_count) || guest_count < 1) {
     return res.status(400).json({ error: 'guest_count must be a positive integer' });
   }
+  /* Friendly fast path (advisory only): catches the common single-process
+   * double-claim in one query. The INSERT below is the decision point — the
+   * unique index arbitrates races across processes. */
   const existing = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1").get(table_id);
   if (existing) return res.status(400).json({ error: 'Table already has an open check', check_id: existing.id });
-  const r = db.prepare(
-    "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
-  ).run(crypto.randomUUID(), SITE_ID, table_id, req.user.id, tab_name || null, guest_count, nowIso());
-  const check = checkResponse(r.lastInsertRowid);
-  broadcastCheckUpdated(check.id);
-  res.status(201).json(check);
+  try {
+    const r = db.prepare(
+      "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
+    ).run(crypto.randomUUID(), SITE_ID, table_id, req.user.id, tab_name || null, guest_count, nowIso());
+    const check = checkResponse(r.lastInsertRowid);
+    broadcastCheckUpdated(check.id);
+    res.status(201).json(check);
+  } catch (e) {
+    if (isClaimConflict(e)) {
+      const w = claimWinnerOnTable(table_id);
+      return res.status(409).json({
+        error: 'Table already claimed',
+        check_id: w ? w.id : null,
+        claimed_by: w ? w.server_name : null,
+        claimed_at: w ? w.opened_at : null,
+      });
+    }
+    throw e;
+  }
 });
 
 app.get('/api/checks/open', serverPlus(), (req, res) => {
@@ -2942,14 +3057,16 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
       broadcastCheckUpdated(targetCheck.id);
     } else {
       const insCheck = db.prepare(
-        "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
+        "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, split_from, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)"
       );
       groups.forEach((g, i) => {
         const seats = [...new Set(g.map((it) => it.seat))];
         const label = check.tab_name ? `${check.tab_name} · split ${i + 1}` : `Split ${i + 1}`;
         // Phase 3A fix: guest_count is the MAX retained seat number, not the
         // distinct-seat count — a retained seat 2 stays valid when seat 1 moved.
-        const r = insCheck.run(crypto.randomUUID(), SITE_ID, check.table_id, check.server_id, label, Math.max(...seats), now);
+        // Claim/overlap P0: split children carry split_from so the one-open-
+        // claim-per-table index doesn't treat a split as a double-claim.
+        const r = insCheck.run(crypto.randomUUID(), SITE_ID, check.table_id, check.server_id, label, Math.max(...seats), check.id, now);
         for (const it of g) {
           transferItem(it, r.lastInsertRowid, mode === 'move' && g.length === 1 ? req._moveQty : null);
         }
@@ -3112,6 +3229,7 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
   // BEFORE the mutation.
   const ikey = ikey0;
   let idem = null;
+  let reopenSkipped = null; // set when a re-seated table blocks the reopen
   if (ikey) {
     const rsv = idemReserve('refunds', ikey);
     if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
@@ -3131,18 +3249,31 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
     }
 
     const totals = persistTotals(payment.check_id);
-  const check = db.prepare('SELECT status FROM checks WHERE id = ?').get(payment.check_id);
+  const check = db.prepare('SELECT status, table_id FROM checks WHERE id = ?').get(payment.check_id);
   /* A refund on a still-active ('paid') check reopens it so the balance stays
      visible on the floor. A 'closed' check is end-of-lifecycle history: the
      refund is recorded in payouts/refunds, but the check does NOT reopen —
      the customer already left and the balance is not a collectible debt
      (matches Toast/Square behavior; keeps closed checks out of the open list). */
   if (check && check.status === 'paid' && totals.balance > 0) {
-    // Refund pushed the check back to a positive balance — reopen it.
-    db.prepare("UPDATE checks SET status = 'open', closed_at = NULL WHERE id = ?").run(payment.check_id);
+    // Refund pushed the check back to a positive balance — reopen it, UNLESS
+    // the table has since been re-seated: reopening would violate the
+    // one-open-staff-claim-per-table index (claim/overlap P0). In that case
+    // the refund still stands; the check keeps its history and the manager
+    // settles the residual from the payout records.
+    const occupant = db.prepare(
+      `SELECT id FROM checks WHERE table_id = ? AND status = 'open'
+       AND split_from IS NULL AND server_id IS NOT NULL LIMIT 1`
+    ).get(check.table_id);
+    if (!occupant) {
+      db.prepare("UPDATE checks SET status = 'open', closed_at = NULL WHERE id = ?").run(payment.check_id);
+    } else {
+      reopenSkipped = { reason: 'table_reseated', open_check_id: occupant.id };
+    }
   }
   broadcastCheckUpdated(payment.check_id);
   const out = { payment: paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(payment.id)) };
+  if (reopenSkipped) out.reopen_skipped = reopenSkipped;
   if (idem) idemStore('refunds', idem, 200, out);
   return res.json(out);
 } catch (e) {
@@ -4929,19 +5060,37 @@ function resvOverlap(tableId, startMs, endMs, excludeId) {
   ).get(SITE_ID, tableId, excludeId ?? null, new Date(endMs).toISOString(), new Date(startMs).toISOString()) || null;
 }
 
-/** Open a check on a table (shared by reservation-arrive + waitlist-seat). */
+/** Open a check on a table (shared by reservation-arrive + waitlist-seat).
+ *  Write-first like POST /api/checks: the unique index arbitrates races; the
+ *  pre-check SELECT is an advisory fast path. On a lost race the returned
+ *  object carries the winner's check_id so callers can reuse it (reservation
+ *  seating intentionally reuses an existing open check). */
 function openCheckOnTable(tableId, guestCount, tabName, serverId) {
   const table = tableById(tableId);
   if (!table) return { error: 'Valid table_id is required' };
   if (!isInt(guestCount) || guestCount < 1) return { error: 'guest_count must be a positive integer' };
   const existing = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1").get(tableId);
   if (existing) return { error: 'Table already has an open check', check_id: existing.id };
-  const r = db.prepare(
-    "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
-  ).run(crypto.randomUUID(), SITE_ID, tableId, serverId, tabName || null, guestCount, nowIso());
-  const check = checkResponse(r.lastInsertRowid);
-  broadcastCheckUpdated(check.id);
-  return { check };
+  try {
+    const r = db.prepare(
+      "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
+    ).run(crypto.randomUUID(), SITE_ID, tableId, serverId, tabName || null, guestCount, nowIso());
+    const check = checkResponse(r.lastInsertRowid);
+    broadcastCheckUpdated(check.id);
+    return { check };
+  } catch (e) {
+    if (isClaimConflict(e)) {
+      const w = claimWinnerOnTable(tableId);
+      return {
+        error: 'Table already claimed',
+        status: 409, // lost-race contract: callers must preserve the 409
+        check_id: w ? w.id : null,
+        claimed_by: w ? w.server_name : null,
+        claimed_at: w ? w.opened_at : null,
+      };
+    }
+    throw e;
+  }
 }
 
 /** Push {type:'resv_updated'} to 'reservations' channel subscribers. */
@@ -5078,6 +5227,11 @@ app.patch('/api/reservations/:id', serverPlus(), (req, res) => {
     const opened = openCheckOnTable(tableId, r.party_size, r.customer_name, req.user.id);
     if (opened.error && !opened.check_id)
       return res.status(400).json({ error: opened.error });
+    if (opened.status === 409)
+      // Lost a simultaneous claim race: the reservation stays booked so the
+      // host can seat it at another table. (A pre-existing open check found
+      // by the fast path is still intentionally reused below.)
+      return res.status(409).json({ error: opened.error, check_id: opened.check_id, claimed_by: opened.claimed_by, claimed_at: opened.claimed_at });
     checkId = opened.check ? opened.check.id : opened.check_id; // reuse open check if one exists
   }
 
@@ -5795,7 +5949,17 @@ app.post('/api/waitlist/:id/seat', serverPlus(), (req, res) => {
   const t = tableById((req.body || {}).table_id);
   if (!t) return res.status(400).json({ error: 'Valid table_id is required' });
   const opened = openCheckOnTable(t.id, w.party_size, w.customer_name, req.user.id);
-  if (opened.error) return res.status(400).json({ error: opened.error, check_id: opened.check_id || null });
+  if (opened.error) {
+    // Lost-race (409) preserves the contract so the host sees who claimed the
+    // table; other errors stay 400 and the entry remains waiting/notified.
+    const out = { error: opened.error, check_id: opened.check_id || null };
+    if (opened.status === 409) {
+      out.claimed_by = opened.claimed_by;
+      out.claimed_at = opened.claimed_at;
+      return res.status(409).json(out);
+    }
+    return res.status(400).json(out);
+  }
   // Attach the pre-order as HELD items — the kitchen fires nothing until /send.
   const preorder = parseJson(w.preorder_json, []);
   const insPre = db.prepare(

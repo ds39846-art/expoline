@@ -91,8 +91,20 @@ CREATE TABLE checks (
   subtotal_cents INTEGER DEFAULT 0,
   total_cents INTEGER DEFAULT 0,
   opened_at TEXT,
-  closed_at TEXT
+  closed_at TEXT,
+  split_from INTEGER,
+  channel TEXT DEFAULT 'dine_in',
+  source TEXT,
+  split_group TEXT
 );
+
+/* Claim/overlap P0: one open staff claim per table, enforced by the DB.
+   Split children (split_from), kiosk orders (server_id NULL) and QR-guest
+   self-orders (server_id NULL) legitimately stack checks on a table and are
+   out of scope. Boot migration in server.js backfills split_from and dedupes. */
+CREATE UNIQUE INDEX IF NOT EXISTS idx_checks_one_open_per_table
+  ON checks(table_id)
+  WHERE status = 'open' AND split_from IS NULL AND server_id IS NOT NULL;
 
 CREATE TABLE check_items (
   id INTEGER PRIMARY KEY,

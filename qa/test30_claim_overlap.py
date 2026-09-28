@@ -37,16 +37,18 @@ if PORT in (4317, 4320):
     sys.exit("FATAL: test 30 refuses ports 4317/4320 (demo/soak ports)")
 
 
-def spawn(extra_env=None, fresh=True):
+def spawn(extra_env=None, fresh=True, port=None):
     if fresh and os.path.exists(DB):
         os.remove(DB)
-    env = dict(os.environ, EXPOLINE_PORT=str(PORT), EXPOLINE_DB=DB,
+    use_port = port or PORT
+    env = dict(os.environ, EXPOLINE_PORT=str(use_port), EXPOLINE_DB=DB,
                NODE_ENV="test", **(extra_env or {}))
     p = subprocess.Popen(["node", SERVER], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = f"http://localhost:{use_port}"
     for _ in range(60):
         try:
-            with urllib.request.urlopen(BASE + "/api/health", timeout=2) as r:
+            with urllib.request.urlopen(base + "/api/health", timeout=2) as r:
                 if r.status == 200:
                     return p
         except Exception:
@@ -225,6 +227,74 @@ try:
     print("== T4: claim-token expiry/steal -- SKIPPED (designed-not-built) ==")
     print("  - no claim-token endpoint exists yet; contract specified in"
           " DESIGN.md sections 3.2 and 3.6")
+
+    # ---------------- T5: cross-process claim race (LAN failover) ----------------
+    # Two server processes sharing ONE sqlite file = the LAN site-brain
+    # failover scenario from DESIGN.md 3.4. The partial unique index (not the
+    # app) must be the arbiter: exactly one winner; losers get 400 (friendly
+    # fast path) or 409 (lost-race contract); the DB holds exactly one open
+    # staff check on the table.
+    print("== T5: cross-process claim race (two servers, one DB) ==")
+    PORT2 = PORT + 1
+    assert PORT2 not in (4317, 4320), "T5 refuses demo/soak ports"
+    srv2 = None
+    try:
+        srv2 = spawn(port=PORT2, fresh=False)
+        BASE2 = f"http://localhost:{PORT2}"
+
+        def api2(method, path, token=None, body=None):
+            req = urllib.request.Request(
+                BASE2 + path, method=method,
+                data=json.dumps(body).encode() if body is not None else None,
+                headers={"Content-Type": "application/json"})
+            if token:
+                req.add_header("Authorization", "Bearer " + token)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    raw = resp.read().decode() or "{}"
+                    return resp.status, json.loads(raw)
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode() or "{}"
+                try:
+                    return e.code, json.loads(raw)
+                except Exception:
+                    return e.code, {"raw": raw}
+
+        st2 = api2("POST", "/api/auth/login", None, {"pin": S})[1]["token"]
+        ok(bool(st2), "second server logs in on the shared DB")
+        t3 = tables[2]["id"]
+
+        n5 = 12
+        bar5 = threading.Barrier(n5)
+
+        def claim5(i):
+            bar5.wait(timeout=30)
+            if i % 2 == 0:
+                return api("POST", "/api/checks", st,
+                           {"table_id": t3, "guest_count": 2})
+            return api2("POST", "/api/checks", st2,
+                        {"table_id": t3, "guest_count": 2})
+
+        with ThreadPoolExecutor(max_workers=n5) as ex:
+            r5 = list(ex.map(claim5, range(n5)))
+        wins5 = [r for r in r5 if r[0] == 201]
+        lose5 = [r for r in r5 if r[0] != 201]
+        ok(len(wins5) == 1, "exactly one claim wins across two processes",
+           f"(winners={len(wins5)})")
+        ok(all(s in (400, 409) for s, _ in lose5), "losers get 400 or 409",
+           f"(statuses={sorted(set(s for s, _ in lose5))})")
+        open5 = dbq("SELECT COUNT(*) FROM checks WHERE table_id = ? "
+                    "AND status = 'open'", (t3,))[0][0]
+        ok(open5 == 1, "exactly one open check in the shared DB",
+           f"(found {open5})")
+        if wins5:
+            wid = wins5[0][1].get("id")
+            bad409 = [b for s, b in lose5
+                      if s == 409 and b.get("check_id") != wid]
+            ok(not bad409, "every 409 names the winning check",
+               f"(mismatched={len(bad409)})")
+    finally:
+        stop(srv2)
 
 finally:
     stop(srv)

@@ -457,7 +457,7 @@ assert st == 200
 c0 = get_check(pc["id"])
 st, _ = api("POST", f"/api/checks/{pc['id']}/payments", ST, {"method": "cash", "amount_cents": 100})
 assert st == 201, f"partial pay failed: {_}"
-st, r = api("POST", f"/api/checks/{pc['id']}/void", MT, {"reason": "oops"})
+st, r = api("POST", f"/api/checks/{pc['id']}/void", MT, {"reason": "oops", "manager_pin": M})
 ok(st == 400, "void with payments 400")
 try:
     rj = json.loads(r) if isinstance(r, str) else r
