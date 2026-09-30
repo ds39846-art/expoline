@@ -452,6 +452,20 @@ require('./routes/parity_kds_pay').migrate(db);
   db.exec(`DELETE FROM course_fires WHERE id NOT IN (SELECT MIN(id) FROM course_fires GROUP BY site_id, check_id, course)`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_course_fires_unique ON course_fires(site_id, check_id, course)`);
 
+  /* Soak-found perf indexes (2026-09-29): at ~80k+ rows the KDS ticket poll
+     degraded to 15.6s and /api/zones to 2.2s, wedging the server (health
+     8s+, CPU pinned 92%). Missing indexes:
+       - kds_tickets(site_id, status, created_at, id): the KDS open-ticket poll
+       - kds_tickets(check_id): courseStatusFor() N+1 per ticket row
+       - check_items(check_id, state): courseStatusFor() held-course counts
+       - checks(table_id, status): /api/zones per-table open-check lookup
+     (the partial idx_checks_one_open_per_table can't serve that query since
+     it doesn't constrain split_from/server_id). */
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_kds_tickets_site_status ON kds_tickets(site_id, status, created_at, id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_kds_tickets_check_id ON kds_tickets(check_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_check_items_check_id_state ON check_items(check_id, state)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_checks_table_status ON checks(table_id, status)`);
+
   /* Claim/overlap P0 (DESIGN hidden_files/claim-overlap-20260927, implemented
      2026-09-28): one open STAFF claim per table, enforced by SQLite itself so
      two processes (LAN site-brain failover) can't both win a read-then-write
