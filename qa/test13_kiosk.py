@@ -114,12 +114,19 @@ print("-- call staff --")
 s, r = api("POST", "/api/kiosk/call-staff")
 ok(s in (200, 201), "call staff ok", str(s))
 call_id = r.get("id")
-s, calls = api("GET", "/api/kiosk/calls")
+# GET /kiosk/calls and POST /kiosk/calls/:id/clear are STAFF-facing by design
+# (routes/kiosk.js: serverPlus-gated so an unauthenticated caller cannot read
+# or silently clear staff-call flags). This test originally called them with
+# no token: the 401 error body (a dict) was iterated as the calls list and the
+# suite crashed with TypeError at the "flag cleared" line. Pass a staff token.
+s0, _ = api("GET", "/api/kiosk/calls")
+ok(s0 in (401, 403), "calls list rejects unauthenticated access", str(s0))
+s, calls = api("GET", "/api/kiosk/calls", MT)
 ok(s == 200 and any(c["id"] == call_id for c in calls), "flag visible to floor", str(calls))
 if call_id:
-    s, r = api("POST", f"/api/kiosk/calls/{call_id}/clear")
+    s, r = api("POST", f"/api/kiosk/calls/{call_id}/clear", MT)
     ok(s == 200, "clear flag", str(s))
-    s, calls = api("GET", "/api/kiosk/calls")
+    s, calls = api("GET", "/api/kiosk/calls", MT)
     ok(all(c["id"] != call_id for c in calls), "flag cleared")
 
 print("-- menuboards split --")
