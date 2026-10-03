@@ -302,6 +302,21 @@ addModGroup('Edamame',
     { name: 'Sweet Chili' },
   ]);
 
+// The stored shape of a group selection on a real order line (server
+// resolveModifiers): {name, price_delta_cents, option_id}. A seeded demo
+// line for an item with a required group carries the group's default
+// pick — exactly what a server ringing it in would have stored.
+const defaultGroupMods = (itemName) => {
+  const row = db.prepare(
+    `SELECT o.name AS name, o.price_delta_cents AS price_delta_cents, o.id AS option_id
+       FROM menu_modifier_groups g
+       JOIN menu_modifier_options o ON o.group_id = g.id
+      WHERE g.menu_item_id = ? AND o.is_default = 1
+      ORDER BY g.sort_order, g.id, o.sort_order, o.id LIMIT 1`
+  ).get(itemId[itemName]);
+  return row ? [{ name: row.name, price_delta_cents: row.price_delta_cents, option_id: row.option_id }] : [];
+};
+
 // ---------------- inventory (phase 2 demo stock) ----------------
 // The inventory tables live in the server boot ensureSchema (not
 // schema.sql), so — same precedent as the modifier groups above — the
@@ -428,7 +443,7 @@ seedClosedCheck({
     { name: 'Lava Slide', seat: 1, qty: 1 },
     { name: 'Lava Slide', seat: 3, qty: 1 },
     { name: 'Coconut Shrimp', seat: 2, qty: 1 },
-    { name: '14oz Ribeye', seat: 1, qty: 1 },
+    { name: '14oz Ribeye', seat: 1, qty: 1, mods: defaultGroupMods('14oz Ribeye') },
     { name: 'Hoisin Beef', seat: 4, qty: 1 },
     { name: 'Steamed White Rice', seat: 1, qty: 1 },
     { name: 'Steamed White Rice', seat: 4, qty: 1 },
