@@ -253,6 +253,45 @@ for (const name of ['Local Greens', 'Thai Caesar', 'Char Sui Cobb', 'Cashew Chic
 
 addMods('Vegetable Fried Rice or Chow Mein', [['Add shrimp', 500], ['Add chicken', 300]]);
 
+// ---------------- modifier groups ----------------
+// Group/option tables use the exact DDL of routes/parity_orders.js
+// ensureSchema (which creates them at server boot); creating them here too
+// (IF NOT EXISTS) lets the seed itself carry group data. The boot-time
+// migration only converts flat menu_modifiers for items with NO group, so a
+// seeded group is left untouched.
+db.exec(`CREATE TABLE IF NOT EXISTS menu_modifier_groups (
+  id INTEGER PRIMARY KEY, site_id TEXT, menu_item_id INTEGER, name TEXT,
+  min_select INTEGER DEFAULT 0, max_select INTEGER DEFAULT 0,
+  required INTEGER DEFAULT 0, parent_group_id INTEGER, parent_option_id INTEGER,
+  sort_order INTEGER DEFAULT 0)`);
+db.exec(`CREATE TABLE IF NOT EXISTS menu_modifier_options (
+  id INTEGER PRIMARY KEY, group_id INTEGER, name TEXT,
+  price_delta_cents INTEGER DEFAULT 0, is_default INTEGER DEFAULT 0,
+  active INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0)`);
+
+const addModGroup = (itemName, group, options) => {
+  const id = itemId[itemName];
+  if (!id) { console.warn('WARNING: item not found for modifier group:', itemName); return; }
+  const g = db.prepare(
+    'INSERT INTO menu_modifier_groups (site_id, menu_item_id, name, min_select, max_select, required, sort_order) VALUES (?, ?, ?, ?, ?, ?, 0)'
+  ).run(SITE, id, group.name, group.min_select, group.max_select, group.required ? 1 : 0);
+  const ins = db.prepare(
+    'INSERT INTO menu_modifier_options (group_id, name, price_delta_cents, is_default, active, sort_order) VALUES (?, ?, ?, ?, 1, ?)'
+  );
+  options.forEach((o, i) => ins.run(g.lastInsertRowid, o.name, o.price_delta_cents || 0, o.is_default ? 1 : 0, i));
+};
+
+// Steak temperature — required single pick on the grilled steak entree.
+addModGroup('14oz Ribeye',
+  { name: 'Temperature', required: true, min_select: 1, max_select: 1 },
+  [
+    { name: 'Rare' },
+    { name: 'Medium Rare' },
+    { name: 'Medium', is_default: true },
+    { name: 'Medium Well' },
+    { name: 'Well Done' },
+  ]);
+
 // ---------------- demo closed checks (yesterday) ----------------
 const money = (subtotal, guests) => {
   const sc = guests >= 8 ? Math.round(subtotal * 0.18) : 0;
@@ -359,7 +398,7 @@ seedClosedCheck({
 
 // ---------------- summary ----------------
 const counts = {};
-for (const t of ['sites','users','zones','tables','menu_categories','menu_items','menu_modifiers','checks','check_items','payments','kds_tickets','site_config']) {
+for (const t of ['sites','users','zones','tables','menu_categories','menu_items','menu_modifiers','menu_modifier_groups','menu_modifier_options','checks','check_items','payments','kds_tickets','site_config']) {
   counts[t] = db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
 }
 
