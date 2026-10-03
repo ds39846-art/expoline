@@ -603,6 +603,9 @@ async function getMenu() {
          no picker and the server then rejected the line at HOLD for a
          missing required selection the server could never make. */
       modifier_groups: i.modifier_groups || [],
+      /* Same pass-through rule for the manager-set popular flag: the
+         quick-pick row reads i.popular from these mapped items. */
+      popular: !!i.popular,
       station: i.station || i.kds_station || null,
       daypart: i.daypart || null,
     })),
