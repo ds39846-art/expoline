@@ -164,7 +164,12 @@ expect_status("POST", "/api/gift-cards/reload", MT, {"code": vc["code"], "amount
 print("== double-spend race ==")
 race_card = api("POST", "/api/gift-cards/issue", MT, {"initial_cents": 4000})["card"]
 chk4 = api("POST", "/api/checks", ST, {"table_id": 4, "guest_count": 1})["id"]
-api("POST", f"/api/checks/{chk4}/items", ST, {"menu_item_id": item["id"], "qty": 1, "seat": 1})
+# The check must be able to ABSORB the full 4000¢ redeem, or both redeems are
+# (correctly) rejected for exceeding the check balance and no race ever
+# happens. items[0] is currently a 3000¢ item whose single-item check totals
+# 3394¢, so order enough units that the subtotal alone clears 4000¢.
+race_qty = 4000 // item["price_cents"] + 1
+api("POST", f"/api/checks/{chk4}/items", ST, {"menu_item_id": item["id"], "qty": race_qty, "seat": 1})
 api("POST", f"/api/checks/{chk4}/send", ST)
 results = []
 barrier = threading.Barrier(2)
