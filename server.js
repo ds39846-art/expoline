@@ -7226,47 +7226,75 @@ function ensureKdsArchiveTable() {
 
 /* Move FULFILLED tickets older than the retention window (site_config
    kds_archive_retention_days, default 30) into kds_tickets_archive, in
-   bounded batches, one transaction per pass. "Older" is judged by the
-   fulfill time (bumped_at), falling back to created_at for rows that
-   never got a bump stamp. Non-fulfilled tickets are never touched.
-   Timestamps are UTC ISO (a few legacy rows are naive SQLite UTC —
-   the separator difference is sub-second at this granularity). */
+   bounded batches of KDS_ARCHIVE_BATCH, ONE TRANSACTION PER BATCH. A
+   single pass loops until a batch comes back short (backlog exhausted)
+   so a large legacy backlog drains in one pass instead of trickling
+   out over weeks — but a hard cap of KDS_ARCHIVE_MAX_BATCHES batches
+   per pass (250k rows) means a pathological case can never stall boot
+   or the 6h interval indefinitely; if the cap stops the pass with
+   qualifying rows still remaining, the caller logs that more remain
+   for the next pass. "Older" is judged by the fulfill time
+   (bumped_at), falling back to created_at for rows that never got a
+   bump stamp. Non-fulfilled tickets are never touched. Timestamps are
+   UTC ISO (a few legacy rows are naive SQLite UTC — the separator
+   difference is sub-second at this granularity). */
 const KDS_ARCHIVE_BATCH = 5000;
+const KDS_ARCHIVE_MAX_BATCHES = 50;
 function archiveFulfilledKdsTickets() {
   const colNames = ensureKdsArchiveTable();
-  if (!colNames.length) return 0;
+  if (!colNames.length) return { moved: 0, capped: false };
   const colList = colNames.join(', ');
   const days = siteConfigInt('kds_archive_retention_days', 30);
   const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
-  const rows = db.prepare(
-    `SELECT id FROM kds_tickets
-     WHERE site_id = ? AND status = 'fulfilled' AND COALESCE(bumped_at, created_at) < ?
-     ORDER BY id LIMIT ?`
-  ).all(SITE_ID, cutoff, KDS_ARCHIVE_BATCH);
-  if (!rows.length) return 0;
-  const ids = rows.map((r) => r.id);
-  const ph = ids.map(() => '?').join(',');
-  withTransaction(() => {
-    db.prepare(`INSERT INTO kds_tickets_archive (${colList}) SELECT ${colList} FROM kds_tickets WHERE id IN (${ph})`).run(...ids);
-    db.prepare(`DELETE FROM kds_tickets WHERE id IN (${ph}) AND status = 'fulfilled'`).run(...ids);
-  });
-  return ids.length;
+  let moved = 0;
+  let batches = 0;
+  let lastBatchFull = false;
+  while (batches < KDS_ARCHIVE_MAX_BATCHES) {
+    const rows = db.prepare(
+      `SELECT id FROM kds_tickets
+       WHERE site_id = ? AND status = 'fulfilled' AND COALESCE(bumped_at, created_at) < ?
+       ORDER BY id LIMIT ?`
+    ).all(SITE_ID, cutoff, KDS_ARCHIVE_BATCH);
+    if (!rows.length) { lastBatchFull = false; break; }
+    const ids = rows.map((r) => r.id);
+    const ph = ids.map(() => '?').join(',');
+    withTransaction(() => {
+      db.prepare(`INSERT INTO kds_tickets_archive (${colList}) SELECT ${colList} FROM kds_tickets WHERE id IN (${ph})`).run(...ids);
+      db.prepare(`DELETE FROM kds_tickets WHERE id IN (${ph}) AND status = 'fulfilled'`).run(...ids);
+    });
+    moved += ids.length;
+    batches += 1;
+    lastBatchFull = ids.length === KDS_ARCHIVE_BATCH;
+    if (!lastBatchFull) break; // short batch: backlog exhausted
+  }
+  /* capped = the pass stopped at the batch cap with a full final batch
+     AND qualifying rows still remain (probed cheaply — a full final
+     batch that happens to end exactly on the backlog's last row is
+     not "capped"). */
+  let capped = false;
+  if (batches === KDS_ARCHIVE_MAX_BATCHES && lastBatchFull) {
+    capped = !!db.prepare(
+      `SELECT 1 AS x FROM kds_tickets
+       WHERE site_id = ? AND status = 'fulfilled' AND COALESCE(bumped_at, created_at) < ? LIMIT 1`
+    ).get(SITE_ID, cutoff);
+  }
+  return { moved, capped };
 }
 
 (() => {
   db.prepare("INSERT OR IGNORE INTO site_config (site_id, key, value) VALUES (?, 'kds_archive_retention_days', '30')").run(SITE_ID);
   try {
     const days = siteConfigInt('kds_archive_retention_days', 30);
-    const n = archiveFulfilledKdsTickets();
-    console.log(`[expoline] kds-archive: moved ${n} fulfilled ticket(s) past the ${days}d retention window to kds_tickets_archive`);
+    const r = archiveFulfilledKdsTickets();
+    console.log(`[expoline] kds-archive: moved ${r.moved} fulfilled ticket(s) past the ${days}d retention window to kds_tickets_archive${r.capped ? ' (batch cap reached — more remain for the next pass)' : ''}`);
   } catch (e) { console.error('[expoline] kds-archive boot pass failed:', e.message); }
 })();
 
 /* Interval passes stay quiet unless something actually moved. */
 setInterval(() => {
   try {
-    const n = archiveFulfilledKdsTickets();
-    if (n) console.log(`[expoline] kds-archive: moved ${n} fulfilled ticket(s) past the retention window to kds_tickets_archive`);
+    const r = archiveFulfilledKdsTickets();
+    if (r.moved) console.log(`[expoline] kds-archive: moved ${r.moved} fulfilled ticket(s) past the retention window to kds_tickets_archive${r.capped ? ' (batch cap reached — more remain for the next pass)' : ''}`);
   } catch (e) { console.error('[expoline] kds-archive pass failed:', e.message); }
 }, 6 * 3600_000).unref();
 

@@ -7,7 +7,10 @@ reboots (the boot pass must archive), and verifies:
         in kds_tickets_archive with every column intact;
   (ii)  recent fulfilled and old UNfulfilled tickets stay in kds_tickets;
   (iii) a second boot pass moves 0 (idempotent), and the seeded demo
-        tickets (fulfilled "yesterday") are never touched.
+        tickets (fulfilled "yesterday") are never touched;
+  (iv)  a 12,000-row backlog of old fulfilled tickets (>1 batch of
+        5,000) drains in ONE pass — the multi-batch loop — leaving
+        only non-qualifying rows live, with the pass total logged.
 Own server on :4346. Never touches 4317/4320.
 """
 import os, signal, sqlite3, subprocess, sys, time
@@ -116,6 +119,44 @@ def main():
     ok(arch2 == n_arch and live2 == n_live, "second boot pass moves 0 (idempotent)",
        f"arch {n_arch}->{arch2} live {n_live}->{live2}")
     ok("kds-archive: moved 0" in log2, "second boot pass logs moved 0")
+
+    # --- Backlog case: >1 batch of old fulfilled tickets must drain in
+    # ONE pass (regression for the 5,000-per-pass trickle: the soak's
+    # 504,836-row backlog would otherwise take ~25 days at 4 passes/day).
+    # Explicit ids above BOTH tables' maxima: kds_tickets uses plain
+    # rowid PKs, so auto-assigned ids in this small test DB can recycle
+    # ids of already-archived tickets and collide with the archive PK;
+    # a real legacy backlog's ids all predate the archive, as here.
+    BACKLOG_N = 12000
+    id_base = max(sql("SELECT COALESCE(MAX(id),0) AS m FROM kds_tickets")[0]["m"],
+                  sql("SELECT COALESCE(MAX(id),0) AS m FROM kds_tickets_archive")[0]["m"])
+    con = sqlite3.connect(DB)
+    try:
+        con.executemany(
+            "INSERT INTO kds_tickets (id, check_id, site_id, station, table_label, server_name,"
+            " items_json, status, created_at, bumped_at, bumped_by) VALUES (?,NULL,'bali-hai',"
+            " 'expediter','T36','Test Server','[]','fulfilled',?,?,?)",
+            [(id_base + 1 + i, iso(40), iso(39), "Expo Kitchen") for i in range(BACKLOG_N)])
+        con.commit()
+    finally: con.close()
+    bulk_ids = {r["id"] for r in sql("SELECT id FROM kds_tickets WHERE id > ?", (id_base,))}
+    ok(len(bulk_ids) == BACKLOG_N, "backlog planted (12,000 old fulfilled)", f"planted={len(bulk_ids)}")
+    KEEP_RECENT = plant("fulfilled", iso(3), iso(2))   # recent fulfilled -> stays
+    KEEP_OPEN = plant("new", iso(40), None)            # old unfulfilled -> stays
+
+    srv = boot(LOG); stop(srv)  # ONE pass must drain the whole backlog
+    log3 = Path(LOG).read_text()
+    arch3_ids = {r["id"] for r in sql("SELECT id FROM kds_tickets_archive")}
+    live3_ids = {r["id"] for r in sql("SELECT id FROM kds_tickets")}
+    ok(len(arch3_ids) == n_arch + BACKLOG_N and bulk_ids <= arch3_ids,
+       "backlog: all 12,000 archived in a single pass",
+       f"arch {n_arch}->{len(arch3_ids)}")
+    ok(not (bulk_ids & live3_ids), "backlog: no planted fulfilled ticket left live")
+    ok(len(live3_ids) == n_live + 2 and KEEP_RECENT in live3_ids and KEEP_OPEN in live3_ids,
+       "backlog: kds_tickets retains only the non-qualifying rows",
+       f"live {n_live}->{len(live3_ids)}")
+    ok(f"kds-archive: moved {BACKLOG_N}" in log3, "backlog: boot log reports the pass total",
+       "log tail: " + "".join(log3.splitlines(keepends=True)[-4:]))
 
     print(f"\n{'ALL GREEN' if not fails else 'FAILURES'}: {checks - len(fails)}/{checks} checks passed")
     sys.exit(1 if fails else 0)
