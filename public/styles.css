@@ -821,3 +821,62 @@ ul.clean li { padding: 6px 0; border-bottom: 1px solid var(--line); }
   #app:has(> .order-layout) { max-width: 1680px; }
   #app:has(> .order-layout) .item-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 200px)); }
 }
+
+/* ---------- KDS TV / wall format ----------------------------
+   Toast's rule: TV mode scales the WHOLE ticket — header
+   metadata (table #, server, timer, status) is distance-
+   critical, so it grows together with the items, and allergy
+   flags render at header scale. Deeper ticket background for
+   distance contrast on the dark board.
+   Applied two ways with the same declarations:
+   (a) manually — the KDS header "🖥 TV" toggle adds .kds-tv
+       to #kds-root (persisted per device in localStorage) and
+       also widens the minimum card (fewer, bigger tickets);
+   (b) automatically — viewports ≥1600px wide or ≥1300px tall
+       get the scale (columns stay on the ≥1600 density rule).
+   ---------------------------------------------------------- */
+.kds-root.kds-tv .kds-grid { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+.kds-root.kds-tv .view-head h1 { font-size: 2.6rem; }
+.kds-root.kds-tv .tab { font-size: 1.15rem; padding: 14px 22px; }
+.kds-root.kds-tv .kds-ws { font-size: 1.1rem; }
+.kds-root.kds-tv .kds-alert { font-size: 1.15rem; padding: 12px 18px; }
+.kds-root.kds-tv .kds-empty { font-size: 1.5rem; }
+.kds-root.kds-tv .ticket { padding: 20px 22px; border-left-width: 10px; background: #0a0f1c; border-color: var(--line); }
+.kds-root.kds-tv .ticket .t-table { font-size: 2rem; }
+.kds-root.kds-tv .ticket .t-server { font-size: 1.15rem; }
+.kds-root.kds-tv .ticket .t-timer { font-size: 1.55rem; }
+.kds-root.kds-tv .ticket .t-status { font-size: 1.05rem; }
+.kds-root.kds-tv .ticket .t-status.new { padding: 6px 16px; }
+.kds-root.kds-tv .ticket .t-chan { font-size: .95rem; padding: 5px 12px; }
+.kds-root.kds-tv .ticket .t-courses { font-size: 1.1rem; padding: 8px 14px; }
+.kds-root.kds-tv .ticket .t-item { font-size: 1.4rem; }
+.kds-root.kds-tv .ticket .t-item .tmods { font-size: 1.15rem; }
+.kds-root.kds-tv .ticket .t-item .seat { font-size: 1rem; padding: 4px 10px; }
+.kds-root.kds-tv .ticket .t-item .t-note { font-size: 1.2rem; padding: 6px 14px; }
+.kds-root.kds-tv .ticket .t-item .t-allergy { font-size: 1.4rem; padding: 6px 14px; }
+.kds-root.kds-tv .ticket .t-banner { font-size: 1.35rem; padding: 12px 16px; }
+.kds-root.kds-tv .ticket .bump-row .btn { min-height: 64px; font-size: 1.3rem; }
+
+@media (min-width: 1600px), (min-height: 1300px) {
+  .kds-root .kds-grid { gap: 20px; }
+  .kds-root .view-head h1 { font-size: 2.6rem; }
+  .kds-root .tab { font-size: 1.15rem; padding: 14px 22px; }
+  .kds-root .kds-ws { font-size: 1.1rem; }
+  .kds-root .kds-alert { font-size: 1.15rem; padding: 12px 18px; }
+  .kds-root .kds-empty { font-size: 1.5rem; }
+  .kds-root .ticket { padding: 20px 22px; border-left-width: 10px; background: #0a0f1c; border-color: var(--line); }
+  .kds-root .ticket .t-table { font-size: 2rem; }
+  .kds-root .ticket .t-server { font-size: 1.15rem; }
+  .kds-root .ticket .t-timer { font-size: 1.55rem; }
+  .kds-root .ticket .t-status { font-size: 1.05rem; }
+  .kds-root .ticket .t-status.new { padding: 6px 16px; }
+  .kds-root .ticket .t-chan { font-size: .95rem; padding: 5px 12px; }
+  .kds-root .ticket .t-courses { font-size: 1.1rem; padding: 8px 14px; }
+  .kds-root .ticket .t-item { font-size: 1.4rem; }
+  .kds-root .ticket .t-item .tmods { font-size: 1.15rem; }
+  .kds-root .ticket .t-item .seat { font-size: 1rem; padding: 4px 10px; }
+  .kds-root .ticket .t-item .t-note { font-size: 1.2rem; padding: 6px 14px; }
+  .kds-root .ticket .t-item .t-allergy { font-size: 1.4rem; padding: 6px 14px; }
+  .kds-root .ticket .t-banner { font-size: 1.35rem; padding: 12px 16px; }
+  .kds-root .ticket .bump-row .btn { min-height: 64px; font-size: 1.3rem; }
+}

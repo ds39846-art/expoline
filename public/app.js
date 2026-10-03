@@ -2456,16 +2456,37 @@ async function renderKds(app) {
   } catch (e) { /* defaults */ }
 
   app.innerHTML =
+    '<div class="kds-root" id="kds-root">' +
     '<div class="view-head"><h1>Kitchen Display</h1><span class="spacer"></span>' +
     '<span class="kds-ws" id="kds-ws"><span class="dot-dead"></span>connecting…</span> ' +
-    '<button class="btn btn-ghost" id="kds-recall-btn">Recall</button></div>' +
+    '<button class="btn btn-ghost" id="kds-recall-btn">Recall</button>' +
+    '<button class="btn btn-ghost" id="kds-tv-btn" aria-pressed="false">🖥 TV</button></div>' +
     '<div id="kds-alerts"></div>' +
     '<div class="tabs" id="kds-tabs">' +
     KDS_STATIONS.map((s) => '<button class="tab' + (s.slug === state.kds.station ? ' active' : '') + '" data-st="' + esc(s.slug) + '">' + esc(s.label) + '</button>').join('') +
-    '</div><div class="kds-grid" id="kds-grid"></div>';
+    '</div><div class="kds-grid" id="kds-grid"></div></div>';
 
   const grid = $('#kds-grid'), wsBadge = $('#kds-ws'), recallBtn = $('#kds-recall-btn');
   const alertsEl = $('#kds-alerts');
+
+  /* TV mode (presentation only): toggles the .kds-tv scale on the
+     board root for a wall-mounted kitchen display. Persisted per
+     device in localStorage; the same scale auto-applies via CSS
+     on very wide/tall viewports. No ticket behavior changes. */
+  const kdsRoot = $('#kds-root'), tvBtn = $('#kds-tv-btn');
+  const applyKdsTv = (on) => {
+    kdsRoot.classList.toggle('kds-tv', on);
+    tvBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    tvBtn.textContent = on ? '🖥 TV: On' : '🖥 TV';
+  };
+  let kdsTv = false;
+  try { kdsTv = localStorage.getItem('expoline.kdsTv') === '1'; } catch (e) { /* storage unavailable */ }
+  applyKdsTv(kdsTv);
+  tvBtn.onclick = () => {
+    kdsTv = !kdsTv;
+    try { localStorage.setItem('expoline.kdsTv', kdsTv ? '1' : '0'); } catch (e) { /* ignore */ }
+    applyKdsTv(kdsTv);
+  };
 
   $$('#kds-tabs .tab').forEach((b) => b.onclick = () => {
     state.kds.station = b.dataset.st;
