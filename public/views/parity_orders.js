@@ -234,6 +234,19 @@ async function openEditItemModal(check, item) {
     bd.addEventListener('change', (e) => {
       const t = e.target;
       if (t.matches('input[data-eg]')) {
+        /* Single-pick groups (max_select === 1 — Temperature, Flavor, …)
+           behave like radios: checking an option unchecks its siblings,
+           so the previously-saved pick doesn't stay ticked next to the
+           new one and ride along in the PATCH past the server's
+           at-most-1 validation. Sibling note inputs close with them. */
+        if (t.checked && groups && Number((groups[Number(t.dataset.eg)] || {}).max_select) === 1) {
+          $$('.mod-group input[data-eg="' + t.dataset.eg + '"]', bd).forEach((c) => {
+            if (c === t || !c.checked) return;
+            c.checked = false;
+            const ni = $('.mod-note-in[data-emn="' + c.dataset.eg + ':' + c.dataset.eo + '"]', bd);
+            if (ni) { ni.style.display = 'none'; ni.value = ''; }
+          });
+        }
         const inp = $('.mod-note-in[data-emn="' + t.dataset.eg + ':' + t.dataset.eo + '"]', bd);
         if (inp) { inp.style.display = t.checked ? 'block' : 'none'; if (!t.checked) inp.value = ''; }
       } else if (t.matches('input[data-emi]')) {

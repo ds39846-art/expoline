@@ -1620,6 +1620,23 @@ async function renderOrder(app, checkId) {
         });
       }
     };
+    /* Single-pick groups (max_select === 1 — Temperature, Flavor, …)
+       behave like radios: checking an option unchecks its siblings in
+       the same group. Without this the pre-checked default stayed
+       ticked next to the new pick and the pair tripped the group's
+       own at-most-1 validation (or reached the server) until the user
+       unticked the first by hand. Registered before refreshModUI so
+       note fields and nested groups settle on the final state. */
+    const enforceSinglePick = (e) => {
+      const t = e.target;
+      if (!groups || !t || !t.checked || !t.dataset || t.dataset.g === undefined) return;
+      const g = groups[Number(t.dataset.g)];
+      if (!g || Number(g.max_select) !== 1) return;
+      $$('.mod-group input[data-g="' + t.dataset.g + '"]', bd).forEach((c) => {
+        if (c !== t) c.checked = false;
+      });
+    };
+    bd.addEventListener('change', enforceSinglePick);
     bd.addEventListener('change', refreshModUI);
     refreshModUI();
     $('[data-x="add"]', bd).onclick = () => {
