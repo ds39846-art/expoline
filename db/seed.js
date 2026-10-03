@@ -236,6 +236,20 @@ for (const c of MENU) {
   }
 }
 
+// Quick-pick row (order screen): the house favorites start flagged.
+// The popular column itself is added by the server boot migration
+// (routes/parity_orders.js ensureSchema) — same seed precedent as the
+// inventory tables below: add it here with identical DDL so the seed
+// can carry the flags.
+{
+  const cols = db.prepare('PRAGMA table_info(menu_items)').all().map((c) => c.name);
+  if (!cols.includes('popular')) db.exec('ALTER TABLE menu_items ADD COLUMN popular INTEGER DEFAULT 0');
+  for (const name of ['Bali Fries', 'Edamame', '14oz Ribeye', 'BH Mai Tai']) {
+    if (itemId[name]) db.prepare('UPDATE menu_items SET popular = 1 WHERE id = ?').run(itemId[name]);
+    else console.warn('WARNING: item not found for popular flag:', name);
+  }
+}
+
 // ---------------- modifiers ----------------
 const addMods = (itemName, mods) => {
   const id = itemId[itemName];
