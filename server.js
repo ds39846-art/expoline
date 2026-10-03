@@ -4263,6 +4263,12 @@ app.get('/api/manager/overview', managerOnly(), (req, res) => {
     // Time-clock labor cost for today (finalized closed shifts + elapsed-so-far
     // on open shifts, including break premiums and overtime). Feeds Finance.
     labor: dayLabor(today).summary,
+    // Day-scale orphan report: OPEN checks with no activity (no new
+    // items, no payments) for site_config stale_check_hours (default
+    // 24). Report only — nothing is auto-voided or auto-closed.
+    // (The alerts array above carries the separate in-service signal:
+    // opened_at older than 4h regardless of activity.)
+    stale_open_checks: staleOpenChecks(),
   });
 });
 
@@ -6676,7 +6682,7 @@ app.get('/api/reviews', managerOnly(), (req, res) => {
 });
 
 /** Manager settings (whitelisted keys only). */
-const ADMIN_SETTINGS = new Set(['review_prompt', 'kds_archive_retention_days']);
+const ADMIN_SETTINGS = new Set(['review_prompt', 'kds_archive_retention_days', 'stale_check_hours']);
 app.put('/api/admin/settings', managerOnly(), (req, res) => {
   const b = req.body || {};
   if (!ADMIN_SETTINGS.has(b.key)) return res.status(400).json({ error: 'key must be one of: ' + [...ADMIN_SETTINGS].join(', ') });
@@ -6691,6 +6697,10 @@ app.put('/api/admin/settings', managerOnly(), (req, res) => {
   } else if (b.key === 'kds_archive_retention_days') {
     const n = parseInt(b.value, 10);
     if (!Number.isFinite(n) || n < 1 || n > 3650) return res.status(400).json({ error: 'kds_archive_retention_days must be an integer 1..3650' });
+    value = String(n);
+  } else if (b.key === 'stale_check_hours') {
+    const n = parseInt(b.value, 10);
+    if (!Number.isFinite(n) || n < 1 || n > 8760) return res.status(400).json({ error: 'stale_check_hours must be an integer 1..8760' });
     value = String(n);
   } else {
     value = String(b.value ?? '');
@@ -6967,7 +6977,7 @@ const API_DOCS = [
   { method: 'GET', path: '/api/login-summary', auth: 'any staff', summary: 'Notes + 86s + today reservations + waitlist depth at login (NEW 3C)', params: '—' },
   { method: 'POST', path: '/api/reviews', auth: 'server+', summary: 'Post-payment 1–5★ review, once per check (NEW 3C)', params: 'check_id, rating, comment?, marketing_opt_in?' },
   { method: 'GET', path: '/api/reviews', auth: 'manager', summary: 'Review summary + list (NEW 3C)', params: '—' },
-  { method: 'PUT', path: '/api/admin/settings', auth: 'manager', summary: 'Whitelisted site settings (review_prompt, kds_archive_retention_days)', params: 'key, value' },
+  { method: 'PUT', path: '/api/admin/settings', auth: 'manager', summary: 'Whitelisted site settings (review_prompt, kds_archive_retention_days, stale_check_hours)', params: 'key, value' },
   { method: 'GET', path: '/api/admin/multisite/overview', auth: 'manager', summary: 'Cross-site dashboard; one site failure never touches another (NEW 3C)', params: '—' },
   { method: 'GET', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Ingredient records with low-stock flags (NEW 3C)', params: '—' },
   { method: 'POST', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Create ingredient (NEW 3C)', params: 'name, unit?, on_hand?, par?, cost_per_unit_cents?' },
@@ -7259,6 +7269,71 @@ setInterval(() => {
     if (n) console.log(`[expoline] kds-archive: moved ${n} fulfilled ticket(s) past the retention window to kds_tickets_archive`);
   } catch (e) { console.error('[expoline] kds-archive pass failed:', e.message); }
 }, 6 * 3600_000).unref();
+
+/* --------------------- stale open checks (report) ----------------------
+   OPEN checks whose last activity is older than site_config
+   stale_check_hours (default 24) are REPORTED — one boot log line and
+   the stale_open_checks field on GET /api/manager/overview — but never
+   auto-voided or auto-closed: a stale check can be a legitimate
+   long-running tab, so cleanup stays a human decision. "Last activity"
+   is the latest of the check's opened_at, its newest
+   check_items.added_at and its newest payments.created_at, compared
+   via parseDbUtc so naive SQLite UTC timestamps don't skew the age. */
+function staleOpenChecks() {
+  const hours = siteConfigInt('stale_check_hours', 24);
+  const cutoffMs = Date.now() - hours * 3600_000;
+  const opens = db.prepare(
+    "SELECT id, table_id, opened_at, total_cents FROM checks WHERE site_id = ? AND status = 'open' ORDER BY id"
+  ).all(SITE_ID);
+  const out = [];
+  if (opens.length) {
+    const ids = opens.map((c) => c.id);
+    const ph = ids.map(() => '?').join(',');
+    const itemAgg = new Map(db.prepare(
+      `SELECT check_id, COUNT(*) AS n, MAX(added_at) AS last_at FROM check_items WHERE check_id IN (${ph}) GROUP BY check_id`
+    ).all(...ids).map((r) => [r.check_id, r]));
+    const payAgg = new Map(db.prepare(
+      `SELECT check_id, MAX(created_at) AS last_at FROM payments WHERE check_id IN (${ph}) GROUP BY check_id`
+    ).all(...ids).map((r) => [r.check_id, r]));
+    const labelStmt = db.prepare('SELECT label FROM tables WHERE id = ?');
+    for (const c of opens) {
+      const ia = itemAgg.get(c.id), pa = payAgg.get(c.id);
+      const stamps = [c.opened_at, ia ? ia.last_at : null, pa ? pa.last_at : null];
+      let lastMs = NaN, lastRaw = null;
+      for (const s of stamps) {
+        const ms = parseDbUtc(s);
+        if (Number.isFinite(ms) && (!Number.isFinite(lastMs) || ms > lastMs)) { lastMs = ms; lastRaw = s; }
+      }
+      if (!Number.isFinite(lastMs) || lastMs > cutoffMs) continue;
+      const table = c.table_id ? labelStmt.get(c.table_id) : null;
+      out.push({
+        check_id: c.id,
+        table_id: c.table_id,
+        table_label: table ? table.label : null,
+        opened_at: c.opened_at,
+        last_activity_at: lastRaw,
+        age_hours: Math.round(((Date.now() - lastMs) / 3600_000) * 10) / 10,
+        item_count: ia ? ia.n : 0,
+        total_cents: c.total_cents || 0,
+      });
+    }
+  }
+  return { threshold_hours: hours, checks: out };
+}
+
+(() => {
+  db.prepare("INSERT OR IGNORE INTO site_config (site_id, key, value) VALUES (?, 'stale_check_hours', '24')").run(SITE_ID);
+  try {
+    const stale = staleOpenChecks();
+    if (!stale.checks.length) {
+      console.log(`[expoline] stale open checks (no activity > ${stale.threshold_hours}h): none`);
+    } else {
+      const ids = stale.checks.slice(0, 20).map((c) => '#' + c.check_id).join(', ');
+      const more = stale.checks.length > 20 ? ` +${stale.checks.length - 20} more` : '';
+      console.log(`[expoline] stale open checks (no activity > ${stale.threshold_hours}h): ${stale.checks.length} — ${ids}${more} (report only — nothing auto-closed)`);
+    }
+  } catch (e) { console.error('[expoline] stale-check boot scan failed:', e.message); }
+})();
 
 /* ------------------------------- graceful stop ------------------------------ */
 function shutdown(signal) {
