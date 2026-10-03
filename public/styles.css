@@ -677,3 +677,147 @@ ul.clean li { padding: 6px 0; border-bottom: 1px solid var(--line); }
 .fire-schedule { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 .fire-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: var(--ink); border: 1px solid var(--line); border-radius: 8px; }
 .fire-row.fire-due { border-color: var(--amber); background: rgba(255, 180, 0, 0.08); }
+
+/* ============================================================
+   DEVICE MAP — responsive presentation.
+   Media queries only (viewport width/height) — NO user-agent
+   sniffing anywhere. This one section is the whole device
+   story, kept together on purpose so a future reader sees it
+   at a glance:
+
+     ≤560px     HANDHELD / PHONE (Toast Go class): single
+                column, oversized touch targets, seat rail
+                pinned directly above a fixed bottom action
+                bar that carries the running total, modals go
+                near-full-screen, pay methods stack full-width
+                with the biggest tip targets on the screen and
+                the total pinned in a bottom bar.
+     561–1100px TABLET: two-pane order view (menu + sticky
+                cart), denser menu grid, KDS in 3–5 columns.
+     1101–1599  DESKTOP / PC: the standard layout, unchanged.
+     ≥1600px    VERY WIDE / TV: the app widens so extra width
+                becomes MORE menu tiles per row (density),
+                never giant stretched tiles; the KDS board
+                widens too and auto-scales to wall format (see
+                the KDS TV block at the end of this section).
+
+   KDS columns scale by width via auto-fit (continuous
+   scroll, no paging): handheld 1–2, tablet 3–5, desktop
+   ~4–6, TV up to ~9 across.
+   ============================================================ */
+
+/* Pinned-bar totals: rendered by the views, shown only where
+   a breakpoint below turns them on. */
+.order-total { display: none; flex: none; flex-direction: column; justify-content: center;
+  padding: 0 4px; color: var(--brass-hi); font-weight: 800; font-size: 1.15rem; white-space: nowrap; }
+.order-total::before { content: "Total"; font-size: .68rem; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--text-dim); }
+.pay-total-bar { display: none; position: fixed; left: 10px; right: 10px; bottom: 10px; z-index: 95;
+  align-items: center; justify-content: space-between; gap: 12px;
+  background: var(--ink-2); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 12px 16px;
+  font-family: var(--serif); font-size: 1.3rem; color: var(--brass-hi); }
+.pay-total-bar .due { font-family: var(--sans); font-size: 1rem; font-weight: 700; color: var(--amber); }
+
+/* ---------- KDS columns by width (auto-fit; later rules in
+   this file override the fixed 1/2/3-column rules above) --- */
+@media (max-width: 560px) {
+  .kds-grid { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+}
+@media (min-width: 561px) and (max-width: 1100px) {
+  .kds-grid { grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); }
+}
+@media (min-width: 1101px) and (max-width: 1599px) {
+  .kds-grid { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+}
+@media (min-width: 1600px) {
+  .kds-grid { grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); }
+}
+
+/* ---------- Tablet: 561–1100px ---------------------------- */
+@media (min-width: 561px) and (max-width: 1100px) {
+  /* Two-pane order view. The #app-scoped selectors outrank the
+     runtime-injected #order-layout-css sheet, so the panes hold
+     across the whole tablet band (incl. 1000–1100px). */
+  #app .order-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+  #app .order-layout .cart-panel { margin-top: 0; position: sticky; top: 64px; }
+  /* Denser menu grid than desktop: more, smaller tiles. */
+  .item-grid { grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); }
+}
+
+/* ---------- Handheld / phone: ≤560px ---------------------- */
+@media (max-width: 560px) {
+  .app { padding: 12px 10px 96px; }
+  h1 { font-size: 1.55rem; }
+  h2 { font-size: 1.25rem; }
+
+  /* Order view: single column — menu first, cart below. */
+  #app .order-layout { display: block; }
+  #app .order-layout .cart-panel { position: static; margin-top: 16px; }
+  .order-top .table-label { font-size: 1.25rem; }
+  /* Clearance so the two fixed bars never cover the cart's end. */
+  #app:has(> .order-layout) { padding-bottom: 196px; }
+
+  /* Menu: ≥2 columns of ≥120px cards, thumb-height targets.
+     Category tabs and the quick-pick row already scroll-x. */
+  .item-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+  .item-card { min-height: 96px; padding: 14px 12px; }
+  .item-card .nm { font-size: 1rem; }
+
+  /* Seat rail pinned directly above the action bar (Toast Go
+     pattern). Scoped to the order strip's id — the move-picker
+     modal reuses the .seat-row class and is NOT pinned. The
+     strip keeps its horizontal scroll; the scrollbar is hidden
+     for a clean rail. */
+  #seat-row { position: fixed; left: 0; right: 0; bottom: 92px; z-index: 90;
+    margin: 0; padding: 8px 10px; background: var(--ink);
+    border-top: 1px solid var(--line); box-shadow: 0 -6px 18px rgba(0,0,0,.35);
+    scrollbar-width: none; }
+  #seat-row::-webkit-scrollbar { display: none; }
+  .seat-chip { min-height: 52px; padding: 10px 16px; font-size: 1.02rem; }
+
+  /* Persistent bottom action bar: HOLD / SEND / SEND NOW plus
+     the running total, always in thumb reach. */
+  #app:has(> .order-layout) .order-actions { position: fixed; left: 10px; right: 10px; bottom: 10px;
+    z-index: 95; margin: 0; padding: 10px; align-items: stretch;
+    background: var(--ink-2); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow); }
+  .order-actions .btn-big { min-height: 60px; }
+  .order-total { display: flex; }
+  /* Toasts ride above the pinned bars instead of behind them. */
+  body:has(.order-layout) #toast-root { bottom: 196px; }
+
+  /* Quick bar: wraps (already flex-wrap) with 44px buttons. */
+  .qb-btn { width: 44px; height: 44px; }
+  .val-type-in { width: 3.6em; padding: 6px 4px; }
+
+  /* Modals: near-full-screen sheets, large inputs/targets. */
+  .modal { max-height: 94vh; padding: 18px 16px calc(18px + env(safe-area-inset-bottom)); }
+  .modal .stepper button { width: 56px; height: 56px; }
+  .mod-row { min-height: 56px; }
+  .field input, .field select { min-height: 56px; font-size: 1.1rem; }
+
+  /* Pay view: methods become full-width stacked rows; tip
+     presets are the largest targets on the screen; the total
+     rides in the pinned bottom bar. */
+  .pay-methods { grid-template-columns: 1fr; }
+  .tip-row { gap: 10px; }
+  .tip-chip { flex: 1 1 30%; min-height: 64px; font-size: 1.2rem; }
+  .pay-total-bar { display: flex; }
+  #app:has(> .pay-total-bar) { padding-bottom: 150px; }
+
+  /* Floor view + shared pieces: no horizontal page scroll.
+     (Tables keep their own .t-scroll containers by design.) */
+  .floor-banner { flex-wrap: wrap; }
+  .date-cols { grid-template-columns: 1fr; }
+}
+
+/* ---------- Very wide: ≥1600px (non-KDS density) ---------- */
+@media (min-width: 1600px) {
+  /* KDS board uses the wall's width… */
+  #app:has(.kds-root) { max-width: 1880px; }
+  /* …and the order view trades tile size for tile count:
+     tiles are capped, extra width becomes more per row. */
+  #app:has(> .order-layout) { max-width: 1680px; }
+  #app:has(> .order-layout) .item-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 200px)); }
+}

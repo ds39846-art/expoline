@@ -1399,7 +1399,10 @@ async function renderOrder(app, checkId) {
     '<div class="order-layout"><div><div class="item-grid" id="item-grid"></div>' +
     '<div class="drinks-note">🍸 <b>Drinks</b> are tagged <span class="drink-tag">BAR</span> — they fire to the <b>bar</b> immediately on send, never holding up food.</div></div>' +
     '<div class="cart-panel"><div class="card"><h3>Order</h3><div id="cart-body"></div>' +
-    '<div class="order-actions"><button class="btn btn-amber btn-big" id="btn-hold">HOLD</button>' +
+    /* Handheld bottom bar shows the running total next to the actions
+       (mirrors the header Pay total — same value, same paint points);
+       the span is display:none except at the handheld breakpoint. */
+    '<div class="order-actions"><span class="order-total" id="order-total">' + fmt(totals.total) + '</span><button class="btn btn-amber btn-big" id="btn-hold">HOLD</button>' +
     '<button class="btn btn-green btn-big" id="btn-send">SEND</button>' +
     /* Phase 3A (P0-4): one-tap send-now — staged items go straight to the
        KDS, skipping the HOLD step (Toast "Send" parity). */
@@ -1834,6 +1837,8 @@ async function renderOrder(app, checkId) {
       if (totals && totals.total != null) {
         const pl = $('.order-top a.btn-primary');
         if (pl) pl.textContent = 'Pay · ' + fmt(totals.total);
+        const ot = $('#order-total');
+        if (ot) ot.textContent = fmt(totals.total);
       }
       drawSeats(); drawCart();
     };
@@ -2760,7 +2765,12 @@ async function renderPay(app, checkId) {
     '<div class="card"><button class="btn btn-green btn-big btn-block" id="close-check"' + (t.balance > 0 ? ' disabled' : '') + '>' +
     (t.balance > 0 ? 'Balance remaining — cannot close' : 'Close check ✓') + '</button>' +
     (t.balance > 0 ? '' : '<p class="small muted" style="text-align:center;margin-top:8px">Balance is $0.00 — ready to close.</p>') + '</div>' +
-    '<div id="review-nudge-slot"></div>';
+    '<div id="review-nudge-slot"></div>' +
+    /* Handheld only (CSS-gated): the running total stays pinned in a
+       bottom bar while the server scrolls the payment card. Same `t`
+       the summary card above renders — display only. */
+    '<div class="pay-total-bar" id="pay-total-bar"><span>Total · ' + fmt(t.total) + '</span>' +
+    (Math.max(0, t.balance) !== t.total ? '<span class="due">Due ' + fmt(Math.max(0, t.balance)) + '</span>' : '') + '</div>';
 
   function paymentLabel(p) {
     if (p.method === 'cash') return 'Cash' + (p.tendered_cents ? ' (tendered ' + fmt(p.tendered_cents) + ')' : '');
