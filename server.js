@@ -6714,7 +6714,23 @@ app.get('/api/reviews', managerOnly(), (req, res) => {
 });
 
 /** Manager settings (whitelisted keys only). */
-const ADMIN_SETTINGS = new Set(['review_prompt', 'kds_archive_retention_days', 'stale_check_hours']);
+const ADMIN_SETTINGS = new Set(['review_prompt', 'kds_archive_retention_days', 'stale_check_hours',
+  'kds_age_warn_minutes', 'kds_age_critical_minutes']);
+/* KDS aging pair (minutes). Defaults 8 / 15 apply when the pair is first
+ * saved: saving either key materializes BOTH minute keys and their
+ * derived seconds keys (kds_warn_secs / kds_late_secs — what
+ * kdsThresholds() reads), so the stored pair is always complete and the
+ * board always runs what the settings say. The keys are deliberately
+ * NOT boot-seeded: an untouched site keeps the long-standing board
+ * thresholds (600s / 1200s) the seconds surface has always driven.
+ * POST /api/kds/settings (seconds) deletes the minute keys when it
+ * writes warn/late — whichever surface wrote last owns the pair. */
+const KDS_AGE_DEFAULTS = { kds_age_warn_minutes: 8, kds_age_critical_minutes: 15 };
+function kdsAgeMinutes(key) {
+  const row = db.prepare('SELECT value FROM site_config WHERE site_id = ? AND key = ?').get(SITE_ID, key);
+  const n = row ? parseInt(row.value, 10) : NaN;
+  return Number.isFinite(n) && n >= 1 && n <= 240 ? n : KDS_AGE_DEFAULTS[key];
+}
 app.put('/api/admin/settings', managerOnly(), (req, res) => {
   const b = req.body || {};
   if (!ADMIN_SETTINGS.has(b.key)) return res.status(400).json({ error: 'key must be one of: ' + [...ADMIN_SETTINGS].join(', ') });
@@ -6733,6 +6749,29 @@ app.put('/api/admin/settings', managerOnly(), (req, res) => {
   } else if (b.key === 'stale_check_hours') {
     const n = parseInt(b.value, 10);
     if (!Number.isFinite(n) || n < 1 || n > 8760) return res.status(400).json({ error: 'stale_check_hours must be an integer 1..8760' });
+    value = String(n);
+  } else if (b.key === 'kds_age_warn_minutes' || b.key === 'kds_age_critical_minutes') {
+    const n = Number(b.value);
+    if (!Number.isInteger(n) || n < 1 || n > 240) {
+      return res.status(400).json({ error: b.key + ' must be an integer 1..240 (minutes)' });
+    }
+    const otherKey = b.key === 'kds_age_warn_minutes' ? 'kds_age_critical_minutes' : 'kds_age_warn_minutes';
+    const pair = { [b.key]: n, [otherKey]: kdsAgeMinutes(otherKey) };
+    if (!(pair.kds_age_warn_minutes < pair.kds_age_critical_minutes)) {
+      return res.status(400).json({
+        error: 'kds_age_warn_minutes (' + pair.kds_age_warn_minutes +
+          ') must be less than kds_age_critical_minutes (' + pair.kds_age_critical_minutes + ')',
+      });
+    }
+    // Materialize the full pair + the derived seconds keys atomically,
+    // so kdsThresholds() (seconds) always runs what these settings say.
+    const up = db.prepare('INSERT INTO site_config (site_id, key, value) VALUES (?, ?, ?) ON CONFLICT(site_id, key) DO UPDATE SET value = excluded.value');
+    withTransaction(() => {
+      up.run(SITE_ID, 'kds_age_warn_minutes', String(pair.kds_age_warn_minutes));
+      up.run(SITE_ID, 'kds_age_critical_minutes', String(pair.kds_age_critical_minutes));
+      up.run(SITE_ID, 'kds_warn_secs', String(pair.kds_age_warn_minutes * 60));
+      up.run(SITE_ID, 'kds_late_secs', String(pair.kds_age_critical_minutes * 60));
+    });
     value = String(n);
   } else {
     value = String(b.value ?? '');
@@ -7179,7 +7218,7 @@ const API_DOCS = [
   { method: 'GET', path: '/api/login-summary', auth: 'any staff', summary: 'Notes + 86s + today reservations + waitlist depth at login (NEW 3C)', params: '—' },
   { method: 'POST', path: '/api/reviews', auth: 'server+', summary: 'Post-payment 1–5★ review, once per check (NEW 3C)', params: 'check_id, rating, comment?, marketing_opt_in?' },
   { method: 'GET', path: '/api/reviews', auth: 'manager', summary: 'Review summary + list (NEW 3C)', params: '—' },
-  { method: 'PUT', path: '/api/admin/settings', auth: 'manager', summary: 'Whitelisted site settings (review_prompt, kds_archive_retention_days, stale_check_hours)', params: 'key, value' },
+  { method: 'PUT', path: '/api/admin/settings', auth: 'manager', summary: 'Whitelisted site settings (review_prompt, kds_archive_retention_days, stale_check_hours, kds_age_warn_minutes, kds_age_critical_minutes)', params: 'key, value' },
   { method: 'GET', path: '/api/admin/multisite/overview', auth: 'manager', summary: 'Cross-site dashboard; one site failure never touches another (NEW 3C)', params: '—' },
   { method: 'GET', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Ingredient records with low-stock flags (NEW 3C)', params: '—' },
   { method: 'POST', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Create ingredient (NEW 3C)', params: 'name, unit?, on_hand?, par?, cost_per_unit_cents?' },

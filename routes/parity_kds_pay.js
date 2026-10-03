@@ -6,7 +6,10 @@
  *   C. KDS ticket timers & aging alerts — thresholds as site_config DATA
  *      (kds_warn_secs / kds_late_secs / kds_alert_lead_secs); the ticket
  *      HEADER owns the aging color; /api/kds/alerts fires BEFORE the breach
- *      (aging_soon tickets with warn_in_s > 0), not after.
+ *      (aging_soon tickets with warn_in_s > 0), not after. Managers can
+ *      also set the pair in minutes (kds_age_warn_minutes /
+ *      kds_age_critical_minutes) via PUT /api/admin/settings, which
+ *      writes through to the seconds keys — last writer owns the pair.
  *   C. Course-status headers — courseStatusFor() rides on EVERY ticket view
  *      (server.js ticketView): per-course held/fired/bumped so the line
  *      never has to ask. Course order: drink < appetizer < entree < dessert.
@@ -599,6 +602,15 @@ function registerStaff(app, ctx) {
       'INSERT INTO site_config (site_id, key, value) VALUES (?, ?, ?) ON CONFLICT(site_id, key) DO UPDATE SET value = excluded.value'
     );
     for (const [k, v] of Object.entries(set)) up.run(SITE_ID, k, v);
+    // Ownership: a warn/late write here (the seconds surface) supersedes
+    // the manager minute settings — PUT /api/admin/settings writes
+    // kds_age_*_minutes through to these same seconds keys, so drop the
+    // minute keys and stored settings never claim values the board is
+    // not running. Whichever surface wrote last owns the pair.
+    if (set.kds_warn_secs !== undefined || set.kds_late_secs !== undefined) {
+      db.prepare("DELETE FROM site_config WHERE site_id = ? AND key IN ('kds_age_warn_minutes','kds_age_critical_minutes')")
+        .run(SITE_ID);
+    }
     res.json({ thresholds: kdsThresholds(db, SITE_ID) });
   });
 
