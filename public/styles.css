@@ -279,6 +279,11 @@ button, input, select, textarea { font-family: var(--sans); font-size: 1rem; col
 .qb-btn { width: 36px; height: 36px; border-radius: 8px; border: 1px solid var(--line); background: var(--ink-3); color: var(--text); font-size: 1.05rem; font-weight: 700; cursor: pointer; }
 .qb-btn:disabled { opacity: .35; cursor: default; }
 .qb-val { min-width: 22px; text-align: center; font-weight: 700; }
+/* Tap-to-type stepper values (quick bar + modals): dotted underline hints
+   the number itself is tappable; the inline editor replaces it in place. */
+.qb-val.tappable, .stepper .val.tappable { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+.val-type-in { width: 3.2em; font: inherit; font-weight: 700; text-align: center; padding: 2px 4px; border: 1px solid var(--brass-dim); border-radius: 6px; background: var(--ink-2); color: var(--text); }
+.val-type-ok { margin-left: 6px; width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--line); background: var(--ink-3); color: var(--text); font-weight: 700; cursor: pointer; vertical-align: middle; }
 .qb-void { color: var(--red); border-color: var(--red); background: transparent; }
 .sel-bar { align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 .mv-row { flex-wrap: wrap; overflow-x: visible; }

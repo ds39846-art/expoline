@@ -137,7 +137,7 @@ function deltaHtml(d) {
 
 async function openEditItemModal(check, item) {
   const fired = item.state === 'sent' || item.state === 'fulfilled';
-  const guests = check.guest_count || 2;
+  let guests = check.guest_count || 2;
   let qty = item.qty || 1, seat = item.seat || 1;
   let course = item.course || null;
   let note = item.note || '', allergy = !!item.allergy, allergyDetail = item.allergy_detail || '';
@@ -213,10 +213,17 @@ async function openEditItemModal(check, item) {
       '<button class="btn" id="ei-repeat" title="Add the same line again">Repeat 🔁</button>' +
       '<button class="btn btn-primary" data-x="go">Save changes</button></div>');
 
-    $('[data-q="dec"]', bd).onclick = () => { qty = Math.max(1, qty - 1); $('#ei-qty', bd).textContent = qty; };
-    $('[data-q="inc"]', bd).onclick = () => { qty = Math.min(24, qty + 1); $('#ei-qty', bd).textContent = qty; };
-    $('[data-s="dec"]', bd).onclick = () => { seat = Math.max(1, seat - 1); $('#ei-seat', bd).textContent = seat; };
-    $('[data-s="inc"]', bd).onclick = () => { seat = Math.min(guests, seat + 1); $('#ei-seat', bd).textContent = seat; };
+    $('[data-q="dec"]', bd).onclick = () => { qty = Math.max(1, qty - 1); delete $('#ei-qty', bd).dataset.editing; $('#ei-qty', bd).textContent = qty; };
+    $('[data-q="inc"]', bd).onclick = () => { qty = Math.min(24, qty + 1); delete $('#ei-qty', bd).dataset.editing; $('#ei-qty', bd).textContent = qty; };
+    $('[data-s="dec"]', bd).onclick = () => { seat = Math.max(1, seat - 1); delete $('#ei-seat', bd).dataset.editing; $('#ei-seat', bd).textContent = seat; };
+    $('[data-s="inc"]', bd).onclick = () => { seat = Math.min(guests, seat + 1); delete $('#ei-seat', bd).dataset.editing; $('#ei-seat', bd).textContent = seat; };
+    /* Tap-to-type on the same values: typed qty applies to the local
+       qty; typed seat may run to 24 — if it passes the check's current
+       guest_count, Save grows the check first (see the go handler). */
+    tappableValue($('#ei-qty', bd), { get: () => qty, min: 1, max: 24, label: 'Quantity',
+      onApply: (n) => { qty = n; $('#ei-qty', bd).textContent = n; } });
+    tappableValue($('#ei-seat', bd), { get: () => seat, min: 1, max: 24, label: 'Seat',
+      onApply: (n) => { seat = n; $('#ei-seat', bd).textContent = n; } });
     $('#ei-allergy', bd).onchange = (e) => { $('#ei-allergy-detail', bd).style.display = e.target.checked ? 'block' : 'none'; };
     let dMode = 'amount';
     $$('#ei-dmode .tip-chip', bd).forEach((b) => b.onclick = () => {
@@ -296,6 +303,13 @@ async function openEditItemModal(check, item) {
       if (pin === undefined) return;
       if (pin) { b2.manager_pin = pin; if (applyDiscount) applyDiscount.manager_pin = pin; }
       try {
+        /* Typed seat beyond the current guest_count: grow the check
+           first (same PATCH the "+ Seat" chip uses) or the item PATCH
+           would 400 on seat > guest_count. */
+        if (seat > guests) {
+          await window.api('/api/checks/' + encodeURIComponent(check.id), 'PATCH', { guest_count: seat });
+          guests = seat;
+        }
         const r = await window.api('/api/checks/' + encodeURIComponent(check.id) + '/items/' + encodeURIComponent(item.id), 'PATCH', b2);
         if (applyDiscount) {
           const itemId = (r.item && r.item.id) || item.id;
@@ -516,8 +530,10 @@ function seatStripHtml(o) {
  *  at the server's own bounds (qty 1–24, seat 1..guest_count) so a tap
  *  never fires a request the API would reject. Fired lines keep the same
  *  buttons — app.js routes those taps to the manager-approved edit modal.
- *  "More…" is omitted for staged lines (they have no server line to edit;
- *  qty/seat/repeat/void cover their whole lifecycle). */
+ *  The value spans carry data-qbval hooks: app.js makes them tap-to-type
+ *  (tappableValue below) so a server can key the exact qty/seat instead
+ *  of tapping + a dozen times. "More…" shows for staged lines too — it
+ *  reopens the modifier flow on the staged line (app.js restage). */
 function quickBarHtml(o) {
   const qty = Math.max(1, o.qty || 1), seat = Math.max(1, o.seat || 1);
   const guests = Math.max(1, o.guestCount || 1);
@@ -525,16 +541,79 @@ function quickBarHtml(o) {
   return '<div class="quick-bar" data-quickbar="1">' +
     '<span class="qb-group"><span class="qb-lbl">Qty</span>' +
     '<button class="qb-btn" data-qa="qty-dec"' + dis(qty <= 1) + ' aria-label="One fewer">−</button>' +
-    '<span class="qb-val">' + qty + '</span>' +
+    '<span class="qb-val" data-qbval="qty">' + qty + '</span>' +
     '<button class="qb-btn" data-qa="qty-inc"' + dis(qty >= 24) + ' aria-label="One more">+</button></span>' +
     '<span class="qb-group"><span class="qb-lbl">Seat</span>' +
     '<button class="qb-btn" data-qa="seat-dec"' + dis(seat <= 1) + ' aria-label="Move to lower seat">−</button>' +
-    '<span class="qb-val">' + seat + '</span>' +
+    '<span class="qb-val" data-qbval="seat">' + seat + '</span>' +
     '<button class="qb-btn" data-qa="seat-inc"' + dis(seat >= guests) + (seat >= guests ? ' title="Add a seat from the seat strip first"' : '') + ' aria-label="Move to higher seat">+</button></span>' +
     '<button class="btn btn-sm" data-qa="repeat">Repeat 🔁</button>' +
     '<button class="btn btn-sm qb-void" data-qa="void">Void</button>' +
-    (o.staged ? '' : '<button class="btn btn-sm" data-qa="more">More…</button>') +
+    '<button class="btn btn-sm" data-qa="more">More…</button>' +
     '</div>';
+}
+
+/** Tap-to-type for a stepper value. Tapping the number swaps it, in place,
+ *  for a numeric input prefilled with the current value and fully selected
+ *  (typing replaces it). Enter, the ✓ button, or blur-after-a-change
+ *  applies through opts.onApply — the SAME apply path the steppers use.
+ *  Esc cancels. Empty / non-numeric / out-of-range input only toasts and
+ *  restores the old value: onApply is never called, so nothing invalid
+ *  can reach the API. opts: {get(), min, max, label, onApply(n)}. */
+function tappableValue(span, opts) {
+  if (!span) return;
+  span.classList.add('tappable');
+  span.setAttribute('role', 'button');
+  span.setAttribute('tabindex', '0');
+  span.title = 'Tap to type';
+  const open = () => {
+    if (span.dataset.editing || !span.isConnected) return;
+    span.dataset.editing = '1';
+    const cur = opts.get();
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.inputMode = 'numeric';
+    inp.setAttribute('pattern', '[0-9]*');
+    inp.className = 'val-type-in';
+    inp.value = String(cur);
+    inp.setAttribute('aria-label', (opts.label || 'Value') + ' — type a number');
+    const okBtn = document.createElement('button');
+    okBtn.type = 'button';
+    okBtn.className = 'val-type-ok';
+    okBtn.textContent = '✓';
+    okBtn.setAttribute('aria-label', 'Apply');
+    span.textContent = '';
+    span.appendChild(inp);
+    span.appendChild(okBtn);
+    let closed = false;
+    const finish = (apply) => {
+      if (closed) return;
+      closed = true;
+      delete span.dataset.editing;
+      const raw = inp.value.trim();
+      span.textContent = String(opts.get()); // restore the display first
+      if (!apply) return;
+      if (!/^\d+$/.test(raw)) { window.toast('Enter a whole number between ' + opts.min + ' and ' + opts.max, 'err'); return; }
+      const n = parseInt(raw, 10);
+      if (n < opts.min || n > opts.max) { window.toast('Enter a whole number between ' + opts.min + ' and ' + opts.max, 'err'); return; }
+      if (n === cur) return;
+      opts.onApply(n);
+    };
+    okBtn.onclick = (e) => { e.stopPropagation(); finish(true); };
+    inp.onclick = (e) => e.stopPropagation();
+    inp.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    inp.addEventListener('blur', () => finish(inp.value.trim() !== String(cur)));
+    inp.focus();
+    inp.select();
+  };
+  span.onclick = open;
+  span.onkeydown = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+  };
 }
 
 /** Seat-chip picker for bulk moves. Resolves: seat number | 'new' | null
@@ -571,7 +650,7 @@ window.ParityOrders = {
   openRenameSeatModal,
   openEditItemModal, describeDelta, deltaHtml,
   openVisualSplit, openMergePicker,
-  countLinesBySeat, seatStripHtml, quickBarHtml, openMoveToSeatPicker,
+  countLinesBySeat, seatStripHtml, quickBarHtml, openMoveToSeatPicker, tappableValue,
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = window.ParityOrders;
 })();

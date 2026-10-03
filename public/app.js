@@ -1377,7 +1377,7 @@ async function renderOrder(app, checkId) {
     '<a class="btn btn-ghost" href="#/floor" aria-label="Back to floor">‹</a>' +
     '<span class="table-label">' + esc(check.table_label || check.table || ('Check ' + String(checkId).slice(-4))) + '</span>' +
     (check.tab_name ? '<span class="muted">· ' + esc(check.tab_name) + '</span>' : '') +
-    '<span class="muted small">' + guests + ' guests</span>' +
+    '<span class="muted small" id="hdr-guests">' + guests + ' guests</span>' +
     '<button class="icon-btn" id="check-settings" title="Check settings — guests, tab name, coursing, order note, void check" aria-label="Check settings">⚙</button>' +
     '<span class="spacer"></span>' +
     '<button class="pill dp-pill" id="dp-pill" title="Menu daypart — auto by clock, tap to override">' + esc(dpLabel()) + '</button>' +
@@ -1412,6 +1412,11 @@ async function renderOrder(app, checkId) {
 
   const seatRow = $('#seat-row'), catTabs = $('#cat-tabs'), itemGrid = $('#item-grid'), cartBody = $('#cart-body');
 
+  /* Header guests label: the header is only rebuilt on full renders, so
+     guest_count changes (seat add, typed-seat growth) repaint it in place
+     from the light-refresh paths — otherwise it reads stale until HOLD. */
+  const paintGuests = () => { const el = $('#hdr-guests'); if (el) el.textContent = guests + ' guests'; };
+
   /* Seat strip: chips carry per-seat line counts; "+ Seat" grows the check
      (PATCH guest_count — server-level, no manager PIN) and selects the new
      seat so the next taps land on it; the active chip's ✎ renames that
@@ -1436,6 +1441,7 @@ async function renderOrder(app, checkId) {
       check = v.check; guests = check.guest_count || guests + 1;
     } catch (e) { guests = guests + 1; }
     setSeat(guests);
+    paintGuests();
     drawSeats(); drawCart();
     toast('Seat ' + guests + ' added — tap items to ring for this guest', 'ok');
   }
@@ -1513,12 +1519,15 @@ async function renderOrder(app, checkId) {
      required/min/max, defaults pre-checked, 86'd options disabled, nested
      groups revealed by their parent option; per-modifier notes ("light on
      the cheese"); per-line special request + allergy flag. */
-  function addItemFlow(item, catName) {
+  /* preset (staged-line "More…" restage): prefill qty / modifiers / note /
+     allergy from the staged entry being edited, so the flow reopens the
+     way the line already is instead of making the server rebuild it. */
+  function addItemFlow(item, catName, preset) {
     const groups = Array.isArray(item.modifier_groups) && item.modifier_groups.length
       ? item.modifier_groups : null;
     const flatMods = groups ? [] : itemModifiers(item);
-    if (!groups && !flatMods.length) { stageItem(item, [], 1, {}); return; }
-    let qty = 1;
+    let qty = (preset && preset.qty) || 1;
+    if (!groups && !flatMods.length) { stageItem(item, [], qty, {}); return; }
     const groupHint = (g) => {
       const bits = [];
       if (g.required) bits.push('required');
@@ -1526,34 +1535,49 @@ async function renderOrder(app, checkId) {
       if (g.max_select > 0) bits.push('up to ' + g.max_select);
       return bits.length ? ' <span class="muted small">· ' + bits.join(', ') + '</span>' : '';
     };
-    const modRow = (o, gi, oi) =>
-      '<label class="mod-row' + (o.active === false ? ' mod-86' : '') + '">' +
+    const presetMod = (key) => !preset ? null
+      : (preset.modifiers || []).find((m) => m.name === key) || null;
+    const modRow = (o, gi, oi) => {
+      const pm = preset
+        ? (preset.modifiers || []).find((m) => (o.id != null && m.option_id === o.id) || m.name === o.name) || null
+        : null;
+      const on = preset ? !!pm : (o.is_default && o.active !== false);
+      return '<label class="mod-row' + (o.active === false ? ' mod-86' : '') + '">' +
       '<input type="checkbox" data-g="' + gi + '" data-o="' + oi + '"' +
-      (o.is_default && o.active !== false ? ' checked' : '') +
+      (on && o.active !== false ? ' checked' : '') +
       (o.active === false ? ' disabled' : '') + '>' +
       '<span class="mn">' + esc(o.name) + (o.active === false ? ' <span class="pill held">86</span>' : '') + '</span>' +
       '<span class="mp">' + (o.price_delta_cents ? '+' + fmt(o.price_delta_cents) : 'incl.') + '</span></label>' +
-      '<input class="mod-note-in" data-mn="' + gi + ':' + oi + '" maxlength="60" placeholder="Note for ' + esc(o.name) + ' (optional)" style="display:none">';
+      '<input class="mod-note-in" data-mn="' + gi + ':' + oi + '" maxlength="60" placeholder="Note for ' + esc(o.name) + ' (optional)"' +
+      ' value="' + esc((pm && pm.note) || '') + '"' + (on ? '' : ' style="display:none"') + '>';
+    };
     const groupsHtml = groups ? groups.map((g, gi) =>
       '<div class="mod-group" data-group="' + gi + '" data-parent-opt="' + (g.parent_option_id || '') + '">' +
       '<h4>' + esc(g.name) + groupHint(g) + '</h4>' +
       g.options.map((o, oi) => modRow(o, gi, oi)).join('') + '</div>').join('')
       : '<h3>Modifiers</h3><div id="mod-list">' +
-        flatMods.map((m, i) => '<label class="mod-row"><input type="checkbox" data-mi="' + i + '"><span class="mn">' + esc(m.name) + '</span><span class="mp">+' + fmt(m.price_delta_cents) + '</span></label>' +
-          '<input class="mod-note-in" data-fmn="' + i + '" maxlength="60" placeholder="Note for ' + esc(m.name) + ' (optional)" style="display:none">').join('') + '</div>';
+        flatMods.map((m, i) => {
+          const pm = presetMod(m.name);
+          const on = !!pm;
+          return '<label class="mod-row"><input type="checkbox" data-mi="' + i + '"' + (on ? ' checked' : '') + '><span class="mn">' + esc(m.name) + '</span><span class="mp">+' + fmt(m.price_delta_cents) + '</span></label>' +
+          '<input class="mod-note-in" data-fmn="' + i + '" maxlength="60" placeholder="Note for ' + esc(m.name) + ' (optional)" value="' + esc((pm && pm.note) || '') + '"' + (on ? '' : ' style="display:none"') + '>';
+        }).join('') + '</div>';
     const bd = openModal(
       '<h2>' + esc(item.name) + ' <span class="muted">· ' + fmt(item.price_cents) + '</span></h2>' +
       '<p class="muted small">Seat ' + seat + (isDrink(item, catName) ? ' · <span class="drink-tag">BAR</span> fires to bar on send' : '') + '</p>' +
-      '<div class="field"><label>Quantity</label><div class="stepper"><button data-q="dec">−</button><span class="val" id="m-qty">1</span><button data-q="inc">+</button></div></div>' +
+      '<div class="field"><label>Quantity</label><div class="stepper"><button data-q="dec">−</button><span class="val" id="m-qty">' + qty + '</span><button data-q="inc">+</button></div></div>' +
       groupsHtml +
       '<div class="field"><label for="m-note">Special request <span class="muted small">(optional, prints on the KDS ticket)</span></label>' +
-      '<input type="text" id="m-note" maxlength="140" placeholder="e.g. no onions, dressing on side" autocomplete="off"></div>' +
-      '<div class="field"><label class="check-line"><input type="checkbox" id="m-allergy"> ⚠️ Allergy alert for this item</label>' +
-      '<input type="text" id="m-allergy-detail" maxlength="140" placeholder="Allergy detail (optional)" autocomplete="off" style="display:none;margin-top:6px"></div>' +
+      '<input type="text" id="m-note" maxlength="140" value="' + esc((preset && preset.note) || '') + '" placeholder="e.g. no onions, dressing on side" autocomplete="off"></div>' +
+      '<div class="field"><label class="check-line"><input type="checkbox" id="m-allergy"' + (preset && preset.allergy ? ' checked' : '') + '> ⚠️ Allergy alert for this item</label>' +
+      '<input type="text" id="m-allergy-detail" maxlength="140" value="' + esc((preset && preset.allergy_detail) || '') + '" placeholder="Allergy detail (optional)" autocomplete="off" style="' + (preset && preset.allergy ? '' : 'display:none;') + 'margin-top:6px"></div>' +
       '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
       '<button class="btn btn-primary" data-x="add">Add to order</button></div>');
-    $('[data-q="dec"]', bd).onclick = () => { qty = Math.max(1, qty - 1); $('#m-qty', bd).textContent = qty; };
-    $('[data-q="inc"]', bd).onclick = () => { qty = Math.min(24, qty + 1); $('#m-qty', bd).textContent = qty; };
+    $('[data-q="dec"]', bd).onclick = () => { qty = Math.max(1, qty - 1); delete $('#m-qty', bd).dataset.editing; $('#m-qty', bd).textContent = qty; };
+    $('[data-q="inc"]', bd).onclick = () => { qty = Math.min(24, qty + 1); delete $('#m-qty', bd).dataset.editing; $('#m-qty', bd).textContent = qty; };
+    /* Tap-to-type on the quantity — same local qty the steppers drive. */
+    PO.tappableValue($('#m-qty', bd), { get: () => qty, min: 1, max: 24, label: 'Quantity',
+      onApply: (n) => { qty = n; $('#m-qty', bd).textContent = n; } });
     $('#m-allergy', bd).onchange = (e) => { $('#m-allergy-detail', bd).style.display = e.target.checked ? 'block' : 'none'; };
     $('[data-x="cancel"]', bd).onclick = closeModal;
     // Show the per-modifier note field only while its modifier is checked;
@@ -1637,6 +1661,11 @@ async function renderOrder(app, checkId) {
   }
 
   function drawCart() {
+    /* The seat strip's per-seat counts derive from the same staged + held
+       lines the cart renders — repaint it on EVERY cart mutation (stage,
+       quick-bar change, void, …), not just full renders, or the chips
+       read stale until the next HOLD. */
+    drawSeats();
     const bySeat = {};
     const seatNames = check.seat_names || {};
     staged.forEach((s) => { (bySeat[s.seat] = bySeat[s.seat] || []).push({ kind: 'staged', ref: s }); });
@@ -1743,6 +1772,49 @@ async function renderOrder(app, checkId) {
       const ref = (check.items || []).find((x) => String(x.id) === id);
       return ref ? { kind, ref } : null;
     };
+    /* Staged "More…": a staged line has no server row for the edit modal,
+       so More reopens the guided add-item modifier flow on the same menu
+       item — prefilled with the line's seat, qty, modifiers, note and
+       allergy — and the staged entry is swapped for the flow's result.
+       The modal can close via Cancel, backdrop tap, or Esc; whichever
+       way it closes without staging a replacement, the original entry
+       is restored untouched, so backing out never loses the line. */
+    const restageStagedLine = (sref) => {
+      let foundItem = null, foundCat = '';
+      for (const c of menu) {
+        const mi = (c.items || []).find((x) => String(x.id) === String(sref.menu_item_id));
+        if (mi) { foundItem = mi; foundCat = c.name; break; }
+      }
+      if (!foundItem) { toast('That item is no longer on the menu — void it and re-ring it', 'err'); return; }
+      const backup = sref;
+      staged = staged.filter((s) => s.temp_id !== sref.temp_id);
+      saveStaged(checkId, staged);
+      quickKey = null;
+      setSeat(sref.seat || seat);
+      drawCart();
+      const countAfterRemoval = staged.length;
+      addItemFlow(foundItem, foundCat, {
+        qty: sref.qty || 1,
+        modifiers: sref.modifiers || [],
+        note: sref.note || '',
+        allergy: !!sref.allergy,
+        allergy_detail: sref.allergy_detail || '',
+      });
+      const root = $('#modal-root');
+      const bdNode = root && root.firstChild;
+      if (bdNode) {
+        const obs = new MutationObserver(() => {
+          if (bdNode.isConnected) return;
+          obs.disconnect();
+          if (staged.length === countAfterRemoval && !staged.some((s) => s.temp_id === backup.temp_id)) {
+            staged.push(backup);
+            saveStaged(checkId, staged);
+            drawCart();
+          }
+        });
+        obs.observe(root, { childList: true });
+      }
+    };
     /* Light refresh after a quick action: refetch the check, redraw seats +
        cart, repaint the header Pay total from the mutation response. No
        full route re-render — the tapped line and the selected seat stay
@@ -1752,6 +1824,7 @@ async function renderOrder(app, checkId) {
         const v = await getCheckView(checkId);
         check = v.check; guests = check.guest_count || guests;
       } catch (e) { /* keep the on-screen check; the next render resyncs */ }
+      paintGuests();
       if (totals && totals.total != null) {
         const pl = $('.order-top a.btn-primary');
         if (pl) pl.textContent = 'Pay · ' + fmt(totals.total);
@@ -1767,17 +1840,42 @@ async function renderOrder(app, checkId) {
         const fired = kind !== 'staged' && ref.state !== 'held';
         let busy = false;
         /* Fired lines: the API requires a manager PIN for edits, so qty /
-           seat taps hand off to the full edit modal (the PIN lives there)
-           instead of firing a request that would 403. */
+           seat changes hand off to the full edit modal (the PIN lives
+           there) instead of firing a request that would 403. Steppers,
+           typed values, and the value spans all route through here. */
+        const routeFired = async () => {
+          toast('Fired item — manager approval needed', 'err');
+          const it = (check.items || []).find((x) => String(x.id) === String(ref.id));
+          if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
+        };
         const patchItem = async (patch) => {
-          if (fired) {
-            toast('Fired item — manager approval needed', 'err');
-            const it = (check.items || []).find((x) => String(x.id) === String(ref.id));
-            if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
-            return;
-          }
+          if (fired) { await routeFired(); return; }
           const r = await api('/api/checks/' + realId(checkId) + '/items/' + ref.id, 'PATCH', patch);
           await refreshAfterQuick(r && r.totals);
+        };
+        /* The apply paths shared by the steppers AND tap-to-type, so a
+           typed value lands exactly like a tapped one. */
+        const applyQtyVal = async (nq) => {
+          if (nq === (ref.qty || 1)) return;
+          if (kind === 'staged') { ref.qty = nq; saveStaged(checkId, staged); drawCart(); }
+          else await patchItem({ qty: nq });
+        };
+        const applySeatVal = async (ns) => {
+          if (ns === (ref.seat || 1)) return;
+          if (ns > guests) {
+            /* Typed seat past the current guest_count: grow the check
+               first (the same PATCH the "+ Seat" chip uses), then move
+               the line — refreshAfterQuick / drawSeats repaint guests. */
+            if (isOffline()) { toast('Adding a seat needs a connection — reconnect first', 'err'); return; }
+            await api('/api/checks/' + realId(checkId), 'PATCH', { guest_count: ns });
+            if (kind === 'staged') {
+              ref.seat = ns; saveStaged(checkId, staged);
+              await refreshAfterQuick();
+              return;
+            }
+          }
+          if (kind === 'staged') { ref.seat = ns; saveStaged(checkId, staged); drawCart(); }
+          else await patchItem({ seat: ns });
         };
         $$('[data-qa]', qb).forEach((b) => b.onclick = async () => {
           if (busy) return;
@@ -1787,14 +1885,10 @@ async function renderOrder(app, checkId) {
             const a = b.dataset.qa;
             if (a === 'qty-inc' || a === 'qty-dec') {
               const nq = Math.max(1, Math.min(24, (ref.qty || 1) + (a === 'qty-inc' ? 1 : -1)));
-              if (nq === (ref.qty || 1)) return;
-              if (kind === 'staged') { ref.qty = nq; saveStaged(checkId, staged); drawCart(); }
-              else await patchItem({ qty: nq });
+              await applyQtyVal(nq);
             } else if (a === 'seat-inc' || a === 'seat-dec') {
               const ns = Math.max(1, Math.min(guests, (ref.seat || 1) + (a === 'seat-inc' ? 1 : -1)));
-              if (ns === (ref.seat || 1)) return;
-              if (kind === 'staged') { ref.seat = ns; saveStaged(checkId, staged); drawCart(); }
-              else await patchItem({ seat: ns });
+              await applySeatVal(ns);
             } else if (a === 'repeat') {
               if (kind === 'staged') {
                 staged.push(Object.assign({}, ref, { temp_id: uid('st'),
@@ -1818,8 +1912,12 @@ async function renderOrder(app, checkId) {
                 openVoidApproval(ref.id, ref.name);
               }
             } else if (a === 'more') {
-              const it = (check.items || []).find((x) => String(x.id) === String(ref.id));
-              if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
+              if (kind === 'staged') {
+                restageStagedLine(ref);
+              } else {
+                const it = (check.items || []).find((x) => String(x.id) === String(ref.id));
+                if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
+              }
             }
           } catch (e) { handleApiError(e); }
           finally {
@@ -1830,6 +1928,35 @@ async function renderOrder(app, checkId) {
             if (qb.isConnected) $$('button', qb).forEach((x) => { x.disabled = false; });
           }
         });
+        /* Tap-to-type on the bar's numbers: typing the exact qty / seat
+           beats tapping + twelve times in a rush. Typed values run the
+           same busy guard + apply paths as the steppers; on fired lines
+           the numbers route to the PIN-carrying edit modal instead,
+           exactly like the stepper taps do. */
+        const typedRun = async (fn) => {
+          if (busy) return;
+          busy = true;
+          $$('button', qb).forEach((x) => { x.disabled = true; });
+          try { await fn(); } catch (e) { handleApiError(e); }
+          finally {
+            busy = false;
+            if (qb.isConnected) $$('button', qb).forEach((x) => { x.disabled = false; });
+          }
+        };
+        const qtyValEl = $('[data-qbval="qty"]', qb), seatValEl = $('[data-qbval="seat"]', qb);
+        if (fired) {
+          [qtyValEl, seatValEl].forEach((el) => {
+            if (!el) return;
+            el.classList.add('tappable');
+            el.title = 'Tap to edit — manager approval needed';
+            el.onclick = () => typedRun(routeFired);
+          });
+        } else {
+          if (qtyValEl) PO.tappableValue(qtyValEl, { get: () => ref.qty || 1, min: 1, max: 24, label: 'Quantity',
+            onApply: (n) => typedRun(() => applyQtyVal(n)) });
+          if (seatValEl) PO.tappableValue(seatValEl, { get: () => ref.seat || 1, min: 1, max: 24, label: 'Seat',
+            onApply: (n) => typedRun(() => applySeatVal(n)) });
+        }
       }
     }
     /* Phase 3A (P0-3/NG-C): line selection — selective send + item-first
@@ -1873,14 +2000,20 @@ async function renderOrder(app, checkId) {
           toSeat = guests;
         } catch (e) { handleApiError(e); return; }
       }
-      let moved = 0; const failures = [];
+      let moved = 0, already = 0; const failures = [];
       for (const k of keys) {
         const ix = k.indexOf(':');
         const kind = k.slice(0, ix), id = k.slice(ix + 1);
         if (kind === 'staged') {
           const s = staged.find((x) => String(x.temp_id) === id);
-          if (s) { s.seat = toSeat; moved++; }
+          if (s) {
+            /* Already on the target seat: not a move, not a failure. */
+            if ((s.seat || 1) === toSeat) already++;
+            else { s.seat = toSeat; moved++; }
+          }
         } else {
+          const cur = (check.items || []).find((x) => String(x.id) === id);
+          if (cur && (cur.seat || 1) === toSeat) { already++; continue; }
           try {
             await api('/api/checks/' + realId(checkId) + '/items/' + id, 'PATCH', { seat: toSeat });
             moved++;
@@ -1890,9 +2023,13 @@ async function renderOrder(app, checkId) {
       saveStaged(checkId, staged);
       if (failures.length) {
         const why = (failures[0] && (failures[0].message || failures[0].error)) || 'error';
-        toast('Moved ' + moved + ' of ' + keys.length + ' lines → Seat ' + toSeat + ' — ' + failures.length + ' failed (' + why + ')', 'err');
+        toast('Moved ' + moved + ' of ' + (moved + failures.length) + ' lines → Seat ' + toSeat + ' — ' + failures.length + ' failed (' + why + ')' +
+          (already ? ' · ' + already + ' already on Seat ' + toSeat : ''), 'err');
       } else {
-        toast(keys.length + ' line' + (keys.length === 1 ? '' : 's') + ' → Seat ' + toSeat, 'ok');
+        const parts = [];
+        if (moved) parts.push('Moved ' + moved + ' line' + (moved === 1 ? '' : 's') + ' → Seat ' + toSeat);
+        if (already) parts.push(already + ' already on Seat ' + toSeat);
+        toast(parts.join(' · ') || 'Nothing to move', 'ok');
       }
       renderRoute(true);
     };
