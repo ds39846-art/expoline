@@ -6904,6 +6904,8 @@ app.post('/api/admin/inventory/adjust', managerOnly(), (req, res) => {
   if (!ing || !ing.active) return res.status(400).json({ error: 'Valid active ingredient_id is required' });
   if (typeof b.delta !== 'number' || !isFinite(b.delta) || b.delta === 0)
     return res.status(400).json({ error: 'delta must be a non-zero number' });
+  if (overQtyCap(b.delta))
+    return res.status(400).json({ error: 'delta exceeds the ' + MAX_STOCK_QTY + ' sanity cap' });
   const reason = cleanLabel(b.reason) || 'manual adjustment';
   withTransaction(() => {
     db.prepare('UPDATE ingredients SET on_hand = on_hand + ? WHERE id = ?').run(b.delta, ing.id);
@@ -6938,6 +6940,12 @@ function inventoryTarget(req, res) {
   return ing;
 }
 const isPositiveQty = (v) => typeof v === 'number' && isFinite(v) && v > 0;
+/* Sanity cap on a single stock movement: quantities are real-world amounts
+   (lb / L / ea), so anything past this is a typo or a runaway client and
+   must not zero — or explode — the book. Shared by waste / receive /
+   count / adjust. */
+const MAX_STOCK_QTY = 1000000;
+const overQtyCap = (v) => Math.abs(v) > MAX_STOCK_QTY;
 function writeAdjustment(ingredientId, delta, reason, kind, actor) {
   db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, kind, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(SITE_ID, ingredientId, delta, reason, kind, actor, nowIso());
@@ -6947,6 +6955,7 @@ app.post('/api/admin/inventory/waste', managerOnly(), (req, res) => {
   const ing = inventoryTarget(req, res); if (!ing) return;
   const b = req.body || {};
   if (!isPositiveQty(b.qty)) return res.status(400).json({ error: 'qty must be a positive number' });
+  if (overQtyCap(b.qty)) return res.status(400).json({ error: 'qty exceeds the ' + MAX_STOCK_QTY + ' sanity cap' });
   if (!WASTE_REASON_CODES.includes(b.reason_code))
     return res.status(400).json({ error: 'reason_code must be one of: ' + WASTE_REASON_CODES.join(', ') });
   const note = b.note != null ? cleanLabel(b.note) : null;
@@ -6964,6 +6973,7 @@ app.post('/api/admin/inventory/receive', managerOnly(), (req, res) => {
   const ing = inventoryTarget(req, res); if (!ing) return;
   const b = req.body || {};
   if (!isPositiveQty(b.qty)) return res.status(400).json({ error: 'qty must be a positive number' });
+  if (overQtyCap(b.qty)) return res.status(400).json({ error: 'qty exceeds the ' + MAX_STOCK_QTY + ' sanity cap' });
   if (b.unit_cost_cents != null && (!isInt(b.unit_cost_cents) || b.unit_cost_cents < 0))
     return res.status(400).json({ error: 'unit_cost_cents must be a non-negative integer' });
   const supplier = b.supplier != null ? cleanLabel(b.supplier) : null;
@@ -6988,6 +6998,8 @@ app.post('/api/admin/inventory/count', managerOnly(), (req, res) => {
   const b = req.body || {};
   if (typeof b.counted_qty !== 'number' || !isFinite(b.counted_qty) || b.counted_qty < 0)
     return res.status(400).json({ error: 'counted_qty must be a non-negative number' });
+  if (overQtyCap(b.counted_qty))
+    return res.status(400).json({ error: 'counted_qty exceeds the ' + MAX_STOCK_QTY + ' sanity cap' });
   const expected = ing.on_hand;
   const variance = r4(b.counted_qty - expected);
   /* No separate counts table: when the count disagrees with the book, the
@@ -7015,6 +7027,7 @@ app.get('/api/admin/inventory/variance', managerOnly(), (req, res) => {
   const from = parseWin(req.query.from, new Date(nowMs - 7 * 864e5).toISOString(), false);
   const to = parseWin(req.query.to, new Date(nowMs).toISOString(), true);
   if (!from || !to) return res.status(400).json({ error: 'from/to must be ISO dates' });
+  if (from > to) return res.status(400).json({ error: 'from must not be after to' });
   /* Inclusion rule: an ingredient appears iff it has at least one ledger row
      inside the window (any kind). Buckets key on the structured kind ONLY —
      reason text is never consulted, so a manual adjustment whose free-text

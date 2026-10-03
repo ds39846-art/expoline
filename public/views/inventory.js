@@ -167,7 +167,11 @@ async function renderInventory(container, api) {
         const q = (id) => document.querySelector('#' + id).value;
         const qty = Number(q('ir-qty'));
         if (!isFinite(qty) || qty <= 0) { toast('Enter how much arrived', 'err'); return; }
-        const costDollars = Number(q('ir-cost'));
+        /* A cleared cost field means "keep the stored cost": Number('') is
+           0, which would silently zero it — leave the field out instead
+           (undefined is dropped from the JSON body, like supplier below). */
+        const costRaw = q('ir-cost').trim();
+        const costDollars = costRaw === '' ? NaN : Number(costRaw);
         try {
           await api('/api/admin/inventory/receive', 'POST', {
             ingredient_id: g.id, qty: qty,
@@ -186,7 +190,11 @@ async function renderInventory(container, api) {
       '<p class="muted small">The book says <b>' + num(g.on_hand) + ' ' + esc(g.unit) + '</b>. Count the shelf and enter what is really there — the book is corrected to match.</p>' +
       '<label class="muted small">Counted quantity</label><input id="ic-counted" class="input" inputmode="decimal" style="width:100%" value="' + num(g.on_hand) + '">',
       'Save count', async () => {
-        const counted = Number(document.querySelector('#ic-counted').value);
+        /* A cleared field must not submit: Number('') is 0, which would
+           "correct" the book to zero. Blank is invalid, same feedback as
+           a bad number. */
+        const countedRaw = document.querySelector('#ic-counted').value.trim();
+        const counted = countedRaw === '' ? NaN : Number(countedRaw);
         if (!isFinite(counted) || counted < 0) { toast('Enter the counted quantity', 'err'); return; }
         try {
           const r = await api('/api/admin/inventory/count', 'POST', { ingredient_id: g.id, counted_qty: counted });
