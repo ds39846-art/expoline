@@ -6883,6 +6883,137 @@ app.post('/api/admin/inventory/adjust', managerOnly(), (req, res) => {
   auditApproval(req, 'inventory_adjust', {}, { ingredient_id: ing.id, delta: b.delta, reason });
   res.json(ingredientById(ing.id));
 });
+/* ------------------------- inventory phase 2 ------------------------------
+   Waste, receiving (deliberately PO-less — no purchase-order documents),
+   physical counts, and the theoretical-vs-actual variance report. Every
+   movement writes an inventory_adjustments row; the reason string is the
+   report key, in one consistent format:
+     'sale depletion'              (written by depleteInventoryForItems)
+     'waste: <code>' [+ ' — <note>']
+     'receiving'       [+ ' — <supplier>' [+ ' · inv <invoice_ref>']]
+     'count correction'
+   Waste cost uses the ingredient's stored unit cost (cost_per_unit_cents)
+   at the moment of the movement; an unset cost is 0, so waste cost is 0. */
+const WASTE_REASON_CODES = ['spoilage', 'expired', 'dropped', 'over_portioned', 'quality', 'other'];
+const r4 = (n) => Math.round((Number(n) || 0) * 10000) / 10000; // quantities are REAL; trim float dust
+function inventoryTarget(req, res) {
+  const b = req.body || {};
+  const ing = b.ingredient_id != null ? ingredientById(b.ingredient_id) : null;
+  if (!ing || !ing.active) { res.status(400).json({ error: 'Valid active ingredient_id is required' }); return null; }
+  return ing;
+}
+const isPositiveQty = (v) => typeof v === 'number' && isFinite(v) && v > 0;
+function writeAdjustment(ingredientId, delta, reason, actor) {
+  db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(SITE_ID, ingredientId, delta, reason, actor, nowIso());
+}
+
+app.post('/api/admin/inventory/waste', managerOnly(), (req, res) => {
+  const ing = inventoryTarget(req, res); if (!ing) return;
+  const b = req.body || {};
+  if (!isPositiveQty(b.qty)) return res.status(400).json({ error: 'qty must be a positive number' });
+  if (!WASTE_REASON_CODES.includes(b.reason_code))
+    return res.status(400).json({ error: 'reason_code must be one of: ' + WASTE_REASON_CODES.join(', ') });
+  const note = b.note != null ? cleanLabel(b.note) : null;
+  const reason = 'waste: ' + b.reason_code + (note ? ' — ' + note : '');
+  const wasteCost = Math.round(b.qty * (ing.cost_per_unit_cents || 0));
+  withTransaction(() => {
+    db.prepare('UPDATE ingredients SET on_hand = on_hand - ? WHERE id = ?').run(b.qty, ing.id);
+    writeAdjustment(ing.id, -b.qty, reason, req.user.name);
+  });
+  auditApproval(req, 'inventory_waste', {}, { ingredient_id: ing.id, qty: b.qty, reason_code: b.reason_code, waste_cost_cents: wasteCost });
+  res.json({ ingredient: ingredientById(ing.id), wasted_qty: b.qty, waste_cost_cents: wasteCost });
+});
+
+app.post('/api/admin/inventory/receive', managerOnly(), (req, res) => {
+  const ing = inventoryTarget(req, res); if (!ing) return;
+  const b = req.body || {};
+  if (!isPositiveQty(b.qty)) return res.status(400).json({ error: 'qty must be a positive number' });
+  if (b.unit_cost_cents != null && (!isInt(b.unit_cost_cents) || b.unit_cost_cents < 0))
+    return res.status(400).json({ error: 'unit_cost_cents must be a non-negative integer' });
+  const supplier = b.supplier != null ? cleanLabel(b.supplier) : null;
+  const invoiceRef = b.invoice_ref != null ? cleanLabel(b.invoice_ref) : null;
+  const detail = [supplier, invoiceRef ? 'inv ' + invoiceRef : null].filter(Boolean).join(' · ');
+  const reason = 'receiving' + (detail ? ' — ' + detail : '');
+  withTransaction(() => {
+    db.prepare('UPDATE ingredients SET on_hand = on_hand + ? WHERE id = ?').run(b.qty, ing.id);
+    /* Latest-cost semantics: a delivery cost stated on receiving replaces
+       the stored unit cost, so stock value and waste cost track the newest
+       invoice price. Omit unit_cost_cents to keep the stored cost. */
+    if (b.unit_cost_cents != null)
+      db.prepare('UPDATE ingredients SET cost_per_unit_cents = ? WHERE id = ?').run(b.unit_cost_cents, ing.id);
+    writeAdjustment(ing.id, b.qty, reason, req.user.name);
+  });
+  auditApproval(req, 'inventory_receive', {}, { ingredient_id: ing.id, qty: b.qty, unit_cost_cents: b.unit_cost_cents ?? null, supplier, invoice_ref: invoiceRef });
+  res.json({ ingredient: ingredientById(ing.id), received_qty: b.qty });
+});
+
+app.post('/api/admin/inventory/count', managerOnly(), (req, res) => {
+  const ing = inventoryTarget(req, res); if (!ing) return;
+  const b = req.body || {};
+  if (typeof b.counted_qty !== 'number' || !isFinite(b.counted_qty) || b.counted_qty < 0)
+    return res.status(400).json({ error: 'counted_qty must be a non-negative number' });
+  const expected = ing.on_hand;
+  const variance = r4(b.counted_qty - expected);
+  /* No separate counts table: when the count disagrees with the book, the
+     'count correction' adjustment row IS the record of the count. A count
+     that matches writes no row (but is still audit-logged below). */
+  if (variance !== 0) {
+    withTransaction(() => {
+      db.prepare('UPDATE ingredients SET on_hand = ? WHERE id = ?').run(b.counted_qty, ing.id);
+      writeAdjustment(ing.id, variance, 'count correction', req.user.name);
+    });
+  }
+  auditApproval(req, 'inventory_count', {}, { ingredient_id: ing.id, expected, counted: b.counted_qty, variance });
+  res.json({ ingredient: ingredientById(ing.id), expected, counted: b.counted_qty, variance });
+});
+
+app.get('/api/admin/inventory/variance', managerOnly(), (req, res) => {
+  const nowMs = Date.now();
+  const parseWin = (v, fallback, endOfDay) => {
+    if (v == null || v === '') return fallback;
+    let s = String(v);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) s += endOfDay ? 'T23:59:59.999Z' : 'T00:00:00.000Z';
+    const t = Date.parse(s);
+    return isNaN(t) ? null : new Date(t).toISOString();
+  };
+  const from = parseWin(req.query.from, new Date(nowMs - 7 * 864e5).toISOString(), false);
+  const to = parseWin(req.query.to, new Date(nowMs).toISOString(), true);
+  if (!from || !to) return res.status(400).json({ error: 'from/to must be ISO dates' });
+  /* Inclusion rule: an ingredient appears iff it has at least one ledger row
+     inside the window (any reason). Waste cost is valued at each
+     ingredient's CURRENT stored unit cost. */
+  const rows = db.prepare(`
+    SELECT i.id AS ingredient_id, i.name AS name, i.unit AS unit, i.cost_per_unit_cents AS cost_per_unit_cents,
+      SUM(CASE WHEN a.reason = 'sale depletion' THEN -a.delta ELSE 0 END) AS theoretical_usage,
+      SUM(CASE WHEN a.reason LIKE 'waste:%' THEN -a.delta ELSE 0 END) AS waste_qty,
+      SUM(CASE WHEN a.reason LIKE 'receiving%' THEN a.delta ELSE 0 END) AS received_qty,
+      SUM(CASE WHEN a.reason = 'count correction' THEN a.delta ELSE 0 END) AS count_correction_qty,
+      SUM(a.delta) AS net_change
+    FROM inventory_adjustments a JOIN ingredients i ON i.id = a.ingredient_id
+    WHERE a.site_id = ? AND a.created_at >= ? AND a.created_at <= ?
+    GROUP BY a.ingredient_id ORDER BY i.name`).all(SITE_ID, from, to);
+  const ingredients = rows.map((r) => ({
+    ingredient_id: r.ingredient_id, name: r.name, unit: r.unit,
+    theoretical_usage: r4(r.theoretical_usage),
+    waste_qty: r4(r.waste_qty),
+    waste_cost_cents: Math.round((r.waste_qty || 0) * (r.cost_per_unit_cents || 0)),
+    received_qty: r4(r.received_qty),
+    count_correction_qty: r4(r.count_correction_qty),
+    net_change: r4(r.net_change),
+  }));
+  const totals = { theoretical_usage: 0, waste_qty: 0, waste_cost_cents: 0, received_qty: 0, count_correction_qty: 0, net_change: 0 };
+  for (const r of ingredients) {
+    totals.theoretical_usage = r4(totals.theoretical_usage + r.theoretical_usage);
+    totals.waste_qty = r4(totals.waste_qty + r.waste_qty);
+    totals.waste_cost_cents += r.waste_cost_cents;
+    totals.received_qty = r4(totals.received_qty + r.received_qty);
+    totals.count_correction_qty = r4(totals.count_correction_qty + r.count_correction_qty);
+    totals.net_change = r4(totals.net_change + r.net_change);
+  }
+  res.json({ from, to, ingredients, totals });
+});
+
 app.get('/api/inventory/status', managerOnly(), (req, res) => {
   const ings = db.prepare('SELECT * FROM ingredients WHERE site_id = ? AND active = 1 ORDER BY name').all(SITE_ID);
   const recent = db.prepare(
@@ -7004,6 +7135,10 @@ const API_DOCS = [
   { method: 'GET', path: '/api/admin/inventory/recipes', auth: 'manager', summary: 'Recipe lines (NEW 3C)', params: 'menu_item_id?' },
   { method: 'POST', path: '/api/admin/inventory/recipes', auth: 'manager', summary: 'Replace recipe lines for a menu item (NEW 3C)', params: 'menu_item_id, lines[]' },
   { method: 'POST', path: '/api/admin/inventory/adjust', auth: 'manager', summary: 'Manual stock adjustment, audited (NEW 3C)', params: 'ingredient_id, delta, reason?' },
+  { method: 'POST', path: '/api/admin/inventory/waste', auth: 'manager', summary: 'Log waste with a reason code; returns waste cost (Phase 2)', params: 'ingredient_id, qty, reason_code, note?' },
+  { method: 'POST', path: '/api/admin/inventory/receive', auth: 'manager', summary: 'Receive a delivery (PO-less); stated cost replaces stored cost (Phase 2)', params: 'ingredient_id, qty, unit_cost_cents?, supplier?, invoice_ref?' },
+  { method: 'POST', path: '/api/admin/inventory/count', auth: 'manager', summary: 'Physical stock count; writes a count-correction row on variance (Phase 2)', params: 'ingredient_id, counted_qty' },
+  { method: 'GET', path: '/api/admin/inventory/variance', auth: 'manager', summary: 'Theoretical vs actual: usage, waste, receiving, count corrections per ingredient (Phase 2)', params: 'from?, to?' },
   { method: 'GET', path: '/api/inventory/status', auth: 'manager', summary: 'Low-stock list + recent adjustments (NEW 3C)', params: '—' },
   { method: 'GET', path: '/api/openapi.json', auth: 'manager', summary: 'Machine-readable endpoint registry (NEW 3C)', params: '—' },
   { method: 'GET', path: '/api/docs', auth: 'manager', summary: 'Human-readable API documentation (NEW 3C)', params: '—' },
