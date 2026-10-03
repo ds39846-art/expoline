@@ -6676,7 +6676,7 @@ app.get('/api/reviews', managerOnly(), (req, res) => {
 });
 
 /** Manager settings (whitelisted keys only). */
-const ADMIN_SETTINGS = new Set(['review_prompt']);
+const ADMIN_SETTINGS = new Set(['review_prompt', 'kds_archive_retention_days']);
 app.put('/api/admin/settings', managerOnly(), (req, res) => {
   const b = req.body || {};
   if (!ADMIN_SETTINGS.has(b.key)) return res.status(400).json({ error: 'key must be one of: ' + [...ADMIN_SETTINGS].join(', ') });
@@ -6688,6 +6688,10 @@ app.put('/api/admin/settings', managerOnly(), (req, res) => {
     const off = v === false || v === 0 ||
       (typeof v === 'string' && ['0', 'false', 'off', 'no', ''].includes(v.trim().toLowerCase()));
     value = off ? '0' : '1';
+  } else if (b.key === 'kds_archive_retention_days') {
+    const n = parseInt(b.value, 10);
+    if (!Number.isFinite(n) || n < 1 || n > 3650) return res.status(400).json({ error: 'kds_archive_retention_days must be an integer 1..3650' });
+    value = String(n);
   } else {
     value = String(b.value ?? '');
   }
@@ -6963,7 +6967,7 @@ const API_DOCS = [
   { method: 'GET', path: '/api/login-summary', auth: 'any staff', summary: 'Notes + 86s + today reservations + waitlist depth at login (NEW 3C)', params: '—' },
   { method: 'POST', path: '/api/reviews', auth: 'server+', summary: 'Post-payment 1–5★ review, once per check (NEW 3C)', params: 'check_id, rating, comment?, marketing_opt_in?' },
   { method: 'GET', path: '/api/reviews', auth: 'manager', summary: 'Review summary + list (NEW 3C)', params: '—' },
-  { method: 'PUT', path: '/api/admin/settings', auth: 'manager', summary: 'Whitelisted site settings (review_prompt) (NEW 3C)', params: 'key, value' },
+  { method: 'PUT', path: '/api/admin/settings', auth: 'manager', summary: 'Whitelisted site settings (review_prompt, kds_archive_retention_days)', params: 'key, value' },
   { method: 'GET', path: '/api/admin/multisite/overview', auth: 'manager', summary: 'Cross-site dashboard; one site failure never touches another (NEW 3C)', params: '—' },
   { method: 'GET', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Ingredient records with low-stock flags (NEW 3C)', params: '—' },
   { method: 'POST', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Create ingredient (NEW 3C)', params: 'name, unit?, on_hand?, par?, cost_per_unit_cents?' },
@@ -7172,6 +7176,89 @@ function broadcastMenuUpdated() {
     }
   }
 }
+
+/* ------------------------------ maintenance ------------------------------
+   Periodic housekeeping. Fulfilled KDS tickets used to accumulate
+   forever (504,836 rows in the 7-day soak DB) because nothing ever
+   retired them; the pass below archives them on a retention window. */
+
+/** Integer site_config value with a sane fallback (the keys are
+    manager-editable via the whitelisted PUT /api/admin/settings). */
+function siteConfigInt(key, fallback) {
+  const r = db.prepare('SELECT value FROM site_config WHERE site_id = ? AND key = ?').get(SITE_ID, key);
+  const n = parseInt(r && r.value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/* Archive table: mirrors kds_tickets column-for-column so rows move
+   across intact on ANY database vintage (boot migrations have appended
+   columns over time — refire, online_order_id, deltas_json — and a
+   static column list would silently drop the newer ones). The mirror
+   is reconciled before every pass, following the codebase's
+   PRAGMA-guard migration pattern; only the indexes an archive needs
+   are added (PK + created_at). */
+function ensureKdsArchiveTable() {
+  const cols = db.prepare('PRAGMA table_info(kds_tickets)').all();
+  if (!cols.length) return [];
+  const exists = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'kds_tickets_archive'").get();
+  if (!exists) {
+    const defs = cols.map((c) => `${c.name} ${c.type || 'TEXT'}${c.pk ? ' PRIMARY KEY' : ''}`).join(', ');
+    db.exec(`CREATE TABLE kds_tickets_archive (${defs})`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_kds_tickets_archive_created ON kds_tickets_archive(created_at)');
+  } else {
+    const have = new Set(db.prepare('PRAGMA table_info(kds_tickets_archive)').all().map((c) => c.name));
+    for (const c of cols) {
+      if (!have.has(c.name)) db.exec(`ALTER TABLE kds_tickets_archive ADD COLUMN ${c.name} ${c.type || 'TEXT'}`);
+    }
+  }
+  return cols.map((c) => c.name);
+}
+
+/* Move FULFILLED tickets older than the retention window (site_config
+   kds_archive_retention_days, default 30) into kds_tickets_archive, in
+   bounded batches, one transaction per pass. "Older" is judged by the
+   fulfill time (bumped_at), falling back to created_at for rows that
+   never got a bump stamp. Non-fulfilled tickets are never touched.
+   Timestamps are UTC ISO (a few legacy rows are naive SQLite UTC —
+   the separator difference is sub-second at this granularity). */
+const KDS_ARCHIVE_BATCH = 5000;
+function archiveFulfilledKdsTickets() {
+  const colNames = ensureKdsArchiveTable();
+  if (!colNames.length) return 0;
+  const colList = colNames.join(', ');
+  const days = siteConfigInt('kds_archive_retention_days', 30);
+  const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
+  const rows = db.prepare(
+    `SELECT id FROM kds_tickets
+     WHERE site_id = ? AND status = 'fulfilled' AND COALESCE(bumped_at, created_at) < ?
+     ORDER BY id LIMIT ?`
+  ).all(SITE_ID, cutoff, KDS_ARCHIVE_BATCH);
+  if (!rows.length) return 0;
+  const ids = rows.map((r) => r.id);
+  const ph = ids.map(() => '?').join(',');
+  withTransaction(() => {
+    db.prepare(`INSERT INTO kds_tickets_archive (${colList}) SELECT ${colList} FROM kds_tickets WHERE id IN (${ph})`).run(...ids);
+    db.prepare(`DELETE FROM kds_tickets WHERE id IN (${ph}) AND status = 'fulfilled'`).run(...ids);
+  });
+  return ids.length;
+}
+
+(() => {
+  db.prepare("INSERT OR IGNORE INTO site_config (site_id, key, value) VALUES (?, 'kds_archive_retention_days', '30')").run(SITE_ID);
+  try {
+    const days = siteConfigInt('kds_archive_retention_days', 30);
+    const n = archiveFulfilledKdsTickets();
+    console.log(`[expoline] kds-archive: moved ${n} fulfilled ticket(s) past the ${days}d retention window to kds_tickets_archive`);
+  } catch (e) { console.error('[expoline] kds-archive boot pass failed:', e.message); }
+})();
+
+/* Interval passes stay quiet unless something actually moved. */
+setInterval(() => {
+  try {
+    const n = archiveFulfilledKdsTickets();
+    if (n) console.log(`[expoline] kds-archive: moved ${n} fulfilled ticket(s) past the retention window to kds_tickets_archive`);
+  } catch (e) { console.error('[expoline] kds-archive pass failed:', e.message); }
+}, 6 * 3600_000).unref();
 
 /* ------------------------------- graceful stop ------------------------------ */
 function shutdown(signal) {
