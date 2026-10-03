@@ -292,6 +292,16 @@ addModGroup('14oz Ribeye',
     { name: 'Well Done' },
   ]);
 
+// Edamame flavor — required single pick, all $0.
+addModGroup('Edamame',
+  { name: 'Flavor', required: true, min_select: 1, max_select: 1 },
+  [
+    { name: 'Sea Salt', is_default: true },
+    { name: 'Garlic' },
+    { name: 'Spicy Chili Garlic' },
+    { name: 'Sweet Chili' },
+  ]);
+
 // ---------------- demo closed checks (yesterday) ----------------
 const money = (subtotal, guests) => {
   const sc = guests >= 8 ? Math.round(subtotal * 0.18) : 0;
