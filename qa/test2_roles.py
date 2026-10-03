@@ -24,9 +24,25 @@ def want(got, want_code, name):
         print(f"  ✗ {name}: want {want_code}, got {got[0]}")
     else: print(f"  ✓ {name} -> {got[0]}")
 
-# need a ticket id for bump tests
-kids = api("GET","/api/kds/tickets",KT)[1]
-tid = kids[0]["id"] if kids else 999999
+# need a ticket id for bump tests. Build our OWN open ticket through the real
+# order flow instead of reading whatever earlier suites left on the board:
+# a fresh seed contains only FULFILLED tickets and GET /api/kds/tickets
+# defaults to open-only, so the old ambient pickup fell back to id 999999 and
+# the (correct) bump 404 read as a failure. The product behavior is right —
+# the board shows open tickets and unknown ids 404; the fixture was missing.
+tid = 999999
+zones = api("GET", "/api/zones", ST)[1]
+zone_list = zones if isinstance(zones, list) else zones.get("zones", [])
+free_tables = [t["id"] for z in zone_list for t in z.get("tables", [])
+               if not t.get("open_check_id") and t["id"] != 5]  # table 5 is used by the manager section below
+if free_tables:
+    fx = api("POST", "/api/checks", ST, {"table_id": free_tables[0], "guest_count": 1})[1]
+    if fx.get("id"):
+        api("POST", f"/api/checks/{fx['id']}/items", ST,
+            {"menu_item_id": 90, "seat": 1, "qty": 1, "modifiers": []})
+        sent = api("POST", f"/api/checks/{fx['id']}/send", ST)[1]
+        if sent.get("tickets"):
+            tid = sent["tickets"][0]["id"]
 # need a payment id for refund tests: get from payouts
 pays = api("GET",f"/api/finance/payouts?date={TODAY}",MT)[1]
 pid = pays["card_payments"][0]["id"] if pays["card_payments"] else 999999
