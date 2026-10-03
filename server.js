@@ -2095,7 +2095,7 @@ app.post('/api/checks/:id/fire-course', serverPlus(), (req, res) => {
       /* The actual fire — held items of this course go to KDS now via the shared
          fire path (same tickets, inventory, totals as /send). When nothing is
          held the fire is still recorded (and audited) for timing. */
-      const core = fireHeldItemsToKdsCore(check, heldNow);
+      const core = fireHeldItemsToKdsCore(check, heldNow, actor);
       persistTotals(check.id);
       /* Dedicated audit entry so every course fire is traceable. */
       db.prepare(`INSERT INTO approval_audit (site_id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at)
@@ -2841,7 +2841,7 @@ app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
    DB-ONLY: runs inside the caller's transaction (no broadcasts here) so the
    item/inventory/ticket writes commit or roll back as one unit. Returns
    {sent, tickets} with full ticket views; the caller broadcasts after commit. */
-function fireHeldItemsToKdsCore(check, held) {
+function fireHeldItemsToKdsCore(check, held, actor) {
   const sentAt = nowIso();
   const table = check.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(check.table_id) : null;
   const serverUser = check.server_id ? db.prepare('SELECT name FROM users WHERE id = ?').get(check.server_id) : null;
@@ -2867,7 +2867,9 @@ function fireHeldItemsToKdsCore(check, held) {
       allergy_detail: it.allergy_detail || null,
     });
   }
-  depleteInventoryForItems(held); // phase 3C: ingredient-level depletion from real sales
+  /* Ledger actor: the sending user when the route threaded one through,
+     else the check's server, else 'system'. */
+  depleteInventoryForItems(held, actor || (serverUser ? serverUser.name : null)); // phase 3C: ingredient-level depletion from real sales
 
   /* Tickets are created in the SAME transaction as the item/inventory writes:
      a crash mid-fire can never leave items marked sent with no KDS ticket. */
@@ -2895,8 +2897,8 @@ function fireHeldItemsToKdsCore(check, held) {
   return { sent: held.length, tickets };
 }
 
-function fireHeldItemsToKds(check, held) {
-  const result = withTransaction(() => fireHeldItemsToKdsCore(check, held));
+function fireHeldItemsToKds(check, held, actor) {
+  const result = withTransaction(() => fireHeldItemsToKdsCore(check, held, actor));
   for (const ticket of result.tickets) broadcastTicket(ticket); // push {type:'ticket'} to that station's subscribers
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
@@ -2942,7 +2944,7 @@ app.post('/api/checks/:id/send', serverPlus(), (req, res) => {
   }
 
   /* Fire via the shared KDS path so /send and /fire-course behave identically. */
-  return res.json(fireHeldItemsToKds(check, held));
+  return res.json(fireHeldItemsToKds(check, held, req.user && req.user.name));
 });
 
 /* Phase 3A (P0 send-now): one-tap add+fire — items go on the check and straight to KDS. */
@@ -6767,9 +6769,11 @@ app.get('/api/admin/multisite/overview', managerOnly(), (req, res) => {
 
 /* ------------------------------ inventory (1) -----------------------------
    Phase 1: ingredient records, per-menu-item recipes, depletion on fire
-   (/send), manual adjustments with audit, low-stock status. Honest scope —
-   vendor receiving/POs, waste tracking, and theoretical-vs-actual food cost
-   are NOT in phase 1 (see REMAINING note in the final report). */
+   (/send), manual adjustments with audit, low-stock status.
+   Phase 2 (below, after /adjust): depletion is ledgered ('sale depletion'),
+   waste logging, PO-less receiving, physical counts with correction rows,
+   and a theoretical-vs-actual variance report. Purchase orders as documents
+   are deliberately still out of scope. */
 function ingredientById(id) {
   return db.prepare('SELECT * FROM ingredients WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
@@ -6892,13 +6896,27 @@ app.get('/api/inventory/status', managerOnly(), (req, res) => {
     recent_adjustments: recent,
   });
 });
-/** Deplete inventory for fired items. Called inside the /send transaction. */
-function depleteInventoryForItems(heldItems) {
+/** Deplete inventory for fired items. Called inside the /send transaction.
+ * Phase 2: every depletion is also written to the inventory_adjustments
+ * ledger — one row per ingredient per fire, aggregated across all fired
+ * lines (reason 'sale depletion') — so theoretical usage is auditable
+ * against waste/counts. The on_hand math is unchanged from phase 1. */
+function depleteInventoryForItems(heldItems, actor) {
   const lineStmt = db.prepare('SELECT ingredient_id, qty FROM recipes WHERE site_id = ? AND menu_item_id = ?');
   const decStmt = db.prepare('UPDATE ingredients SET on_hand = on_hand - ? WHERE id = ? AND site_id = ?');
+  const ledStmt = db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+  const used = new Map(); // ingredient_id -> total qty consumed by this fire
   for (const it of heldItems) {
     for (const ln of lineStmt.all(SITE_ID, it.menu_item_id)) {
-      decStmt.run(ln.qty * (it.qty || 1), ln.ingredient_id, SITE_ID);
+      const qty = ln.qty * (it.qty || 1);
+      decStmt.run(qty, ln.ingredient_id, SITE_ID);
+      used.set(ln.ingredient_id, (used.get(ln.ingredient_id) || 0) + qty);
+    }
+  }
+  if (used.size) {
+    const ts = nowIso();
+    for (const [ingredientId, qty] of used) {
+      ledStmt.run(SITE_ID, ingredientId, -qty, 'sale depletion', actor || 'system', ts);
     }
   }
 }
