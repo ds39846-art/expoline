@@ -1527,7 +1527,13 @@ async function renderOrder(app, checkId) {
       ? item.modifier_groups : null;
     const flatMods = groups ? [] : itemModifiers(item);
     let qty = (preset && preset.qty) || 1;
-    if (!groups && !flatMods.length) { stageItem(item, [], qty, {}); return; }
+    /* Fast path for FRESH adds only: nothing to configure, so stage in
+       one tap. In edit mode (preset from a staged line's "More…") the
+       modal must ALWAYS open — even when the item has no modifiers —
+       so qty, the special-request note and the allergy flag stay
+       editable; the shortcut would otherwise re-stage instantly and
+       silently drop the preset's note/allergy. */
+    if (!preset && !groups && !flatMods.length) { stageItem(item, [], qty, {}); return; }
     const groupHint = (g) => {
       const bits = [];
       if (g.required) bits.push('required');
@@ -1555,13 +1561,13 @@ async function renderOrder(app, checkId) {
       '<div class="mod-group" data-group="' + gi + '" data-parent-opt="' + (g.parent_option_id || '') + '">' +
       '<h4>' + esc(g.name) + groupHint(g) + '</h4>' +
       g.options.map((o, oi) => modRow(o, gi, oi)).join('') + '</div>').join('')
-      : '<h3>Modifiers</h3><div id="mod-list">' +
+      : (flatMods.length ? '<h3>Modifiers</h3><div id="mod-list">' +
         flatMods.map((m, i) => {
           const pm = presetMod(m.name);
           const on = !!pm;
           return '<label class="mod-row"><input type="checkbox" data-mi="' + i + '"' + (on ? ' checked' : '') + '><span class="mn">' + esc(m.name) + '</span><span class="mp">+' + fmt(m.price_delta_cents) + '</span></label>' +
           '<input class="mod-note-in" data-fmn="' + i + '" maxlength="60" placeholder="Note for ' + esc(m.name) + ' (optional)" value="' + esc((pm && pm.note) || '') + '"' + (on ? '' : ' style="display:none"') + '>';
-        }).join('') + '</div>';
+        }).join('') + '</div>' : '');
     const bd = openModal(
       '<h2>' + esc(item.name) + ' <span class="muted">· ' + fmt(item.price_cents) + '</span></h2>' +
       '<p class="muted small">Seat ' + seat + (isDrink(item, catName) ? ' · <span class="drink-tag">BAR</span> fires to bar on send' : '') + '</p>' +
