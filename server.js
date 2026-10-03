@@ -7205,22 +7205,52 @@ function siteConfigInt(key, fallback) {
    columns over time — refire, online_order_id, deltas_json — and a
    static column list would silently drop the newer ones). The mirror
    is reconciled before every pass, following the codebase's
-   PRAGMA-guard migration pattern; only the indexes an archive needs
-   are added (PK + created_at). */
+   PRAGMA-guard migration pattern.
+   DELIBERATELY NO PRIMARY KEY in the mirror: kds_tickets.id is a plain
+   rowid (no AUTOINCREMENT), so once a ticket is archived and deleted,
+   SQLite can hand its id to a NEW ticket. If the archive treated id
+   as unique, archiving that recycled id later would violate the
+   constraint, roll the whole batch back, and wedge every subsequent
+   pass on the same first batch forever. Archive rows are cold
+   records — the archive's implicit rowid is its own identity, and two
+   archive rows may legitimately carry the same original ticket id
+   from different eras. Only non-unique indexes (id, created_at) are
+   added. */
 function ensureKdsArchiveTable() {
   const cols = db.prepare('PRAGMA table_info(kds_tickets)').all();
   if (!cols.length) return [];
   const exists = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'kds_tickets_archive'").get();
   if (!exists) {
-    const defs = cols.map((c) => `${c.name} ${c.type || 'TEXT'}${c.pk ? ' PRIMARY KEY' : ''}`).join(', ');
+    const defs = cols.map((c) => `${c.name} ${c.type || 'TEXT'}`).join(', ');
     db.exec(`CREATE TABLE kds_tickets_archive (${defs})`);
-    db.exec('CREATE INDEX IF NOT EXISTS idx_kds_tickets_archive_created ON kds_tickets_archive(created_at)');
   } else {
-    const have = new Set(db.prepare('PRAGMA table_info(kds_tickets_archive)').all().map((c) => c.name));
+    let info = db.prepare('PRAGMA table_info(kds_tickets_archive)').all();
+    const idCol = info.find((c) => c.name === 'id');
+    if (idCol && idCol.pk) {
+      /* Legacy shape (pre-fix builds): id was mirrored as PRIMARY KEY.
+         Rebuild the table once without it, preserving every row — it
+         carries the same wedging hazard as the fresh-create case. */
+      const oldNames = new Set(info.map((c) => c.name));
+      const copyCols = cols.map((c) => c.name).filter((n) => oldNames.has(n));
+      const defs = cols.map((c) => `${c.name} ${c.type || 'TEXT'}`).join(', ');
+      withTransaction(() => {
+        db.exec(`CREATE TABLE kds_tickets_archive_rebuilt (${defs})`);
+        if (copyCols.length) {
+          db.exec(`INSERT INTO kds_tickets_archive_rebuilt (${copyCols.join(', ')}) SELECT ${copyCols.join(', ')} FROM kds_tickets_archive`);
+        }
+        db.exec('DROP TABLE kds_tickets_archive');
+        db.exec('ALTER TABLE kds_tickets_archive_rebuilt RENAME TO kds_tickets_archive');
+      });
+      console.log('[expoline] kds-archive: rebuilt kds_tickets_archive without PRIMARY KEY on id (source ticket ids recycle after archival)');
+      info = db.prepare('PRAGMA table_info(kds_tickets_archive)').all();
+    }
+    const have = new Set(info.map((c) => c.name));
     for (const c of cols) {
       if (!have.has(c.name)) db.exec(`ALTER TABLE kds_tickets_archive ADD COLUMN ${c.name} ${c.type || 'TEXT'}`);
     }
   }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_kds_tickets_archive_id ON kds_tickets_archive(id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_kds_tickets_archive_created ON kds_tickets_archive(created_at)');
   return cols.map((c) => c.name);
 }
 
