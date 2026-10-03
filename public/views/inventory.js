@@ -1,7 +1,8 @@
 /* ============================================================================
- * Expoline inventory view (manager) — phase 1: ingredient records,
- * per-item recipes, manual adjustments, low-stock alerts. Depletion happens
- * automatically when items fire (/send).
+ * Expoline inventory view (manager) — ingredients, per-item recipes,
+ * manual adjustments, low-stock alerts, plus phase 2: waste logging,
+ * delivery receiving, stock counts, and the variance report. Depletion
+ * happens automatically when items fire (/send).
  * Usage: renderInventory(container, api). Exposed via window (IIFE).
  * ========================================================================== */
 (function () {
@@ -24,7 +25,7 @@ async function renderInventory(container, api) {
     '<div class="view-head"><h1>Inventory</h1><span class="spacer"></span>' +
     '<button id="iv-add" class="btn btn-primary">+ Ingredient</button></div>' +
     ((typeof mgrNav === 'function') ? mgrNav('inventory') : '') +
-    '<p class="muted small">Phase 1: ingredients deplete automatically when items fire. Receiving, POs, and waste tracking are not in this phase.</p>' +
+    '<p class="muted small">Ingredients deplete automatically when items fire. Log waste and deliveries, take stock counts, and check the variance report below.</p>' +
     '<div id="iv-low"></div>' +
     '<div class="card mt"><h3>Ingredients</h3><div class="t-scroll"><table class="t-table"><thead><tr>' +
     '<th>Name</th><th>On hand</th><th>Par</th><th>Unit cost</th><th>Stock value</th><th></th></tr></thead>' +
@@ -32,7 +33,13 @@ async function renderInventory(container, api) {
     '<div class="grid2 mt"><div class="card"><h3>Recipe for a menu item</h3>' +
     '<div class="row"><select id="iv-item" class="input" style="flex:1;min-width:0"><option value="">Pick item…</option></select></div>' +
     '<div id="iv-recipe" class="mt"><p class="muted small">Pick a menu item to see or edit its ingredient lines.</p></div></div>' +
-    '<div class="card"><h3>Recent adjustments</h3><div id="iv-adj"><p class="muted small">Loading…</p></div></div></div>';
+    '<div class="card"><h3>Recent adjustments</h3><div id="iv-adj"><p class="muted small">Loading…</p></div></div></div>' +
+    '<div class="card mt"><h3>Variance report</h3>' +
+    '<p class="muted small">What sales should have used, against what actually left the shelf in waste and count fixes.</p>' +
+    '<div class="row"><label class="muted small">From</label><input type="date" id="iv-vfrom" class="input">' +
+    '<label class="muted small">To</label><input type="date" id="iv-vto" class="input">' +
+    '<button id="iv-vload" class="btn">Load report</button></div>' +
+    '<div id="iv-variance" class="mt"><p class="muted small">Pick a range and load the report.</p></div></div>';
 
   const $ = (id) => container.querySelector('#' + id);
   let ingredients = [];
@@ -48,10 +55,16 @@ async function renderInventory(container, api) {
       return '<tr><td><b>' + esc(g.name) + '</b><div class="muted small">' + esc(g.unit) + (low ? ' · <span class="amber">LOW</span>' : '') + '</div></td>' +
         '<td>' + num(g.on_hand) + '</td><td class="muted">' + num(g.par) + '</td><td>' + money(g.cost_per_unit_cents) + '</td>' +
         '<td>' + money(Math.round(g.on_hand * g.cost_per_unit_cents)) + '</td>' +
-        '<td><button class="btn btn-sm" data-e="' + g.id + '">Edit</button> ' +
+        '<td><button class="btn btn-sm" data-w="' + g.id + '">Waste</button> ' +
+        '<button class="btn btn-sm" data-r="' + g.id + '">Receive</button> ' +
+        '<button class="btn btn-sm" data-c="' + g.id + '">Count</button> ' +
+        '<button class="btn btn-sm" data-e="' + g.id + '">Edit</button> ' +
         '<button class="btn btn-sm" data-a="' + g.id + '">Adjust</button> ' +
         '<button class="btn btn-sm btn-ghost" data-d="' + g.id + '">✕</button></td></tr>';
     }).join('') : '<tr><td colspan="6" class="muted">No ingredients yet.</td></tr>';
+    $('iv-body').querySelectorAll('[data-w]').forEach((b) => { b.onclick = () => wasteDialog(ingredients.find((g) => g.id === Number(b.dataset.w))); });
+    $('iv-body').querySelectorAll('[data-r]').forEach((b) => { b.onclick = () => receiveDialog(ingredients.find((g) => g.id === Number(b.dataset.r))); });
+    $('iv-body').querySelectorAll('[data-c]').forEach((b) => { b.onclick = () => countDialog(ingredients.find((g) => g.id === Number(b.dataset.c))); });
     $('iv-body').querySelectorAll('[data-e]').forEach((b) => { b.onclick = () => ingDialog(ingredients.find((g) => g.id === Number(b.dataset.e))); });
     $('iv-body').querySelectorAll('[data-a]').forEach((b) => { b.onclick = () => adjustDialog(ingredients.find((g) => g.id === Number(b.dataset.a))); });
     $('iv-body').querySelectorAll('[data-d]').forEach((b) => {
@@ -115,6 +128,102 @@ async function renderInventory(container, api) {
         } catch (e) { handleApiError(e); }
       });
   }
+
+  // ---- phase 2: waste / receive / count ----
+  const WASTE_CODES = [
+    ['spoilage', 'Spoiled'], ['expired', 'Expired'], ['dropped', 'Dropped / spilled'],
+    ['over_portioned', 'Over-portioned'], ['quality', 'Quality (remake / sent back)'], ['other', 'Other'],
+  ];
+  function wasteDialog(g) {
+    if (!g) return;
+    confirmDialog('Log waste — ' + esc(g.name),
+      '<p class="muted small">On hand now: ' + num(g.on_hand) + ' ' + esc(g.unit) + ' · unit cost ' + money(g.cost_per_unit_cents) + '</p>' +
+      '<label class="muted small">How much was wasted</label><input id="iw-qty" class="input" inputmode="decimal" style="width:100%" placeholder="e.g. 2">' +
+      '<label class="muted small">Why</label><select id="iw-code" class="input" style="width:100%">' +
+      WASTE_CODES.map(([v, l]) => '<option value="' + v + '">' + l + '</option>').join('') + '</select>' +
+      '<label class="muted small">Note (optional)</label><input id="iw-note" class="input" style="width:100%" placeholder="e.g. fridge failure">',
+      'Log waste', async () => {
+        const q = (id) => document.querySelector('#' + id).value;
+        const qty = Number(q('iw-qty'));
+        if (!isFinite(qty) || qty <= 0) { toast('Enter how much was wasted', 'err'); return; }
+        try {
+          const r = await api('/api/admin/inventory/waste', 'POST', {
+            ingredient_id: g.id, qty: qty, reason_code: q('iw-code'), note: q('iw-note').trim() || undefined,
+          });
+          toast('Waste logged — ' + money(r.waste_cost_cents), 'ok'); load();
+        } catch (e) { handleApiError(e); }
+      });
+  }
+
+  function receiveDialog(g) {
+    if (!g) return;
+    confirmDialog('Receive delivery — ' + esc(g.name),
+      '<p class="muted small">On hand now: ' + num(g.on_hand) + ' ' + esc(g.unit) + '</p>' +
+      '<label class="muted small">How much arrived</label><input id="ir-qty" class="input" inputmode="decimal" style="width:100%" placeholder="e.g. 10">' +
+      '<label class="muted small">Unit cost $ (latest delivery price wins)</label><input id="ir-cost" class="input" inputmode="decimal" style="width:100%" value="' + (g.cost_per_unit_cents / 100).toFixed(2) + '">' +
+      '<div class="row"><div style="flex:1"><label class="muted small">Supplier (optional)</label><input id="ir-supplier" class="input" style="width:100%"></div>' +
+      '<div style="flex:1"><label class="muted small">Invoice # (optional)</label><input id="ir-invoice" class="input" style="width:100%"></div></div>',
+      'Receive', async () => {
+        const q = (id) => document.querySelector('#' + id).value;
+        const qty = Number(q('ir-qty'));
+        if (!isFinite(qty) || qty <= 0) { toast('Enter how much arrived', 'err'); return; }
+        const costDollars = Number(q('ir-cost'));
+        try {
+          await api('/api/admin/inventory/receive', 'POST', {
+            ingredient_id: g.id, qty: qty,
+            unit_cost_cents: isFinite(costDollars) ? Math.round(costDollars * 100) : undefined,
+            supplier: q('ir-supplier').trim() || undefined,
+            invoice_ref: q('ir-invoice').trim() || undefined,
+          });
+          toast('Delivery logged', 'ok'); load();
+        } catch (e) { handleApiError(e); }
+      });
+  }
+
+  function countDialog(g) {
+    if (!g) return;
+    confirmDialog('Stock count — ' + esc(g.name),
+      '<p class="muted small">The book says <b>' + num(g.on_hand) + ' ' + esc(g.unit) + '</b>. Count the shelf and enter what is really there — the book is corrected to match.</p>' +
+      '<label class="muted small">Counted quantity</label><input id="ic-counted" class="input" inputmode="decimal" style="width:100%" value="' + num(g.on_hand) + '">',
+      'Save count', async () => {
+        const counted = Number(document.querySelector('#ic-counted').value);
+        if (!isFinite(counted) || counted < 0) { toast('Enter the counted quantity', 'err'); return; }
+        try {
+          const r = await api('/api/admin/inventory/count', 'POST', { ingredient_id: g.id, counted_qty: counted });
+          toast(r.variance === 0 ? 'Count matches the book' :
+            'Count saved — book adjusted by ' + (r.variance > 0 ? '+' : '') + num(r.variance) + ' ' + g.unit, 'ok');
+          load();
+        } catch (e) { handleApiError(e); }
+      });
+  }
+
+  // ---- phase 2: variance report ----
+  const dInput = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const vTo = new Date(); const vFrom = new Date(Date.now() - 6 * 864e5);
+  $('iv-vfrom').value = dInput(vFrom); $('iv-vto').value = dInput(vTo);
+  const signed = (n) => (n > 0 ? '+' : '') + num(n);
+  async function loadVariance() {
+    const from = $('iv-vfrom').value, to = $('iv-vto').value;
+    let v = null;
+    try { v = await api('/api/admin/inventory/variance?from=' + encodeURIComponent(from) + '&to=' + encodeURIComponent(to)); }
+    catch (e) { handleApiError(e); return; }
+    const rows = v.ingredients || [];
+    const t = v.totals || {};
+    $('iv-variance').innerHTML = rows.length
+      ? '<div class="t-scroll"><table class="t-table"><thead><tr><th>Ingredient</th><th>Used by sales</th><th>Wasted</th>' +
+        '<th>Waste cost</th><th>Received</th><th>Count fix</th><th>Net change</th></tr></thead><tbody>' +
+        rows.map((r) =>
+          '<tr><td><b>' + esc(r.name) + '</b> <span class="muted small">' + esc(r.unit) + '</span></td>' +
+          '<td>' + num(r.theoretical_usage) + '</td><td>' + num(r.waste_qty) + '</td><td>' + money(r.waste_cost_cents) + '</td>' +
+          '<td>' + num(r.received_qty) + '</td><td>' + signed(r.count_correction_qty) + '</td><td>' + signed(r.net_change) + '</td></tr>').join('') +
+        '<tr><td><b>Totals</b></td><td><b>' + num(t.theoretical_usage) + '</b></td><td><b>' + num(t.waste_qty) + '</b></td>' +
+        '<td><b>' + money(t.waste_cost_cents) + '</b></td><td><b>' + num(t.received_qty) + '</b></td>' +
+        '<td><b>' + signed(t.count_correction_qty) + '</b></td><td><b>' + signed(t.net_change) + '</b></td></tr>' +
+        '</tbody></table></div>' +
+        '<p class="mt"><b>Total waste cost: ' + money(t.waste_cost_cents) + '</b> <span class="muted small">(valued at current unit costs)</span></p>'
+      : '<p class="muted small">No stock movement in this range.</p>';
+  }
+  $('iv-vload').onclick = loadVariance;
 
   // ---- recipe editor ----
   async function loadMenu() {
