@@ -28,6 +28,22 @@ ledger above is undisturbed): send-now must deplete + ledger exactly like
 exactly ONE new aggregated 'sale depletion' row (delta -6, actor = the
 send-now user). Send-now previously fired through its own inline path and
 never touched inventory at all.
+
+Kind-column hardening (2026-10-03): variance buckets on the structured
+inventory_adjustments.kind, never on reason text. After the baseline:
+  → four /adjust calls whose free-text reasons ape the structured formats
+    ('waste: spoilage', 'Receiving — QA Farms', 'count correction',
+    'sale depletion'; deltas net to zero) — the variance report must be
+    byte-identical, the rows ledgered as kind 'manual', on_hand unmoved
+  → every structured row carries its kind (depletion/waste/receiving/
+    count_correction), checked via /api/inventory/status
+  → qty sanity cap: waste/receive/adjust/count at 1e9 → 400, no movement
+  → variance with from > to → 400 (was an empty 200)
+  → legacy phase (port 4350, separate DB): drop the kind column, plant
+    pre-migration rows with legacy reason strings, reboot — the boot
+    migration backfills depletion/waste/receiving/count_correction and
+    files everything else ('waste:expired', free text) under 'manual',
+    and the variance report buckets the backfilled rows correctly
 """
 import json, os, signal, subprocess, sys, time
 import urllib.request, urllib.error
@@ -85,6 +101,91 @@ def on_hand(mt, iid):
     s, lst = api("GET", "/api/admin/inventory/ingredients", mt)
     assert s == 200
     return [i for i in lst if i["id"] == iid][0]
+
+def legacy_phase():
+    """Kind backfill on a pre-migration DB.
+
+    First boot builds a fully-formed DB with the current code; then the
+    kind column is DROPPED (restoring the old schema) and legacy rows are
+    inserted carrying only the historical reason strings. The next boot's
+    migration must re-add kind and backfill it from the exact legacy
+    patterns — including the traps: 'receiving — <supplier>' still counts
+    as receiving, while 'waste:expired' (no space after the colon — never
+    a structured format) and arbitrary free text fall to 'manual'.
+    """
+    import sqlite3
+    LPORT, LDB = 4350, "/tmp/expoline-test38-legacy.db"
+    LBASE = f"http://localhost:{LPORT}"
+
+    def lapi(method, path, token=None, body=None):
+        req = urllib.request.Request(LBASE + path, method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Content-Type": "application/json"})
+        if token: req.add_header("Authorization", "Bearer " + token)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            try: return e.code, json.loads(e.read().decode() or "{}")
+            except Exception: return e.code, {}
+
+    def lboot():
+        env = dict(os.environ, EXPOLINE_PORT=str(LPORT), EXPOLINE_DB=LDB, NODE_ENV="test")
+        p = subprocess.Popen(["node", str(ROOT / "server.js")], env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        for _ in range(60):
+            try:
+                with urllib.request.urlopen(LBASE + "/api/health", timeout=2) as r:
+                    if r.status == 200: return p
+            except Exception: time.sleep(0.5)
+        p.kill(); raise RuntimeError("legacy server did not come up")
+
+    for suf in ("", "-wal", "-shm"):
+        try: os.remove(LDB + suf)
+        except FileNotFoundError: pass
+    srv = lboot()
+    stop(srv)  # fully-formed DB; server fully down before surgery
+
+    planted = [
+        ("sale depletion", -11), ("waste: spoilage", -12),
+        ("receiving — QA Farms", 13), ("count correction", 14),
+        ("waste:expired", -16), ("cycle count note", 15),
+    ]
+    con = sqlite3.connect(LDB)
+    site = con.execute("SELECT id FROM sites LIMIT 1").fetchone()[0]
+    ing = con.execute("SELECT id FROM ingredients WHERE name = 'Ribeye beef'").fetchone()[0]
+    con.execute("ALTER TABLE inventory_adjustments DROP COLUMN kind")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    for reason, delta in planted:
+        con.execute(
+            "INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, actor, created_at)"
+            " VALUES (?, ?, ?, ?, 'legacy probe', ?)", (site, ing, delta, reason, ts))
+    con.commit()
+    con.close()
+
+    srv = lboot()
+    try:
+        s, b = lapi("POST", "/api/auth/login", None, {"pin": "2580"})
+        assert s == 200, (s, b)
+        mt = b["token"]
+        s, st = lapi("GET", "/api/inventory/status", mt)
+        got = {x["reason"]: x.get("kind") for x in st["recent_adjustments"]
+               if x["ingredient_name"] == "Ribeye beef"}
+        expect = {"sale depletion": "depletion", "waste: spoilage": "waste",
+                  "receiving — QA Farms": "receiving",
+                  "count correction": "count_correction",
+                  "waste:expired": "manual", "cycle count note": "manual"}
+        ok(got == expect, "backfill: kinds derived from legacy reason patterns",
+           f"got={got}")
+        s, v = lapi("GET", "/api/admin/inventory/variance", mt)
+        row = [r for r in v.get("ingredients", []) if r["name"] == "Ribeye beef"]
+        ok(bool(row) and row[0]["theoretical_usage"] == 11 and row[0]["waste_qty"] == 12
+           and row[0]["received_qty"] == 13 and row[0]["count_correction_qty"] == 14
+           and row[0]["net_change"] == 3,
+           "backfill: variance buckets the backfilled rows correctly", f"{row}")
+    finally:
+        stop(srv)
+
 
 def main():
     for suf in ("", "-wal", "-shm"):
@@ -237,6 +338,82 @@ def main():
            "send-now depletion actor = sending user",
            f"{new_rows[0]['actor'] if new_rows else None}")
 
+        # ---- variance pollution: crafted manual reasons must not bucket ----
+        # A is at 93 after send-now. The four crafted /adjust deltas net to
+        # zero (-5 +8 -2 -1), so if kind bucketing works the report must be
+        # BYTE-identical afterwards even though every reason string apes a
+        # structured movement ('waste: ...', 'Receiving ...', ...). The rows
+        # themselves must still land — as kind 'manual'.
+        s, v_before = api("GET", f"/api/admin/inventory/variance?from={frm}&to={to}", MT)
+        ok(s == 200, "pollution: baseline variance snapshot", f"s={s}")
+        before_blob = json.dumps(v_before, sort_keys=True)
+        crafted = [
+            (-5, "waste: spoilage", 88),
+            (8, "Receiving — QA Farms", 96),
+            (-2, "count correction", 94),
+            (-1, "sale depletion", 93),
+        ]
+        for delta, reason, expect_hand in crafted:
+            s, r = api("POST", "/api/admin/inventory/adjust", MT,
+                       {"ingredient_id": A, "delta": delta, "reason": reason})
+            ok(s == 200 and r.get("on_hand") == expect_hand,
+               f"pollution: adjust {reason!r} lands, on_hand -> {expect_hand}",
+               f"s={s} {r}")
+        s, v_after = api("GET", f"/api/admin/inventory/variance?from={frm}&to={to}", MT)
+        ok(s == 200 and json.dumps(v_after, sort_keys=True) == before_blob,
+           "pollution: variance report byte-identical after crafted manual reasons",
+           "reports differ")
+        s, st = api("GET", "/api/inventory/status", MT)
+        # Match on (reason, delta) pairs: the structured rows share two of
+        # the reason strings ('sale depletion', 'count correction') but with
+        # different deltas, so reason alone would over-match.
+        crafted_pairs = {(r, d) for d, r, _ in crafted}
+        manual = [x for x in st["recent_adjustments"]
+                  if x["ingredient_name"] == "QA38 Beef"
+                  and (x["reason"], x["delta"]) in crafted_pairs]
+        ok(len(manual) == 4 and all(x.get("kind") == "manual" for x in manual),
+           "pollution: crafted rows ledgered with kind 'manual'", f"rows={manual}")
+        # Structured rows written earlier must carry their own kinds.
+        adj = [x for x in st["recent_adjustments"] if x["ingredient_name"] == "QA38 Beef"]
+        depk = [x for x in adj if x["reason"] == "sale depletion" and x["delta"] == -6]
+        ok(len(depk) == 2 and all(x.get("kind") == "depletion" for x in depk),
+           "kinds: depletion rows carry kind 'depletion'", f"{depk}")
+        wstk = [x for x in adj if x["reason"] == "waste: spoilage — fridge failure"]
+        ok(len(wstk) == 1 and wstk[0].get("kind") == "waste",
+           "kinds: waste rows carry kind 'waste'", f"{wstk}")
+        rctk = [x for x in adj if x["reason"].startswith("receiving")]
+        ok(len(rctk) == 1 and rctk[0].get("kind") == "receiving",
+           "kinds: receiving rows carry kind 'receiving'", f"{rctk}")
+        cork = [x for x in adj if x["reason"] == "count correction" and x["delta"] in (-3, 2)]
+        ok(len(cork) == 2 and all(x.get("kind") == "count_correction" for x in cork),
+           "kinds: count rows carry kind 'count_correction'", f"{cork}")
+        ok(on_hand(MT, A)["on_hand"] == 93, "pollution: net-zero adjusts return on_hand to 93",
+           f"got {on_hand(MT, A)['on_hand']}")
+
+        # ---- quantity sanity cap (1,000,000): all four writers ----
+        for name, path, body in [
+            ("waste", "/api/admin/inventory/waste",
+             {"ingredient_id": A, "qty": 10**9, "reason_code": "spoilage"}),
+            ("receive", "/api/admin/inventory/receive",
+             {"ingredient_id": A, "qty": 10**9}),
+            ("adjust +", "/api/admin/inventory/adjust",
+             {"ingredient_id": A, "delta": 10**9, "reason": "cap probe"}),
+            ("adjust -", "/api/admin/inventory/adjust",
+             {"ingredient_id": A, "delta": -(10**9), "reason": "cap probe"}),
+            ("count", "/api/admin/inventory/count",
+             {"ingredient_id": A, "counted_qty": 10**9}),
+        ]:
+            s, r = api("POST", path, MT, body)
+            ok(s == 400, f"cap: {name} at 1e9 rejected 400", f"s={s} {r}")
+        ok(on_hand(MT, A)["on_hand"] == 93, "cap: rejected movements changed no stock",
+           f"got {on_hand(MT, A)['on_hand']}")
+
+        # ---- variance window sanity ----
+        f2 = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        t2 = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        s, r = api("GET", f"/api/admin/inventory/variance?from={f2}&to={t2}", MT)
+        ok(s == 400, "variance: from after to is a 400, not an empty 200", f"s={s} {r}")
+
         # ---- manager-only guards ----
         for name, method, path, body in [
             ("waste", "POST", "/api/admin/inventory/waste", {"ingredient_id": A, "qty": 1, "reason_code": "other"}),
@@ -248,6 +425,9 @@ def main():
             ok(s == 403, f"guard: server token 403 on {name}", f"s={s}")
     finally:
         stop(srv)
+
+    # ---- kind backfill on a pre-migration DB ----
+    legacy_phase()
 
     print(f"\ntest38: {checks - len(fails)}/{checks} passed" + (f" — FAILURES: {fails}" if fails else ""))
     return 1 if fails else 0
