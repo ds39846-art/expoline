@@ -471,12 +471,107 @@ async function openMergePicker(checkId) {
   });
 }
 
+/* ----------------- 8. rush-friendly order controls -----------------------
+ * Pure render helpers + the move-to-seat picker used by app.js's order
+ * view. State (selected seat, tapped line, select mode) lives in app.js;
+ * these only render HTML (esc'd) and, for the picker, resolve the server's
+ * choice. All mutations still go through the existing API endpoints:
+ *   PATCH  /api/checks/:id                  (guest_count — add a seat)
+ *   PATCH  /api/checks/:id/items/:item_id   (qty / seat — one tap, no modal)
+ *   POST   /api/checks/:id/items/:item_id/duplicate  (Repeat)
+ *   POST   /api/checks/:id/void-item        (Void — manager PIN, app.js modal)
+ */
+
+/** Count order lines per seat. lines: [{seat}] — staged + billable items. */
+function countLinesBySeat(lines) {
+  const counts = {};
+  for (const l of lines || []) {
+    const s = Number(l && l.seat) || 0;
+    if (s > 0) counts[s] = (counts[s] || 0) + 1;
+  }
+  return counts;
+}
+
+/** Seat strip: one chip per seat with guest name + line count, plus a
+ *  "+ Seat" chip (omitted at the server's 24-guest cap). The active chip
+ *  carries a rename pencil (data-rename-seat) that opens the existing
+ *  rename modal for that seat. */
+function seatStripHtml(o) {
+  const guests = Math.max(1, o.guestCount || 1);
+  const names = o.seatNames || {}, counts = o.counts || {};
+  let html = '';
+  for (let s = 1; s <= guests; s++) {
+    const active = s === o.selectedSeat;
+    html += '<button class="seat-chip' + (active ? ' active' : '') + '" data-s="' + s + '" role="radio" aria-checked="' + active + '">Seat ' + s +
+      (names[s] ? '<span class="guest-nm">' + esc(names[s]) + '</span>' : '') +
+      (counts[s] ? '<span class="seat-cnt">' + counts[s] + ' item' + (counts[s] === 1 ? '' : 's') + '</span>' : '') +
+      (active ? '<span class="seat-ren" data-rename-seat="' + s + '" title="Rename guest at seat ' + s + '" aria-label="Rename guest at seat ' + s + '">✎</span>' : '') +
+      '</button>';
+  }
+  if (guests < 24) html += '<button class="seat-chip add" data-add-seat="1" title="Add a seat to this check">+ Seat</button>';
+  return html;
+}
+
+/** Compact action row shown under the tapped check line. Steppers disable
+ *  at the server's own bounds (qty 1–24, seat 1..guest_count) so a tap
+ *  never fires a request the API would reject. Fired lines keep the same
+ *  buttons — app.js routes those taps to the manager-approved edit modal.
+ *  "More…" is omitted for staged lines (they have no server line to edit;
+ *  qty/seat/repeat/void cover their whole lifecycle). */
+function quickBarHtml(o) {
+  const qty = Math.max(1, o.qty || 1), seat = Math.max(1, o.seat || 1);
+  const guests = Math.max(1, o.guestCount || 1);
+  const dis = (b) => (b ? ' disabled' : '');
+  return '<div class="quick-bar" data-quickbar="1">' +
+    '<span class="qb-group"><span class="qb-lbl">Qty</span>' +
+    '<button class="qb-btn" data-qa="qty-dec"' + dis(qty <= 1) + ' aria-label="One fewer">−</button>' +
+    '<span class="qb-val">' + qty + '</span>' +
+    '<button class="qb-btn" data-qa="qty-inc"' + dis(qty >= 24) + ' aria-label="One more">+</button></span>' +
+    '<span class="qb-group"><span class="qb-lbl">Seat</span>' +
+    '<button class="qb-btn" data-qa="seat-dec"' + dis(seat <= 1) + ' aria-label="Move to lower seat">−</button>' +
+    '<span class="qb-val">' + seat + '</span>' +
+    '<button class="qb-btn" data-qa="seat-inc"' + dis(seat >= guests) + (seat >= guests ? ' title="Add a seat from the seat strip first"' : '') + ' aria-label="Move to higher seat">+</button></span>' +
+    '<button class="btn btn-sm" data-qa="repeat">Repeat 🔁</button>' +
+    '<button class="btn btn-sm qb-void" data-qa="void">Void</button>' +
+    (o.staged ? '' : '<button class="btn btn-sm" data-qa="more">More…</button>') +
+    '</div>';
+}
+
+/** Seat-chip picker for bulk moves. Resolves: seat number | 'new' | null
+ *  (cancelled). "+ New seat" is offered below the 24-guest server cap; the
+ *  caller grows guest_count via PATCH /api/checks/:id before moving. */
+function openMoveToSeatPicker(o) {
+  return new Promise((resolve) => {
+    const guests = Math.max(1, o.guestCount || 1);
+    const names = o.seatNames || {}, counts = o.counts || {};
+    let chips = '';
+    for (let s = 1; s <= guests; s++) {
+      chips += '<button class="seat-chip mv-chip" data-mv="' + s + '">Seat ' + s +
+        (names[s] ? '<span class="guest-nm">' + esc(names[s]) + '</span>' : '') +
+        (counts[s] ? '<span class="seat-cnt">' + counts[s] + ' item' + (counts[s] === 1 ? '' : 's') + '</span>' : '') + '</button>';
+    }
+    if (guests < 24) chips += '<button class="seat-chip add mv-chip" data-mv="new">+ New seat</button>';
+    const n = o.count || 0;
+    const bd = window.openModal(
+      '<h2>Move to seat</h2><p class="muted small">Move the ' + n + ' selected line' + (n === 1 ? '' : 's') + ' to:</p>' +
+      '<div class="seat-row mv-row">' + chips + '</div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button></div>');
+    $('[data-x="c"]', bd).onclick = () => { window.closeModal(); resolve(null); };
+    $all('[data-mv]', bd).forEach((b) => b.onclick = () => {
+      const v = b.dataset.mv;
+      window.closeModal();
+      resolve(v === 'new' ? 'new' : Number(v));
+    });
+  });
+}
+
 window.ParityOrders = {
   itemVisible, filterMenuByDaypart, windowForName, openDaypartPicker,
   fmtElapsed, timerChip,
   openRenameSeatModal,
   openEditItemModal, describeDelta, deltaHtml,
   openVisualSplit, openMergePicker,
+  countLinesBySeat, seatStripHtml, quickBarHtml, openMoveToSeatPicker,
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = window.ParityOrders;
 })();

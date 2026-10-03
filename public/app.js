@@ -1324,9 +1324,29 @@ async function renderOrder(app, checkId) {
   try { view = await getCheckView(checkId); }
   catch (e) { if (handleApiError(e) === 'bounced') return; app.innerHTML = '<div class="card"><h2>Check not found</h2><p><a class="btn btn-ghost" href="#/floor">Back to floor</a></p></div>'; return; }
   let check = view.check;
-  const guests = check.guest_count || check.guests || 2;
+  let guests = check.guest_count || check.guests || 2;
+  /* The seat the server is ringing for survives re-renders (HOLD, quick
+     actions, websocket redraws) — losing it mid-rush sends the next tap to
+     Seat 1. Persisted per check, clamped to the live guest count. */
   let seat = 1;
+  try { seat = Number(sessionStorage.getItem('expoline.seat:' + checkId)) || 1; } catch (e) { /* ignore */ }
+  if (!(seat >= 1)) seat = 1;
+  if (seat > guests) seat = guests;
+  const setSeat = (s) => {
+    seat = Math.max(1, Math.min(Math.max(1, guests), s));
+    try { sessionStorage.setItem('expoline.seat:' + checkId, String(seat)); } catch (e) { /* ignore */ }
+  };
   let staged = loadStaged(checkId);
+  /* Rush controls: quickKey = the tapped cart line ('staged:<temp_id>' or
+     'held:<item_id>') whose quick-action bar is open; selectMode shows the
+     multi-select checkboxes for bulk seat moves. */
+  let quickKey = null;
+  let selectMode = false;
+  try { selectMode = sessionStorage.getItem('expoline.selectMode:' + checkId) === '1'; } catch (e) { /* ignore */ }
+  const setSelectMode = (on) => {
+    selectMode = !!on;
+    try { sessionStorage.setItem('expoline.selectMode:' + checkId, on ? '1' : '0'); } catch (e) { /* ignore */ }
+  };
   let menu = [], activeCat = null;
 
   try { menu = await getMenu(); } catch (e) { handleApiError(e); }
@@ -1392,12 +1412,49 @@ async function renderOrder(app, checkId) {
 
   const seatRow = $('#seat-row'), catTabs = $('#cat-tabs'), itemGrid = $('#item-grid'), cartBody = $('#cart-body');
 
-  const drawSeats = () => {
+  /* Seat strip: chips carry per-seat line counts; "+ Seat" grows the check
+     (PATCH guest_count — server-level, no manager PIN) and selects the new
+     seat so the next taps land on it; the active chip's ✎ renames that
+     guest via the existing modal. */
+  async function renameSeat(s) {
     const names = check.seat_names || {};
-    seatRow.innerHTML = Array.from({ length: guests }, (_, i) => i + 1).map((s) =>
-      '<button class="seat-chip' + (s === seat ? ' active' : '') + '" data-s="' + s + '" role="radio" aria-checked="' + (s === seat) + '">Seat ' + s +
-      (names[s] ? '<span class="guest-nm">' + esc(names[s]) + '</span>' : '') + '</button>').join('');
-    $$('.seat-chip', seatRow).forEach((b) => b.onclick = () => { seat = Number(b.dataset.s); drawSeats(); drawCart(); });
+    const r = await PO.openRenameSeatModal(check.id, s, names[s] || '');
+    if (r === null) return; // cancelled
+    try {
+      const v = await getCheckView(checkId);
+      check = v.check; guests = check.guest_count || guests; drawSeats(); drawCart();
+    } catch (e) { handleApiError(e); }
+  }
+  async function addSeat() {
+    if (guests >= 24) { toast('24 guests is the max for one check', 'err'); return; }
+    if (isOffline()) { toast('Adding a seat needs a connection — reconnect first', 'err'); return; }
+    try {
+      await api('/api/checks/' + realId(checkId), 'PATCH', { guest_count: guests + 1 });
+    } catch (e) { handleApiError(e); return; }
+    try {
+      const v = await getCheckView(checkId);
+      check = v.check; guests = check.guest_count || guests + 1;
+    } catch (e) { guests = guests + 1; }
+    setSeat(guests);
+    drawSeats(); drawCart();
+    toast('Seat ' + guests + ' added — tap items to ring for this guest', 'ok');
+  }
+  const drawSeats = () => {
+    const counts = PO.countLinesBySeat(
+      staged.concat((check.items || []).filter((i) => ['held', 'sent', 'fulfilled'].includes(i.state))));
+    seatRow.innerHTML = PO.seatStripHtml({ guestCount: guests, seatNames: check.seat_names || {}, counts, selectedSeat: seat });
+    $$('.seat-chip[data-s]', seatRow).forEach((b) => b.onclick = (e) => {
+      if (e.target.closest('[data-rename-seat]')) return; // rename has its own handler
+      setSeat(Number(b.dataset.s)); drawSeats(); drawCart();
+    });
+    $$('[data-rename-seat]', seatRow).forEach((b) => b.onclick = (e) => {
+      e.stopPropagation();
+      setSeat(Number(b.dataset.renameSeat));
+      drawSeats(); drawCart();
+      renameSeat(seat);
+    });
+    const add = $('[data-add-seat]', seatRow);
+    if (add) add.onclick = addSeat;
   };
   const drawCats = () => {
     const vm = visibleMenu();
@@ -1586,7 +1643,11 @@ async function renderOrder(app, checkId) {
     (check.items || []).forEach((i) => { (bySeat[i.seat || 0] = bySeat[i.seat || 0] || []).push({ kind: 'held', ref: i }); });
     const seats = Object.keys(bySeat).map(Number).sort((a, b) => a - b);
     if (!seats.length) { cartBody.innerHTML = '<p class="muted small">Nothing ordered yet — pick a seat, then tap items.</p>'; return; }
-    cartBody.innerHTML = seats.map((s) =>
+    const toolsHtml = '<div class="cart-tools">' +
+      '<button class="btn btn-sm' + (selectMode ? ' btn-primary' : ' btn-ghost') + '" id="sel-toggle" aria-pressed="' + selectMode + '">' +
+      (selectMode ? '✓ Selecting' : '☰ Select') + '</button>' +
+      '<span class="muted small">' + (selectMode ? 'Tick lines, then Move to seat…' : 'Tap a line for quick actions') + '</span></div>';
+    cartBody.innerHTML = toolsHtml + seats.map((s) =>
       '<div class="seat-group"><div class="seat-name">' + (s ? 'Seat ' + s + (seatNames[s] ? ' · ' + esc(seatNames[s]) : '') : 'Unseated') + '</div>' +
       bySeat[s].map(({ kind, ref }) => {
         const pill = kind === 'staged' ? '<span class="pill staged">staged</span>'
@@ -1598,10 +1659,10 @@ async function renderOrder(app, checkId) {
         /* Phase 3A (P0-2/NG-E): special request + allergy ride the cart line. */
         const noteHtml = ref.note ? '<span class="line-note">📝 ' + esc(ref.note) + '</span>' : '';
         const allergyHtml = ref.allergy ? '<span class="pill allergy">⚠️ allergy' + (ref.allergy_detail ? ' · ' + esc(ref.allergy_detail) : '') + '</span>' : '';
-        /* Phase 3A (P0-3/NG-C): multi-select — held lines can be sent
-           selectively; staged + held lines can be bulk-assigned to a seat. */
+        /* Multi-select (Select toggle on): staged + held lines can be
+           ticked for selective send / bulk seat moves. */
         const selKey = kind + ':' + (ref.temp_id || ref.id);
-        const selBox = (kind === 'staged' || ref.state === 'held')
+        const selBox = (selectMode && (kind === 'staged' || ref.state === 'held'))
           ? '<input type="checkbox" class="line-sel" data-sel="' + esc(selKey) + '" aria-label="Select line">'
           : '';
         const voidBtn = (kind === 'staged' || ref.state === 'held')
@@ -1619,16 +1680,23 @@ async function renderOrder(app, checkId) {
         const editBtn = (kind !== 'staged' && (ref.state === 'held' || ref.state === 'sent'))
           ? '<button class="icon-btn" data-edit="' + esc(String(ref.id)) + '" aria-label="Edit item" title="Edit item (fired items need manager PIN)">✎</button>'
           : '';
-        return '<div class="cart-line">' + selBox + '<div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
+        const lineHtml = '<div class="cart-line' + (quickKey === selKey ? ' qsel' : '') + '" data-line="' + esc(selKey) + '">' + selBox + '<div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
           (mods ? '<span class="mods">' + mods + '</span>' : '') + noteHtml + allergyHtml + '</div>' + pill +
           '<span class="pr">' + fmt(lineTotal) + '</span>' + editBtn + refireBtn + voidBtn + '</div>';
+        /* Quick-action bar: tapping the line opens qty/seat steppers plus
+           Repeat / Void / More… directly under it — qty and seat apply in
+           one tap via PATCH, no modal round-trip. */
+        const quickHtml = quickKey === selKey
+          ? PO.quickBarHtml({ qty: ref.qty || 1, seat: ref.seat || s, guestCount: guests, staged: kind === 'staged' })
+          : '';
+        return lineHtml + quickHtml;
       }).join('') + '</div>').join('') +
-      /* Phase 3A (P0-3/NG-C): selection action bar — send selected lines, or
-         bulk-assign staged/held lines to a seat (item-first guest assignment). */
+      /* Selection action bar — send selected lines, or move them all to
+         one seat (chips, incl. "+ New seat") in a single action. */
       '<div class="sel-bar" id="sel-bar" style="display:none">' +
       '<span class="muted small" id="sel-count"></span>' +
       '<button class="btn btn-sm" id="sel-send">Send selected</button>' +
-      '<button class="btn btn-sm" id="sel-seat">Assign seat…</button>' +
+      '<button class="btn btn-sm" id="sel-move">Move to seat…</button>' +
       '<button class="btn btn-sm btn-ghost" id="sel-clear">Clear</button></div>';
     $$('[data-void]', cartBody).forEach((b) => b.onclick = () => {
       const id = b.dataset.void, kind = b.dataset.kind;
@@ -1649,6 +1717,121 @@ async function renderOrder(app, checkId) {
       const it = (check.items || []).find((x) => String(x.id) === String(b.dataset.edit));
       if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
     });
+    /* Select toggle: the multi-select checkboxes render only in select
+       mode, so the default cart stays clean for line tapping. */
+    const selToggle = $('#sel-toggle', cartBody);
+    if (selToggle) selToggle.onclick = () => {
+      setSelectMode(!selectMode);
+      if (selectMode) quickKey = null; // one interaction mode at a time
+      drawCart();
+    };
+    /* Tap a line → its quick-action bar opens under it. Taps landing on the
+       line's own buttons/checkboxes keep their existing behavior. */
+    $$('.cart-line[data-line]', cartBody).forEach((el) => el.onclick = (e) => {
+      if (e.target.closest('button, input, select, a')) return;
+      quickKey = quickKey === el.dataset.line ? null : el.dataset.line;
+      drawCart();
+    });
+    const findLine = (key) => {
+      if (!key) return null;
+      const ix = key.indexOf(':');
+      const kind = key.slice(0, ix), id = key.slice(ix + 1);
+      if (kind === 'staged') {
+        const ref = staged.find((x) => String(x.temp_id) === id);
+        return ref ? { kind, ref } : null;
+      }
+      const ref = (check.items || []).find((x) => String(x.id) === id);
+      return ref ? { kind, ref } : null;
+    };
+    /* Light refresh after a quick action: refetch the check, redraw seats +
+       cart, repaint the header Pay total from the mutation response. No
+       full route re-render — the tapped line and the selected seat stay
+       exactly where the server left them. */
+    const refreshAfterQuick = async (totals) => {
+      try {
+        const v = await getCheckView(checkId);
+        check = v.check; guests = check.guest_count || guests;
+      } catch (e) { /* keep the on-screen check; the next render resyncs */ }
+      if (totals && totals.total != null) {
+        const pl = $('.order-top a.btn-primary');
+        if (pl) pl.textContent = 'Pay · ' + fmt(totals.total);
+      }
+      drawSeats(); drawCart();
+    };
+    const qb = $('[data-quickbar]', cartBody);
+    if (qb) {
+      const found = findLine(quickKey);
+      if (!found) quickKey = null;
+      else {
+        const { kind, ref } = found;
+        const fired = kind !== 'staged' && ref.state !== 'held';
+        let busy = false;
+        /* Fired lines: the API requires a manager PIN for edits, so qty /
+           seat taps hand off to the full edit modal (the PIN lives there)
+           instead of firing a request that would 403. */
+        const patchItem = async (patch) => {
+          if (fired) {
+            toast('Fired item — manager approval needed', 'err');
+            const it = (check.items || []).find((x) => String(x.id) === String(ref.id));
+            if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
+            return;
+          }
+          const r = await api('/api/checks/' + realId(checkId) + '/items/' + ref.id, 'PATCH', patch);
+          await refreshAfterQuick(r && r.totals);
+        };
+        $$('[data-qa]', qb).forEach((b) => b.onclick = async () => {
+          if (busy) return;
+          busy = true;
+          $$('button', qb).forEach((x) => { x.disabled = true; });
+          try {
+            const a = b.dataset.qa;
+            if (a === 'qty-inc' || a === 'qty-dec') {
+              const nq = Math.max(1, Math.min(24, (ref.qty || 1) + (a === 'qty-inc' ? 1 : -1)));
+              if (nq === (ref.qty || 1)) return;
+              if (kind === 'staged') { ref.qty = nq; saveStaged(checkId, staged); drawCart(); }
+              else await patchItem({ qty: nq });
+            } else if (a === 'seat-inc' || a === 'seat-dec') {
+              const ns = Math.max(1, Math.min(guests, (ref.seat || 1) + (a === 'seat-inc' ? 1 : -1)));
+              if (ns === (ref.seat || 1)) return;
+              if (kind === 'staged') { ref.seat = ns; saveStaged(checkId, staged); drawCart(); }
+              else await patchItem({ seat: ns });
+            } else if (a === 'repeat') {
+              if (kind === 'staged') {
+                staged.push(Object.assign({}, ref, { temp_id: uid('st'),
+                  modifiers: (ref.modifiers || []).map((m) => Object.assign({}, m)) }));
+                saveStaged(checkId, staged); drawCart();
+                toast('Repeated — same line added again', 'ok');
+              } else {
+                const r = await api('/api/checks/' + realId(checkId) + '/items/' + ref.id + '/duplicate', 'POST', {});
+                toast('Repeated — same line added again', 'ok');
+                await refreshAfterQuick(r && r.totals);
+              }
+            } else if (a === 'void') {
+              if (kind === 'staged') {
+                confirmDialog('Void item', 'Remove this item from the order? It was never sent anywhere.', 'Void item', async () => {
+                  staged = staged.filter((s) => s.temp_id !== ref.temp_id);
+                  saveStaged(checkId, staged);
+                  quickKey = null;
+                  drawCart();
+                });
+              } else {
+                openVoidApproval(ref.id, ref.name);
+              }
+            } else if (a === 'more') {
+              const it = (check.items || []).find((x) => String(x.id) === String(ref.id));
+              if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
+            }
+          } catch (e) { handleApiError(e); }
+          finally {
+            busy = false;
+            // If a redraw replaced the bar this closure is dead anyway;
+            // otherwise (a modal was cancelled) restore the buttons. The
+            // handlers clamp to the API bounds, so re-enabling is safe.
+            if (qb.isConnected) $$('button', qb).forEach((x) => { x.disabled = false; });
+          }
+        });
+      }
+    }
     /* Phase 3A (P0-3/NG-C): line selection — selective send + item-first
        seat assignment ("start with the items and choose who it's for"). */
     const selBar = $('#sel-bar', cartBody), selCount = $('#sel-count', cartBody);
@@ -1670,35 +1853,48 @@ async function renderOrder(app, checkId) {
       } catch (e) { handleApiError(e); }
       renderRoute(true);
     };
-    $('#sel-seat', cartBody).onclick = () => {
+    /* Bulk move: seat chips (incl. "+ New seat") replace the old stepper
+       modal. Moves run line-by-line over the same PATCH endpoint as the
+       quick bar; every failure is counted and reported, never swallowed. */
+    $('#sel-move', cartBody).onclick = async () => {
       const keys = selectedKeys();
       if (!keys.length) return;
-      let toSeat = seat;
-      const bd = openModal('<h2>Assign seat</h2>' +
-        '<p class="muted">Move the ' + keys.length + ' selected line' + (keys.length === 1 ? '' : 's') + ' to a guest — item-first assignment, no re-keying.</p>' +
-        '<div class="field"><label>Seat</label><div class="stepper"><button data-as="dec">−</button><span class="val" id="as-seat">' + toSeat + '</span><button data-as="inc">+</button></div></div>' +
-        '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
-        '<button class="btn btn-primary" data-x="go">Assign to seat</button></div>');
-      $('[data-as="dec"]', bd).onclick = () => { toSeat = Math.max(1, toSeat - 1); $('#as-seat', bd).textContent = toSeat; };
-      $('[data-as="inc"]', bd).onclick = () => { toSeat = Math.min(guests, toSeat + 1); $('#as-seat', bd).textContent = toSeat; };
-      $('[data-x="c"]', bd).onclick = closeModal;
-      $('[data-x="go"]', bd).onclick = async () => {
-        closeModal();
+      const counts = PO.countLinesBySeat(
+        staged.concat((check.items || []).filter((i) => ['held', 'sent', 'fulfilled'].includes(i.state))));
+      const target = await PO.openMoveToSeatPicker({ guestCount: guests, seatNames: check.seat_names || {}, counts, count: keys.length });
+      if (target === null) return;
+      let toSeat = target;
+      if (target === 'new') {
+        if (isOffline()) { toast('Adding a seat needs a connection — reconnect first', 'err'); return; }
         try {
-          for (const k of keys) {
-            const [kind, id] = k.split(':');
-            if (kind === 'staged') {
-              const s = staged.find((x) => String(x.temp_id) === id);
-              if (s) s.seat = toSeat;
-            } else {
-              await api('/api/checks/' + realId(checkId) + '/items/' + id, 'PATCH', { seat: toSeat });
-            }
-          }
-          saveStaged(checkId, staged);
-          toast(keys.length + ' line' + (keys.length === 1 ? '' : 's') + ' → Seat ' + toSeat, 'ok');
-        } catch (e) { handleApiError(e); }
-        renderRoute(true);
-      };
+          await api('/api/checks/' + realId(checkId), 'PATCH', { guest_count: guests + 1 });
+          const v = await getCheckView(checkId);
+          check = v.check; guests = check.guest_count || guests + 1;
+          toSeat = guests;
+        } catch (e) { handleApiError(e); return; }
+      }
+      let moved = 0; const failures = [];
+      for (const k of keys) {
+        const ix = k.indexOf(':');
+        const kind = k.slice(0, ix), id = k.slice(ix + 1);
+        if (kind === 'staged') {
+          const s = staged.find((x) => String(x.temp_id) === id);
+          if (s) { s.seat = toSeat; moved++; }
+        } else {
+          try {
+            await api('/api/checks/' + realId(checkId) + '/items/' + id, 'PATCH', { seat: toSeat });
+            moved++;
+          } catch (e) { failures.push(e); }
+        }
+      }
+      saveStaged(checkId, staged);
+      if (failures.length) {
+        const why = (failures[0] && (failures[0].message || failures[0].error)) || 'error';
+        toast('Moved ' + moved + ' of ' + keys.length + ' lines → Seat ' + toSeat + ' — ' + failures.length + ' failed (' + why + ')', 'err');
+      } else {
+        toast(keys.length + ' line' + (keys.length === 1 ? '' : 's') + ' → Seat ' + toSeat, 'ok');
+      }
+      renderRoute(true);
     };
     /* Re-fire: confirm, then POST — the kitchen gets a flagged RE-FIRE ticket. */
     $$('[data-refire]', cartBody).forEach((b) => b.onclick = () => {
@@ -1952,15 +2148,7 @@ async function renderOrder(app, checkId) {
     try { sessionStorage.setItem('expoline.daypartOverride', v); } catch (e) {}
     renderRoute(true);
   });
-  $('#seat-rename').onclick = async () => {
-    const names = check.seat_names || {};
-    const r = await PO.openRenameSeatModal(check.id, seat, names[seat] || '');
-    if (r === null) return; // cancelled
-    try {
-      const v = await getCheckView(checkId);
-      check = v.check; drawSeats(); drawCart();
-    } catch (e) { handleApiError(e); }
-  };
+  $('#seat-rename').onclick = () => renameSeat(seat);
   /* Phase 3A (NG-D): quick-pick row — one-tap popular items across all
      visible categories. Hidden when nothing is flagged popular. */
   const drawQuickPick = () => {
