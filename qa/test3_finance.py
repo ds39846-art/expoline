@@ -54,6 +54,18 @@ ok(all(cp["fee_label"]!="Other" for cp in p["card_payments"]), "no 'Other' fee l
 
 print(f"-- payouts {TODAY} (today, BEFORE Test-3 refund) --")
 q = api("GET",f"/api/finance/payouts?date={TODAY}",MT)
+# PRECONDITION: today's figures audit the scenario that test1_flow and
+# test2_roles build on THIS server (group checks, the 1471 move-target card
+# payment, test2's refunded 453 soda). On a fresh seed those payments
+# legitimately do not exist, and this suite used to report misleading
+# mismatches and then die with IndexError at the move-target lookup below.
+# Fail fast and loud instead. Run qa/run_4317_sequence.sh, or test1 then
+# test2 against this same server, first.
+if not any(c["amount_cents"] == 1471 for c in q["card_payments"]) or q["refunds_cents"] != 453:
+    print("PRECONDITION MISSING: today's scenario payments not found.")
+    print("test3 audits state created by test1_flow.py + test2_roles.py on the same")
+    print("server — run qa/run_4317_sequence.sh (or test1, then test2) first.")
+    sys.exit(1)
 # card payments: g1-even 4865 tip800, g1-seat 3960 tip700, move-target 1471 tip300, 8-top 3711 tip0, soda 453 refunded(full)
 # 8-top total 3711 = 2800+140+504+267 (tax on sub+sur+mandatory service charge, CA CDTFA Pub 22 Jan 2025)
 cv2 = 4865+3960+1471+3711+453; rf2 = 453
