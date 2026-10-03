@@ -302,6 +302,50 @@ addModGroup('Edamame',
     { name: 'Sweet Chili' },
   ]);
 
+// ---------------- inventory (phase 2 demo stock) ----------------
+// The inventory tables live in the server boot ensureSchema (not
+// schema.sql), so — same precedent as the modifier groups above — the
+// seed creates them IF NOT EXISTS with identical DDL, then seeds a small
+// demo stock set + recipes so the manager inventory screen (and its
+// waste / receiving / count / variance tools) isn't empty on a fresh demo.
+db.exec(`CREATE TABLE IF NOT EXISTS ingredients (
+  id INTEGER PRIMARY KEY, site_id TEXT, name TEXT, unit TEXT DEFAULT 'ea',
+  on_hand REAL DEFAULT 0, par REAL DEFAULT 0, cost_per_unit_cents INTEGER DEFAULT 0,
+  active INTEGER DEFAULT 1, created_at TEXT)`);
+db.exec(`CREATE TABLE IF NOT EXISTS recipes (
+  id INTEGER PRIMARY KEY, site_id TEXT, menu_item_id INTEGER, ingredient_id INTEGER,
+  qty REAL DEFAULT 0, UNIQUE(site_id, menu_item_id, ingredient_id))`);
+db.exec(`CREATE TABLE IF NOT EXISTS inventory_adjustments (
+  id INTEGER PRIMARY KEY, site_id TEXT, ingredient_id INTEGER, delta REAL,
+  reason TEXT, actor TEXT, created_at TEXT)`);
+
+const seedNow = new Date().toISOString();
+const ingId = {};
+{
+  const insIng = db.prepare(
+    'INSERT INTO ingredients (site_id, name, unit, on_hand, par, cost_per_unit_cents, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  // name, unit, on_hand, par, cost_per_unit_cents
+  const STOCK = [
+    ['Ribeye beef', 'lb', 40, 15, 950],
+    ['Edamame (soybeans)', 'lb', 25, 10, 210],
+    ['Potatoes (fries)', 'lb', 60, 20, 90],
+    ['Frying oil', 'L', 20, 8, 380],
+    ['Sea salt', 'lb', 5, 2, 120],
+  ];
+  for (const [name, unit, onHand, par, cost] of STOCK)
+    ingId[name] = insIng.run(SITE, name, unit, onHand, par, cost, seedNow).lastInsertRowid;
+
+  const insRecipe = db.prepare('INSERT INTO recipes (site_id, menu_item_id, ingredient_id, qty) VALUES (?, ?, ?, ?)');
+  const seedRecipe = (itemName, lines) => {
+    const mid = itemId[itemName];
+    if (!mid) { console.warn('WARNING: item not found for recipe seed:', itemName); return; }
+    for (const [ingName, qty] of lines) insRecipe.run(SITE, mid, ingId[ingName], qty);
+  };
+  seedRecipe('14oz Ribeye', [['Ribeye beef', 0.875]]);              // 14 oz of beef
+  seedRecipe('Edamame', [['Edamame (soybeans)', 0.5], ['Sea salt', 0.02]]);
+  seedRecipe('Bali Fries', [['Potatoes (fries)', 0.5], ['Frying oil', 0.25], ['Sea salt', 0.01]]);
+}
+
 // ---------------- demo closed checks (yesterday) ----------------
 const money = (subtotal, guests) => {
   const sc = guests >= 8 ? Math.round(subtotal * 0.18) : 0;
@@ -408,7 +452,7 @@ seedClosedCheck({
 
 // ---------------- summary ----------------
 const counts = {};
-for (const t of ['sites','users','zones','tables','menu_categories','menu_items','menu_modifiers','menu_modifier_groups','menu_modifier_options','checks','check_items','payments','kds_tickets','site_config']) {
+for (const t of ['sites','users','zones','tables','menu_categories','menu_items','menu_modifiers','menu_modifier_groups','menu_modifier_options','checks','check_items','payments','kds_tickets','site_config','ingredients','recipes']) {
   counts[t] = db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
 }
 
