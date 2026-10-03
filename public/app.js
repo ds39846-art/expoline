@@ -2119,7 +2119,10 @@ async function renderOrder(app, checkId) {
     if (!staged.length) { toast('Nothing staged — tap menu items first'); return; }
     const items = staged.map((s) => ({ temp_id: s.temp_id, menu_item_id: s.menu_item_id, name: s.name, price_cents: s.price_cents, seat: s.seat, qty: s.qty, modifiers: s.modifiers,
       note: s.note || null, allergy: !!s.allergy, allergy_detail: s.allergy_detail || null }));
-    staged = []; saveStaged(checkId, staged);
+    /* Staged lines are removed ONLY as they are confirmed. The old shape
+       cleared the list up front, so one rejected POST (e.g. a required
+       modifier group the client menu never showed) destroyed the whole
+       half-built order — data loss on a validation error. */
     try {
       if (isOffline()) {
         if (String(checkId).startsWith('tmp-')) {
@@ -2128,15 +2131,44 @@ async function renderOrder(app, checkId) {
             note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null, state: 'held' }));
           localStorage.setItem('expoline.draft:' + checkId, JSON.stringify(d));
         }
-        await Outbox.enqueue('add_items', { check_id: realId(checkId), items });
+        try {
+          await Outbox.enqueue('add_items', { check_id: realId(checkId), items });
+        } catch (e) {
+          /* Queue write failed after the draft absorbed the lines: back
+             them out of the draft so a retry cannot double them, and keep
+             the staged list untouched. */
+          if (String(checkId).startsWith('tmp-')) {
+            try {
+              const d2 = JSON.parse(localStorage.getItem('expoline.draft:' + checkId));
+              d2.items = d2.items.filter((x) => !items.some((it) => it.temp_id === x.id));
+              localStorage.setItem('expoline.draft:' + checkId, JSON.stringify(d2));
+            } catch (e2) { /* best effort */ }
+          }
+          throw e;
+        }
+        staged = []; saveStaged(checkId, staged);
         toast('Held offline — will sync', 'ok');
       } else {
         const rid = realId(checkId);
+        const heldIds = new Set();
+        let failure = null;
         for (const it of items) {
-          await api('/api/checks/' + rid + '/items', 'POST', { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
-            note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null });
+          try {
+            await api('/api/checks/' + rid + '/items', 'POST', { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
+              note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null });
+            heldIds.add(it.temp_id);
+          } catch (e) { failure = e; break; }
         }
-        toast(items.length + (items.length === 1 ? ' item' : ' items') + ' held', 'ok');
+        staged = staged.filter((s) => !heldIds.has(s.temp_id));
+        saveStaged(checkId, staged);
+        if (!failure) {
+          toast(items.length + (items.length === 1 ? ' item' : ' items') + ' held', 'ok');
+        } else if (failure instanceof ApiError && (failure.status === 401 || failure.status === 403)) {
+          handleApiError(failure);
+        } else {
+          const left = staged.length;
+          toast((heldIds.size ? heldIds.size + ' held · ' : '') + left + ' need' + (left === 1 ? 's' : '') + ' attention: ' + (failure.message || 'request failed'), 'err');
+        }
       }
     } catch (e) { handleApiError(e); }
     renderRoute(true);
@@ -2192,12 +2224,16 @@ async function renderOrder(app, checkId) {
      check and straight to the KDS in a single atomic call. */
   $('#btn-sendnow').onclick = async () => {
     if (!staged.length) { toast('Nothing staged — tap menu items first'); return; }
+    /* Staged lines clear ONLY after the server confirms the send-now call.
+       The old shape cleared the list before even the offline check, so an
+       offline SEND NOW (or one rejected POST) silently discarded the whole
+       order behind a toast. */
+    if (isOffline()) { toast('Send-now needs a connection — reconnect first', 'err'); return; }
     const items = staged.map((s) => ({ menu_item_id: s.menu_item_id, seat: s.seat, qty: s.qty, modifiers: s.modifiers,
       note: s.note || null, allergy: !!s.allergy, allergy_detail: s.allergy_detail || null }));
-    staged = []; saveStaged(checkId, staged);
     try {
-      if (isOffline()) { toast('Send-now needs a connection — reconnect first', 'err'); return; }
       const r = await api('/api/checks/' + realId(checkId) + '/send-now', 'POST', { items });
+      staged = []; saveStaged(checkId, staged);
       toast('Sent now — ' + (r.sent || 0) + ' line' + ((r.sent || 0) === 1 ? '' : 's') + ' fired', 'ok');
     } catch (e) { handleApiError(e); }
     renderRoute(true);
