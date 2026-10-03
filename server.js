@@ -2998,11 +2998,9 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
   const held = db.prepare(
     "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id IN (" + insertedIds.map(() => '?').join(',') + ") ORDER BY ci.id"
   ).all(...insertedIds);
-  // Reuse send route logic by temporarily marking and firing
   const sentAt = nowIso();
   const table = check.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(check.table_id) : null;
   const serverUser = check.server_id ? db.prepare('SELECT name FROM users WHERE id = ?').get(check.server_id) : null;
-  const byStation = new Map();
   const markSent = db.prepare("UPDATE check_items SET state = 'sent', sent_at = ? WHERE id = ?");
   let seatNames = {};
   try {
@@ -3010,29 +3008,40 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
       seatNames[r.seat] = r.guest_name;
     }
   } catch { /* parity_orders migrate owns this table */ }
-  for (const it of held) {
-    markSent.run(sentAt, it.id);
-    const station = it.station || 'expediter';
-    if (!byStation.has(station)) byStation.set(station, []);
-    byStation.get(station).push({
-      item_id: it.id, name: it.name, seat: it.seat, guest_name: seatNames[it.seat] || null,
-      qty: it.qty, modifiers: parseJson(it.modifiers_json, []), course: it.course || null,
-      note: it.note || null, allergy: it.allergy ? true : false, allergy_detail: it.allergy_detail || null,
-    });
-  }
-  const tickets = [];
   const newTicket = db.prepare(
     `INSERT INTO kds_tickets (uuid, site_id, check_id, station, table_label, server_name, items_json, status, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)`
   );
-  for (const [station, items] of byStation) {
-    const r = newTicket.run(crypto.randomUUID(), SITE_ID, check.id, station,
-      table ? table.label : null, serverUser ? serverUser.name : null,
-      JSON.stringify(items), sentAt);
-    const ticket = ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid));
-    tickets.push(ticket);
-    broadcastTicket(ticket);
-  }
+  /* Fire atomically, mirroring /send's fireHeldItemsToKds: mark sent,
+     deplete inventory (+ aggregated 'sale depletion' ledger), and insert
+     the KDS tickets in ONE transaction — a mid-fire failure rolls all of
+     it back, so depletion can never commit without its tickets. (This
+     inline fire path previously never called depleteInventoryForItems at
+     all: send-now sales silently left ingredient on_hand untouched.)
+     Ticket broadcasts go out after commit, like /send. */
+  const tickets = withTransaction(() => {
+    const byStation = new Map();
+    for (const it of held) {
+      markSent.run(sentAt, it.id);
+      const station = it.station || 'expediter';
+      if (!byStation.has(station)) byStation.set(station, []);
+      byStation.get(station).push({
+        item_id: it.id, name: it.name, seat: it.seat, guest_name: seatNames[it.seat] || null,
+        qty: it.qty, modifiers: parseJson(it.modifiers_json, []), course: it.course || null,
+        note: it.note || null, allergy: it.allergy ? true : false, allergy_detail: it.allergy_detail || null,
+      });
+    }
+    depleteInventoryForItems(held, (req.user && req.user.name) || (serverUser ? serverUser.name : null));
+    const created = [];
+    for (const [station, items] of byStation) {
+      const r = newTicket.run(crypto.randomUUID(), SITE_ID, check.id, station,
+        table ? table.label : null, serverUser ? serverUser.name : null,
+        JSON.stringify(items), sentAt);
+      created.push(ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid)));
+    }
+    return created;
+  });
+  for (const ticket of tickets) broadcastTicket(ticket);
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
   const outItems = insertedIds.map((id) => itemView(db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(id)));
@@ -7027,7 +7036,8 @@ app.get('/api/inventory/status', managerOnly(), (req, res) => {
     recent_adjustments: recent,
   });
 });
-/** Deplete inventory for fired items. Called inside the /send transaction.
+/** Deplete inventory for fired items. Called inside the fire transaction
+ * (shared by /send, /fire-course, and /send-now).
  * Phase 2: every depletion is also written to the inventory_adjustments
  * ledger — one row per ingredient per fire, aggregated across all fired
  * lines (reason 'sale depletion') — so theoretical usage is auditable

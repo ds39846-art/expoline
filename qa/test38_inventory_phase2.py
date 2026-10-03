@@ -21,6 +21,13 @@ Hand-computed ledger for ingredient A (QA38 Beef, recipe 2 per Bali Fries):
   count 99         -> correction +2                      on_hand 99
   variance row: usage 6, waste 4, waste cost 4*250 = 1000c (CURRENT cost),
   received 10, count corrections -1, net -1  (100 + (-1) = 99 ✓)
+
+Send-now regression guard (appended AFTER the variance snapshot, so the
+ledger above is undisturbed): send-now must deplete + ledger exactly like
+/send — stage 3 fries in one send-now call -> on_hand 99 - 2x3 = 93,
+exactly ONE new aggregated 'sale depletion' row (delta -6, actor = the
+send-now user). Send-now previously fired through its own inline path and
+never touched inventory at all.
 """
 import json, os, signal, subprocess, sys, time
 import urllib.request, urllib.error
@@ -201,6 +208,34 @@ def main():
         s, v2 = api("GET", "/api/admin/inventory/variance", MT)
         ok(s == 200 and any(r["ingredient_id"] == A for r in v2.get("ingredients", [])),
            "variance default window (7d) includes today's activity", f"s={s}")
+
+        # ---- send-now: depletes + ledgers identically to /send ----
+        s, st = api("GET", "/api/inventory/status", MT)
+        dep_before = [x for x in st["recent_adjustments"]
+                      if x["ingredient_name"] == "QA38 Beef" and x["reason"] == "sale depletion"]
+        table2_id = zlist[0]["tables"][1]["id"]
+        s, chk2 = api("POST", "/api/checks", ST, {"table_id": table2_id, "guest_count": 2, "tab_name": "T38-SN"})
+        assert s == 201, (s, chk2)
+        cid2 = chk2["id"]
+        s, sn = api("POST", f"/api/checks/{cid2}/send-now", ST,
+                    {"items": [{"menu_item_id": fries["id"], "seat": 1, "qty": 3}]})
+        ok(s == 201 and sn.get("sent") == 1 and len(sn.get("tickets", [])) == 1,
+           "send-now fires the staged line (201, sent=1, 1 ticket)", f"s={s} {sn}")
+        ok(on_hand(MT, A)["on_hand"] == 93,
+           "send-now depletes on_hand: 99 - recipe 2 x qty 3 = 93",
+           f"got {on_hand(MT, A)['on_hand']}")
+        s, st = api("GET", "/api/inventory/status", MT)
+        dep_after = [x for x in st["recent_adjustments"]
+                     if x["ingredient_name"] == "QA38 Beef" and x["reason"] == "sale depletion"]
+        new_rows = [x for x in dep_after if x["id"] not in {y["id"] for y in dep_before}]
+        ok(len(dep_after) == len(dep_before) + 1 and len(new_rows) == 1,
+           "send-now wrote exactly ONE new aggregated 'sale depletion' row",
+           f"before={len(dep_before)} after={len(dep_after)} new={new_rows}")
+        ok(bool(new_rows) and new_rows[0]["delta"] == -6,
+           "send-now depletion delta = -(2 x 3) = -6", f"{new_rows}")
+        ok(bool(new_rows) and new_rows[0]["actor"] == "Daniel S",
+           "send-now depletion actor = sending user",
+           f"{new_rows[0]['actor'] if new_rows else None}")
 
         # ---- manager-only guards ----
         for name, method, path, body in [
