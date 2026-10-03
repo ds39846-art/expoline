@@ -596,6 +596,13 @@ async function getMenu() {
       price_cents: i.price_cents != null ? i.price_cents : Math.round((Number(i.price) || 0) * 100),
       is_drink: i.is_drink, tags: i.tags || [],
       modifiers: i.modifiers || i.modifier_options || [],
+      /* Modifier GROUPS (Temperature, Flavor, …) must ride through: the
+         server sends them on every item, and addItemFlow reads
+         item.modifier_groups to render required pickers. This mapping
+         used to drop the field, so grouped items staged instantly with
+         no picker and the server then rejected the line at HOLD for a
+         missing required selection the server could never make. */
+      modifier_groups: i.modifier_groups || [],
       station: i.station || i.kds_station || null,
       daypart: i.daypart || null,
     })),
