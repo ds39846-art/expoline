@@ -200,8 +200,12 @@ async function main() {
     'got ' + JSON.stringify(eGroups.map((g) => g.name)));
   ok('A6', 'getMenu: popular flag passes through (Bali Fries flagged in fixture)',
     !!fries && fries.popular === true, 'got ' + (fries && fries.popular));
-  ok('A7', 'getMenu: unflagged items stay popular=false', !!ribeye && ribeye.popular === false,
-    'got ' + (ribeye && ribeye.popular));
+  /* Probe item must stay unflagged in the seed: batch 4 flags Bali Fries,
+   * Edamame, the Ribeye, and BH Mai Tai as quick-pick favorites, so the
+   * Ribeye can no longer serve as the unflagged control here. */
+  const unflagged = byName('Coconut Shrimp');
+  ok('A7', 'getMenu: unflagged items stay popular=false', !!unflagged && unflagged.popular === false,
+    'got ' + (unflagged && unflagged.popular));
 
   /* ---------- B. addItemFlow pick-1 radio semantics ---------- */
   function flowCase(item, catName, prefix, groupIdx, defaultName, pickName) {
