@@ -571,9 +571,30 @@ require('./routes/parity_kds_pay').migrate(db);
     ingredient_id INTEGER,
     delta REAL,
     reason TEXT,
+    kind TEXT,
     actor TEXT,
     created_at TEXT
   )`);
+  /* Ledger kind migration (2026-10-03): the variance report used to bucket
+     rows by pattern-matching the free-text reason, so a manager's manual
+     adjustment (POST /adjust stores their text verbatim) could impersonate
+     a waste / receiving / count / depletion bucket just by its wording.
+     Bucketing is now on this structured `kind`, set explicitly by every
+     writer. Existing rows are backfilled ONCE — when the column is first
+     added — from the exact reason formats the structured writers used;
+     anything unrecognized is a manual adjustment. */
+  (() => {
+    const acols = new Set(db.prepare('PRAGMA table_info(inventory_adjustments)').all().map((c) => c.name));
+    if (!acols.has('kind')) {
+      db.exec('ALTER TABLE inventory_adjustments ADD COLUMN kind TEXT');
+      db.exec(`UPDATE inventory_adjustments SET kind = CASE
+        WHEN reason = 'sale depletion' THEN 'depletion'
+        WHEN reason LIKE 'waste: %' THEN 'waste'
+        WHEN reason LIKE 'receiving%' THEN 'receiving'
+        WHEN reason = 'count correction' THEN 'count_correction'
+        ELSE 'manual' END`);
+    }
+  })();
   db.exec(`CREATE INDEX IF NOT EXISTS idx_recipes_item ON recipes(site_id, menu_item_id)`);
 
   db.exec(`CREATE TABLE IF NOT EXISTS staff_notes (
@@ -6886,8 +6907,10 @@ app.post('/api/admin/inventory/adjust', managerOnly(), (req, res) => {
   const reason = cleanLabel(b.reason) || 'manual adjustment';
   withTransaction(() => {
     db.prepare('UPDATE ingredients SET on_hand = on_hand + ? WHERE id = ?').run(b.delta, ing.id);
-    db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(SITE_ID, ing.id, b.delta, reason, req.user.name, nowIso());
+    /* kind is ALWAYS 'manual' here: the reason is the manager's free text
+       and must never land this row in a structured variance bucket. */
+    db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, kind, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(SITE_ID, ing.id, b.delta, reason, 'manual', req.user.name, nowIso());
   });
   auditApproval(req, 'inventory_adjust', {}, { ingredient_id: ing.id, delta: b.delta, reason });
   res.json(ingredientById(ing.id));
@@ -6895,12 +6918,15 @@ app.post('/api/admin/inventory/adjust', managerOnly(), (req, res) => {
 /* ------------------------- inventory phase 2 ------------------------------
    Waste, receiving (deliberately PO-less — no purchase-order documents),
    physical counts, and the theoretical-vs-actual variance report. Every
-   movement writes an inventory_adjustments row; the reason string is the
-   report key, in one consistent format:
-     'sale depletion'              (written by depleteInventoryForItems)
-     'waste: <code>' [+ ' — <note>']
-     'receiving'       [+ ' — <supplier>' [+ ' · inv <invoice_ref>']]
-     'count correction'
+   movement writes an inventory_adjustments row carrying a structured
+   `kind` — the variance report buckets on kind ONLY, never on the reason
+   text (which for manual adjustments is manager free text). The reason
+   strings stay human-readable, in one consistent format:
+     kind 'depletion'       reason 'sale depletion'   (depleteInventoryForItems)
+     kind 'waste'           reason 'waste: <code>' [+ ' — <note>']
+     kind 'receiving'       reason 'receiving' [+ ' — <supplier>' [+ ' · inv <invoice_ref>']]
+     kind 'count_correction' reason 'count correction'
+     kind 'manual'          reason = manager free text (POST /adjust)
    Waste cost uses the ingredient's stored unit cost (cost_per_unit_cents)
    at the moment of the movement; an unset cost is 0, so waste cost is 0. */
 const WASTE_REASON_CODES = ['spoilage', 'expired', 'dropped', 'over_portioned', 'quality', 'other'];
@@ -6912,9 +6938,9 @@ function inventoryTarget(req, res) {
   return ing;
 }
 const isPositiveQty = (v) => typeof v === 'number' && isFinite(v) && v > 0;
-function writeAdjustment(ingredientId, delta, reason, actor) {
-  db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(SITE_ID, ingredientId, delta, reason, actor, nowIso());
+function writeAdjustment(ingredientId, delta, reason, kind, actor) {
+  db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, kind, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(SITE_ID, ingredientId, delta, reason, kind, actor, nowIso());
 }
 
 app.post('/api/admin/inventory/waste', managerOnly(), (req, res) => {
@@ -6928,7 +6954,7 @@ app.post('/api/admin/inventory/waste', managerOnly(), (req, res) => {
   const wasteCost = Math.round(b.qty * (ing.cost_per_unit_cents || 0));
   withTransaction(() => {
     db.prepare('UPDATE ingredients SET on_hand = on_hand - ? WHERE id = ?').run(b.qty, ing.id);
-    writeAdjustment(ing.id, -b.qty, reason, req.user.name);
+    writeAdjustment(ing.id, -b.qty, reason, 'waste', req.user.name);
   });
   auditApproval(req, 'inventory_waste', {}, { ingredient_id: ing.id, qty: b.qty, reason_code: b.reason_code, waste_cost_cents: wasteCost });
   res.json({ ingredient: ingredientById(ing.id), wasted_qty: b.qty, waste_cost_cents: wasteCost });
@@ -6951,7 +6977,7 @@ app.post('/api/admin/inventory/receive', managerOnly(), (req, res) => {
        invoice price. Omit unit_cost_cents to keep the stored cost. */
     if (b.unit_cost_cents != null)
       db.prepare('UPDATE ingredients SET cost_per_unit_cents = ? WHERE id = ?').run(b.unit_cost_cents, ing.id);
-    writeAdjustment(ing.id, b.qty, reason, req.user.name);
+    writeAdjustment(ing.id, b.qty, reason, 'receiving', req.user.name);
   });
   auditApproval(req, 'inventory_receive', {}, { ingredient_id: ing.id, qty: b.qty, unit_cost_cents: b.unit_cost_cents ?? null, supplier, invoice_ref: invoiceRef });
   res.json({ ingredient: ingredientById(ing.id), received_qty: b.qty });
@@ -6970,7 +6996,7 @@ app.post('/api/admin/inventory/count', managerOnly(), (req, res) => {
   if (variance !== 0) {
     withTransaction(() => {
       db.prepare('UPDATE ingredients SET on_hand = ? WHERE id = ?').run(b.counted_qty, ing.id);
-      writeAdjustment(ing.id, variance, 'count correction', req.user.name);
+      writeAdjustment(ing.id, variance, 'count correction', 'count_correction', req.user.name);
     });
   }
   auditApproval(req, 'inventory_count', {}, { ingredient_id: ing.id, expected, counted: b.counted_qty, variance });
@@ -6990,14 +7016,17 @@ app.get('/api/admin/inventory/variance', managerOnly(), (req, res) => {
   const to = parseWin(req.query.to, new Date(nowMs).toISOString(), true);
   if (!from || !to) return res.status(400).json({ error: 'from/to must be ISO dates' });
   /* Inclusion rule: an ingredient appears iff it has at least one ledger row
-     inside the window (any reason). Waste cost is valued at each
-     ingredient's CURRENT stored unit cost. */
+     inside the window (any kind). Buckets key on the structured kind ONLY —
+     reason text is never consulted, so a manual adjustment whose free-text
+     reason happens to read like a structured movement cannot pollute a
+     bucket (it still counts toward net_change). Waste cost is valued at
+     each ingredient's CURRENT stored unit cost. */
   const rows = db.prepare(`
     SELECT i.id AS ingredient_id, i.name AS name, i.unit AS unit, i.cost_per_unit_cents AS cost_per_unit_cents,
-      SUM(CASE WHEN a.reason = 'sale depletion' THEN -a.delta ELSE 0 END) AS theoretical_usage,
-      SUM(CASE WHEN a.reason LIKE 'waste:%' THEN -a.delta ELSE 0 END) AS waste_qty,
-      SUM(CASE WHEN a.reason LIKE 'receiving%' THEN a.delta ELSE 0 END) AS received_qty,
-      SUM(CASE WHEN a.reason = 'count correction' THEN a.delta ELSE 0 END) AS count_correction_qty,
+      SUM(CASE WHEN a.kind = 'depletion' THEN -a.delta ELSE 0 END) AS theoretical_usage,
+      SUM(CASE WHEN a.kind = 'waste' THEN -a.delta ELSE 0 END) AS waste_qty,
+      SUM(CASE WHEN a.kind = 'receiving' THEN a.delta ELSE 0 END) AS received_qty,
+      SUM(CASE WHEN a.kind = 'count_correction' THEN a.delta ELSE 0 END) AS count_correction_qty,
       SUM(a.delta) AS net_change
     FROM inventory_adjustments a JOIN ingredients i ON i.id = a.ingredient_id
     WHERE a.site_id = ? AND a.created_at >= ? AND a.created_at <= ?
@@ -7040,12 +7069,13 @@ app.get('/api/inventory/status', managerOnly(), (req, res) => {
  * (shared by /send, /fire-course, and /send-now).
  * Phase 2: every depletion is also written to the inventory_adjustments
  * ledger — one row per ingredient per fire, aggregated across all fired
- * lines (reason 'sale depletion') — so theoretical usage is auditable
- * against waste/counts. The on_hand math is unchanged from phase 1. */
+ * lines (reason 'sale depletion', kind 'depletion') — so theoretical usage
+ * is auditable against waste/counts. The on_hand math is unchanged from
+ * phase 1. */
 function depleteInventoryForItems(heldItems, actor) {
   const lineStmt = db.prepare('SELECT ingredient_id, qty FROM recipes WHERE site_id = ? AND menu_item_id = ?');
   const decStmt = db.prepare('UPDATE ingredients SET on_hand = on_hand - ? WHERE id = ? AND site_id = ?');
-  const ledStmt = db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+  const ledStmt = db.prepare('INSERT INTO inventory_adjustments (site_id, ingredient_id, delta, reason, kind, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
   const used = new Map(); // ingredient_id -> total qty consumed by this fire
   for (const it of heldItems) {
     for (const ln of lineStmt.all(SITE_ID, it.menu_item_id)) {
@@ -7057,7 +7087,7 @@ function depleteInventoryForItems(heldItems, actor) {
   if (used.size) {
     const ts = nowIso();
     for (const [ingredientId, qty] of used) {
-      ledStmt.run(SITE_ID, ingredientId, -qty, 'sale depletion', actor || 'system', ts);
+      ledStmt.run(SITE_ID, ingredientId, -qty, 'sale depletion', 'depletion', actor || 'system', ts);
     }
   }
 }

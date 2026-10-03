@@ -317,7 +317,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS recipes (
   qty REAL DEFAULT 0, UNIQUE(site_id, menu_item_id, ingredient_id))`);
 db.exec(`CREATE TABLE IF NOT EXISTS inventory_adjustments (
   id INTEGER PRIMARY KEY, site_id TEXT, ingredient_id INTEGER, delta REAL,
-  reason TEXT, actor TEXT, created_at TEXT)`);
+  reason TEXT, kind TEXT, actor TEXT, created_at TEXT)`);
 
 const seedNow = new Date().toISOString();
 const ingId = {};
