@@ -42,6 +42,8 @@ const OLO_CSS = `
 .olo-item .pr s{color:var(--text-dim);font-weight:400;margin-right:6px}
 .olo-hh{display:inline-block;margin-left:8px;padding:1px 8px;border:1px solid var(--brass-dim);
   border-radius:999px;color:var(--brass-hi);font-size:11px;letter-spacing:.06em;text-transform:uppercase;vertical-align:1px}
+.olo-taxincl{display:inline-block;margin-left:8px;padding:1px 8px;border:1px solid var(--green);
+  border-radius:999px;color:var(--green);font-size:11px;letter-spacing:.06em;text-transform:uppercase;vertical-align:1px}
 .olo-left{color:var(--brass-hi);font-size:12px;margin-top:3px;font-weight:600}
 .olo-step{display:flex;align-items:center;gap:8px}
 .olo-step button{width:40px;height:40px;border-radius:50%;border:1px solid var(--brass-dim);
@@ -73,6 +75,32 @@ const OLO_CSS = `
   padding:12px 14px;border-radius:var(--radius-sm);margin:12px 0;font-size:14px}
 .olo-note{font-size:13px;color:var(--text-dim);text-align:center;margin-top:12px}
 `;
+
+/* Cart tax, mirroring the server's online math EXACTLY (routes/online.js,
+ * which mirrors the floor's calcTotals for a fee-free check): exclusive
+ * line totals group by effective rate and round per group; tax-inclusive
+ * lines back their tax OUT per line (net = round(total / (1 + rate)))
+ * and that included tax counts in tax_cents but is not added to the
+ * amount due again — it is already inside the sticker price.
+ * entries: [{total_cents, rate_bps, inclusive}] — rate_bps is the item's
+ * effective rate from the menu payload (already resolved server-side:
+ * the item's own rate, or the site default when the item has none).
+ * Pure + top-level so the QA harness can exercise it directly. */
+function oloTaxCalc(entries) {
+  const groups = new Map(); // rate (double) -> exclusive base cents
+  let included = 0;
+  for (const e of entries) {
+    const rate = (e.rate_bps != null ? e.rate_bps : 775) / 10000;
+    if (e.inclusive && rate > 0) {
+      included += e.total_cents - Math.round(e.total_cents / (1 + rate));
+    } else {
+      groups.set(rate, (groups.get(rate) || 0) + e.total_cents);
+    }
+  }
+  let tax = included;
+  groups.forEach((base, rate) => { tax += Math.round(base * rate); });
+  return { tax_cents: tax, tax_included_cents: included };
+}
 
 function oloSlots() {
   const slots = [{ label: 'ASAP', value: null }];
@@ -121,6 +149,21 @@ async function renderOnlineOrder(container, api) {
     st.cart.forEach((q, id) => { const it = byId.get(id); if (it) s += q * oloPrice(it); });
     return s;
   };
+  // The cart's tax on the server's own math (oloTaxCalc) from the menu
+  // payload's per-item effective rate + inclusive flag — the checkout
+  // shows the real figure, and the placed order's server totals match.
+  const cartTax = () => {
+    const entries = [];
+    st.cart.forEach((q, id) => {
+      const it = byId.get(id);
+      if (it) entries.push({
+        total_cents: q * oloPrice(it),
+        rate_bps: it.effective_tax_rate_bps != null ? it.effective_tax_rate_bps : it.tax_rate_bps,
+        inclusive: it.tax_inclusive === true,
+      });
+    });
+    return oloTaxCalc(entries);
+  };
 
   function paint() {
     let style = container.querySelector('style[data-olo]');
@@ -156,7 +199,7 @@ async function renderOnlineOrder(container, api) {
         const q = st.cart.get(it.id) || 0;
         h += `<div class="olo-item"><div class="inf"><div class="nm">${oloEsc(it.name)}</div>` +
           (it.description ? `<div class="ds">${oloEsc(it.description)}</div>` : '') +
-          `<div class="pr">${priceHtml(it)}</div>` +
+          `<div class="pr">${priceHtml(it)}${(it.tax_inclusive ? '<span class="olo-taxincl">Tax included</span>' : '')}</div>` +
           (it.remaining != null ? `<div class="olo-left">Only ${it.remaining} left</div>` : '') +
           `</div>
           <div class="olo-step">
@@ -176,6 +219,7 @@ async function renderOnlineOrder(container, api) {
 
   function viewCheckout() {
     const sub = cartSubtotal();
+    const tx = cartTax();
     const slots = oloSlots();
     let h = `<div class="olo-field"><label>Your name</label>
       <input class="olo-input" id="olo-name" placeholder="Jane Doe" value="${oloEsc(st.name)}"></div>
@@ -191,8 +235,11 @@ async function renderOnlineOrder(container, api) {
       if (it) h += `<div class="r"><span>${q}× ${oloEsc(it.name)}</span><span>${oloFmt(q * oloPrice(it))}</span></div>`;
     });
     h += `<div class="r"><span>Subtotal</span><span>${oloFmt(sub)}</span></div>
-      <div class="r"><span>Tax (7.75%)</span><span>calc. at confirmation</span></div>
-      <div class="r tt"><span>Due at pickup</span><span>${oloFmt(sub)}</span></div></div>
+      <div class="r"><span>Tax</span><span>${oloFmt(tx.tax_cents)}</span></div>` +
+      (tx.tax_included_cents > 0
+        ? `<div class="r"><span></span><span>includes ${oloFmt(tx.tax_included_cents)} tax in prices</span></div>`
+        : '') +
+      `<div class="r tt"><span>Due at pickup</span><span>${oloFmt(sub + tx.tax_cents - tx.tax_included_cents)}</span></div></div>
       <button class="olo-btn big" id="olo-place-btn" ${st.placing ? 'disabled' : ''}>${st.placing ? 'Placing…' : 'Place order'}</button>
       <div class="olo-row" style="margin-top:8px"><button class="olo-btn ghost big" id="olo-back-btn">← Back to menu</button></div>
       <p class="olo-note">No payment now — pay at pickup. No fees, ever.</p>`;
@@ -211,8 +258,11 @@ async function renderOnlineOrder(container, api) {
       <div class="olo-sum" style="text-align:left">` +
       o.items.map((it) => `<div class="r"><span>${it.qty}× ${oloEsc(it.name)}</span><span>${oloFmt(it.qty * it.unit_price_cents)}</span></div>`).join('') +
       `<div class="r"><span>Subtotal</span><span>${oloFmt(o.subtotal_cents)}</span></div>
-       <div class="r"><span>Tax</span><span>${oloFmt(o.tax_cents)}</span></div>
-       <div class="r tt"><span>Due at pickup</span><span>${oloFmt(o.total_cents)}</span></div></div>
+       <div class="r"><span>Tax</span><span>${oloFmt(o.tax_cents)}</span></div>` +
+      (o.tax_included_cents > 0
+        ? `<div class="r"><span></span><span>includes ${oloFmt(o.tax_included_cents)} tax in prices</span></div>`
+        : '') +
+      `<div class="r tt"><span>Due at pickup</span><span>${oloFmt(o.total_cents)}</span></div></div>
       <p class="olo-note">Show this screen or give your name at the counter.<br>Pay at pickup — no fees.</p>
       <button class="olo-btn ghost big" id="olo-new-btn">Start a new order</button></div>`;
   }

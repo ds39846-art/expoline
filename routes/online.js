@@ -23,6 +23,20 @@
  * set mid-service takes effect on the next menu read / order — nothing
  * can go stale. All ctx helpers are guarded: a host that does not wire
  * them gets the pre-parity behavior (plain price, active-flag only).
+ * Tax parity with the floor (tax-breadth semantics): each line snapshots
+ * the item's tax treatment (tax_rate_bps, NULL = site default, 0 =
+ * exempt; tax_inclusive flag) at placement via the host's taxSnapshotOf,
+ * and the order tax is computed the way calcTotals computes a fee-free
+ * check — exclusive line totals grouped by effective rate, rounded per
+ * group; inclusive lines back their tax OUT per line
+ * (net = round(lineTotal / (1 + rate)), included = lineTotal − net) and
+ * contribute that included tax to tax_cents but NOT to the guest total
+ * (it is already inside the sticker). Online has no surcharge/service
+ * charge and there is no check here, so the staff check-level tax-exempt
+ * toggle does not exist on this surface — per-ITEM exemption (0 bps) is
+ * honored. Read-backs serve the placement-time columns + line snapshots,
+ * never live menu tax fields, so a later menu edit cannot move a placed
+ * order. tax_cents / tax_included_cents mirror the check payload names.
  *
  * INTEGRATION (integrator adds these lines to server.js — see bottom):
  *   1. in authMiddleware's public-path early return, add the online paths
@@ -80,6 +94,10 @@ function migrate(db) {
   // Link KDS tickets back to their online order (additive, guarded).
   const tcols = new Set(db.prepare('PRAGMA table_info(kds_tickets)').all().map((c) => c.name));
   if (!tcols.has('online_order_id')) db.exec('ALTER TABLE kds_tickets ADD COLUMN online_order_id INTEGER');
+  // Tax parity: the backed-out (included) portion of tax_cents, stored at
+  // placement like the other money columns (additive, guarded).
+  const ocols = new Set(db.prepare('PRAGMA table_info(online_orders)').all().map((c) => c.name));
+  if (!ocols.has('tax_included_cents')) db.exec('ALTER TABLE online_orders ADD COLUMN tax_included_cents INTEGER DEFAULT 0');
   db.exec('CREATE INDEX IF NOT EXISTS idx_online_orders_site_status ON online_orders(site_id, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_online_orders_phone ON online_orders(site_id, phone)');
 }
@@ -96,6 +114,10 @@ function orderView(row) {
     items,
     subtotal_cents: row.subtotal_cents,
     tax_cents: row.tax_cents,
+    // The portion of tax_cents already inside the sticker prices
+    // (tax-inclusive lines) — same name as the check payload's
+    // totals.tax_included_cents. Legacy rows predate the column.
+    tax_included_cents: row.tax_included_cents || 0,
     total_cents: row.total_cents,
     status: row.status,
     pickup_at: row.pickup_at,
@@ -119,6 +141,16 @@ function register(app, ctx) {
     ? ctx.consumeEightySixCountdown : () => ({ consumed: false, flipped: false });
   const pushMenuUpdated = typeof ctx.broadcastMenuUpdated === 'function'
     ? ctx.broadcastMenuUpdated : () => {};
+  // The floor's ring-time tax snapshot (validates bps to an int in
+  // 0..10000 or null, flag to 0/1) — placement is online's ring time.
+  const taxSnapshotOf = typeof ctx.taxSnapshotOf === 'function'
+    ? ctx.taxSnapshotOf
+    : (src) => {
+        if (!src) return { tax_rate_bps: null, tax_inclusive: 0 };
+        const bps = (Number.isInteger(src.tax_rate_bps) && src.tax_rate_bps >= 0 && src.tax_rate_bps <= 10000)
+          ? src.tax_rate_bps : null;
+        return { tax_rate_bps: bps, tax_inclusive: src.tax_inclusive ? 1 : 0 };
+      };
 
   const taxRate = () => {
     const r = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'tax_rate'").get(SITE_ID);
@@ -138,12 +170,13 @@ function register(app, ctx) {
     // both excluded server-side — same rule as the kiosk/guest menus (staff
     // keep flagged-visible; guests never see a sold-out item at all).
     const itemStmt = db.prepare(
-      'SELECT id, name, description, price_cents, hh_price_cents, is_86, remaining, item_type, station, course, price_note FROM menu_items WHERE category_id = ? AND active = 1 AND COALESCE(is_86, 0) = 0 ORDER BY id'
+      'SELECT id, name, description, price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, is_86, remaining, item_type, station, course, price_note FROM menu_items WHERE category_id = ? AND active = 1 AND COALESCE(is_86, 0) = 0 ORDER BY id'
     );
     const modStmt = db.prepare(
       'SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id'
     );
     const hhActive = hhPricingActive();
+    const siteRateBps = Math.round(taxRate() * 10000);
     // Same shape as /api/menu; mergeCats is server-local so we inline a flat list.
     res.json(cats.map((c) => ({
       id: c.id,
@@ -162,6 +195,14 @@ function register(app, ctx) {
         hh_price_cents: it.hh_price_cents != null ? it.hh_price_cents : null,
         effective_price_cents: effectivePriceCents(it, hhActive),
         hh_active: hhActive && it.price_cents > 0 && it.hh_price_cents != null,
+        // Tax breadth, mirroring the staff /api/menu fields: the item's
+        // own rate (null = site default, 0 = exempt), the resolved
+        // effective rate the client cart math uses, and whether the
+        // sticker price already contains its tax (the menu renders the
+        // honest "Tax included" label — the math below honors it).
+        tax_rate_bps: it.tax_rate_bps != null ? it.tax_rate_bps : null,
+        effective_tax_rate_bps: it.tax_rate_bps != null ? it.tax_rate_bps : siteRateBps,
+        tax_inclusive: it.tax_inclusive ? true : false,
         // Portions still orderable under a floor-86 countdown, else null —
         // shown honestly ("Only N left"), never invented.
         remaining: it.remaining != null ? it.remaining : null,
@@ -208,7 +249,7 @@ function register(app, ctx) {
     const ids = [...new Set(lineReqs.map((l) => l.menuItemId))];
     const placeholders = ids.map(() => '?').join(',');
     const found = db.prepare(
-      `SELECT mi.id, mi.name, mi.price_cents, mi.hh_price_cents, mi.is_86, mi.remaining, mi.station, mi.active, mi.category_id
+      `SELECT mi.id, mi.name, mi.price_cents, mi.hh_price_cents, mi.tax_rate_bps, mi.tax_inclusive, mi.is_86, mi.remaining, mi.station, mi.active, mi.category_id
        FROM menu_items mi WHERE mi.id IN (${placeholders})`
     ).all(...ids);
     // Site-scope check: item must belong to this site via its category.
@@ -231,6 +272,7 @@ function register(app, ctx) {
       if (mi.active !== 1) {
         return res.status(400).json({ error: `“${mi.name}” is 86'd right now — please pick something else` });
       }
+      const taxSnap = taxSnapshotOf(mi);
       priced.push({
         menu_item_id: mi.id,
         name: mi.name,
@@ -239,6 +281,11 @@ function register(app, ctx) {
         // snapshots onto the line — a line placed at 5:55pm keeps its HH
         // price after 6:00pm, exactly like a rung check line.
         unit_price_cents: effectivePriceCents(mi, hhActive),
+        // The item's tax treatment snapshots alongside the price (the
+        // floor's ring-time discipline): a later menu edit to the rate
+        // or the inclusive flag never moves this order's read-backs.
+        tax_rate_bps: taxSnap.tax_rate_bps,
+        tax_inclusive: taxSnap.tax_inclusive ? true : false,
         station: mi.station || 'expediter',
       });
     }
@@ -266,8 +313,30 @@ function register(app, ctx) {
     }
 
     const subtotal = priced.reduce((s, l) => s + l.qty * l.unit_price_cents, 0);
-    const tax = Math.round(subtotal * taxRate());
-    const total = subtotal + tax;
+    /* Tax, computed exactly the way calcTotals computes a fee-free
+       check (online has no surcharge/service charge to allocate):
+       exclusive line totals group by effective rate (the line's
+       snapshot — bps/10000 is the identical double to the parsed site
+       rate, so classic all-default carts land in ONE group and this is
+       the identical Math.round(subtotal × rate) the pre-parity code
+       ran); inclusive lines back out PER LINE on the charged line
+       total, net = Math.round(lt / (1 + rate)), and their tax counts
+       in tax_cents but not again in the guest total. */
+    const siteRate = taxRate();
+    const taxGroups = new Map(); // rate (double) -> exclusive base cents
+    let taxIncluded = 0;
+    for (const l of priced) {
+      const lt = l.qty * l.unit_price_cents;
+      const rate = l.tax_rate_bps != null ? l.tax_rate_bps / 10000 : siteRate;
+      if (l.tax_inclusive && rate > 0) {
+        taxIncluded += lt - Math.round(lt / (1 + rate));
+      } else {
+        taxGroups.set(rate, (taxGroups.get(rate) || 0) + lt);
+      }
+    }
+    let tax = taxIncluded;
+    for (const [rate, base] of taxGroups) tax += Math.round(base * rate);
+    const total = subtotal + (tax - taxIncluded);
     const createdAt = nowIso();
     // Phase 1B money audit (concurrency): re-check 86 flags inside a write
     // transaction — an item 86'd between validation and INSERT must not
@@ -308,9 +377,9 @@ function register(app, ctx) {
       }
       const r = db.prepare(
         `INSERT INTO online_orders
-          (uuid, site_id, customer_name, phone, items_json, subtotal_cents, tax_cents, total_cents, status, pickup_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'placed', ?, ?)`
-      ).run(crypto.randomUUID(), SITE_ID, name, phone, JSON.stringify(priced), subtotal, tax, total, pickupAt, createdAt);
+          (uuid, site_id, customer_name, phone, items_json, subtotal_cents, tax_cents, tax_included_cents, total_cents, status, pickup_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed', ?, ?)`
+      ).run(crypto.randomUUID(), SITE_ID, name, phone, JSON.stringify(priced), subtotal, tax, taxIncluded, total, pickupAt, createdAt);
       orderId = r.lastInsertRowid;
       db.exec('COMMIT');
     } catch (e) {

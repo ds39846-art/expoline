@@ -9608,6 +9608,10 @@ require('./routes/online').register(app, {
   // exactly like a ring at the bar (see routes/online.js).
   effectivePriceCents, hhPricingActive, eightySixRefusal, consumeEightySixCountdown,
   broadcastMenuUpdated,
+  // Online tax parity: the floor's ring-time tax snapshot, so a web
+  // order freezes the item's rate/inclusive treatment at placement and
+  // taxes exactly like a fee-free check (see routes/online.js).
+  taxSnapshotOf,
 });
 
 /* Phase 4: proactive P&L insights + "Ask the restaurant anything" (manager-only).
