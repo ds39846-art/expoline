@@ -59,6 +59,7 @@ const { DatabaseSync } = require('node:sqlite');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const parityOrders = require('./routes/parity_orders');
+const parityKdsPay = require('./routes/parity_kds_pay');
 
 /* ------------------------------ boot: seed -------------------------------- */
 const ROOT = __dirname;
@@ -215,6 +216,38 @@ db.exec('PRAGMA busy_timeout=5000;');
   db.exec('CREATE INDEX IF NOT EXISTS idx_closeouts_site_date ON closeouts(site_id, business_date, status)');
 })();
 
+/* Cash-tip declarations (audit gap #6): ONE row per (server, business
+   date) — the server attests the cash tips they received that day, most
+   of which never pass through a payment record. The declared figure is
+   the figure of record for cash tips (it is what the tips report shows
+   as declared and what the shift review headlines); the recorded cash
+   tip_cents on payments stays as a memo figure. Amendments never
+   silently overwrite: declared_by/declared_at preserve the FIRST
+   declaration, updated_by/updated_at track the last writer, and every
+   write lands in approval_audit with before/after (see the declare
+   endpoint). A declaration writes ONLY this table — it mutates no
+   money figure, so it is exempt from the EOD day freeze (the frozen Z
+   snapshot is stored JSON and never recomputed); see shift review. */
+(() => {
+  db.exec(`CREATE TABLE IF NOT EXISTS tip_declarations (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT UNIQUE,
+    site_id TEXT,
+    user_id INTEGER,
+    business_date TEXT,
+    declared_cash_tips_cents INTEGER,
+    declared_by TEXT,
+    declared_by_id INTEGER,
+    declared_at TEXT,
+    updated_by TEXT,
+    updated_by_id INTEGER,
+    updated_at TEXT,
+    created_at TEXT,
+    UNIQUE(site_id, user_id, business_date)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_tip_declarations_site_date ON tip_declarations(site_id, business_date)');
+})();
+
 /* Time clock + CA break-compliance migration (phase 2). Runs on every boot;
    guards via PRAGMA / CREATE TABLE IF NOT EXISTS. Demo wage defaults are
    applied once (only where no rate is set); the manager sets real rates in
@@ -367,7 +400,7 @@ require('./routes/loyalty').migrate(db);
 require('./routes/kiosk').migrate(db);
 require('./routes/online').migrate(db);
 require('./routes/parity_orders').migrate(db);
-require('./routes/parity_kds_pay').migrate(db);
+parityKdsPay.migrate(db);
 
 /* Seed employees from existing users once SITE_ID is known (see below,
    after the config section — migrations above run before SITE_ID exists). */
@@ -1445,7 +1478,7 @@ app.use((req, res, next) => {
 /* Phase 3B public routes: guest QR order/pay/split + /g/:token page.
    Registered before the auth wall like kiosk (customer phones carry no staff
    token); hardened by rate limiting + full server-side validation. */
-require('./routes/parity_kds_pay').registerPublic(app, {
+parityKdsPay.registerPublic(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse,
   broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents,
   dayClosedToday,
@@ -3902,9 +3935,6 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot take payment on a ${check.status} check` });
-  /* EOD freeze: a new payment is dated today — once today is closed
-   * out, no new money may be dated into it (reopen the day first). */
-  if (!assertDayOpen(res, todaySite())) return;
 
   const { method, amount_cents, tip_cents = 0, tendered_cents, brand, last4, memo } = req.body || {};
   const TENDER_METHODS = ['cash', 'card_demo', 'house_account'];
@@ -3943,6 +3973,15 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
     const rp = idemReplay('payments', ikey);
     if (rp) return res.status(rp.status).json(rp.body);
   }
+
+  /* EOD freeze — AFTER the replay, matching the refund handler and the
+   * LAN payment op (audit gap #6 rider; EOD QA found this handler ran
+   * the freeze first, so a client retrying an already-applied payment
+   * on a closed-out day got a 409 instead of its stored response). A
+   * replay changes nothing and returns above; a genuinely NEW payment
+   * is dated today, and once today is closed out no new money may be
+   * dated into it (reopen the day first). */
+  if (!assertDayOpen(res, todaySite())) return;
 
   const totals = persistTotals(check.id);
   if (totals.balance <= 0) return res.status(400).json({ error: 'Check is already paid in full' });
@@ -4372,14 +4411,14 @@ app.get('/api/finance/payouts', managerOnly(), (req, res) => {
   });
 });
 
-app.get('/api/finance/shift', managerOnly(), (req, res) => {
-  const date = req.query.date || todaySite();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
-  const serverId = req.query.server_id != null ? Number(req.query.server_id) : null;
-  if (req.query.server_id != null && !isInt(serverId)) {
-    return res.status(400).json({ error: 'server_id must be an integer' });
-  }
-
+/** House-wide (serverId null) or per-server day figures over the checks
+ *  CLOSED on the date — the aggregation behind GET /api/finance/shift,
+ *  factored out so the shift review (audit gap #6) reads the very same
+ *  numbers instead of re-deriving them. Bucketing: checks by site-local
+ *  closed date (the sales bucketing); every payment on those checks
+ *  counts, whatever its own date. cash_owed_to_server_cents is the card
+ *  tips the house must pay out at checkout (servers keep cash tips). */
+function shiftDayFigures(date, serverId) {
   let sql = "SELECT * FROM checks WHERE site_id = ? AND status IN ('paid','closed') AND closed_at IS NOT NULL";
   const params = [SITE_ID];
   if (serverId != null) { sql += ' AND server_id = ?'; params.push(serverId); }
@@ -4403,22 +4442,244 @@ app.get('/api/finance/shift', managerOnly(), (req, res) => {
       }
     }
   }
-  // cash_owed_to_server: card tips the house must pay out to the server at
-  // checkout (servers keep their cash tips directly).
-  res.json({
-    demo: true,
-    note: DEMO_FINANCE_NOTE,
+  return {
     date,
     server_id: serverId,
     checks_closed: checks.length,
     subtotal_cents: subtotal,
     service_charge_cents: serviceCharge,
-    service_charge_note: 'Mandatory service charge is restaurant revenue, not a tip — it stays with the house and is taxed as part of the sale in CA. Confirm with your accountant.',
     tips_cents: tips,
     card_brand_breakdown: brandBreakdown,
     cash_sales_cents: cashSales,
     cash_owed_to_server_cents: cardTips,
+  };
+}
+
+app.get('/api/finance/shift', managerOnly(), (req, res) => {
+  const date = req.query.date || todaySite();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  const serverId = req.query.server_id != null ? Number(req.query.server_id) : null;
+  if (req.query.server_id != null && !isInt(serverId)) {
+    return res.status(400).json({ error: 'server_id must be an integer' });
+  }
+  const f = shiftDayFigures(date, serverId);
+  // cash_owed_to_server: card tips the house must pay out to the server at
+  // checkout (servers keep their cash tips directly).
+  res.json({
+    demo: true,
+    note: DEMO_FINANCE_NOTE,
+    date: f.date,
+    server_id: f.server_id,
+    checks_closed: f.checks_closed,
+    subtotal_cents: f.subtotal_cents,
+    service_charge_cents: f.service_charge_cents,
+    service_charge_note: 'Mandatory service charge is restaurant revenue, not a tip — it stays with the house and is taxed as part of the sale in CA. Confirm with your accountant.',
+    tips_cents: f.tips_cents,
+    card_brand_breakdown: f.card_brand_breakdown,
+    cash_sales_cents: f.cash_sales_cents,
+    cash_owed_to_server_cents: f.cash_owed_to_server_cents,
     cash_owed_to_server_note: 'Card tips the house owes the server at checkout (cash tips are kept directly)',
+  });
+});
+
+/* ---------------- shift review + cash-tip declarations -------------------
+ * Audit gap #6 (Toast/SpotOn parity): a server ends the day by reviewing
+ * their sales and tips and DECLARING the cash tips they received — an
+ * attestation that becomes the figure of record for their cash tips
+ * (most cash tips never pass through a payment record at all).
+ *
+ * SCOPE DECISION — server + business date, NOT a clock window. Every
+ * per-server money figure in this codebase is date-bucketed (tips report
+ * by payment date; finance/shift by check closed date; tip-out by check
+ * opened date; labor by clock-in date) and NO builder windows money by
+ * clock_in/clock_out. A clock-window review would need a new bucketing
+ * that disagrees with every report a manager reads. So the review is
+ * per server per business date — the IRS daily tip record is per day
+ * too — and lists the day clock windows alongside. Consequence, stated
+ * plainly: a server who works two clock shifts in one business day
+ * files ONE declaration and gets ONE combined review for the day.
+ *
+ * COMPOSITION FORMULA (the one place a double-count could hide — the
+ * recorded cash tip_cents must NEVER be added to the declaration):
+ *   cash_tips_of_record = declared_cash_tips_cents, when a declaration
+ *                         exists; otherwise the recorded cash tips
+ *                         (the pre-declaration fallback).
+ *   total_tips          = card_tips (recorded, tips report)
+ *                         + cash_tips_of_record.
+ * The recorded cash figure is always shown as its own memo row.
+ *
+ * EOD INTERPLAY — declarations are EXEMPT from the day freeze, on
+ * purpose: a declaration writes ONLY the tip_declarations table. It
+ * cannot move any money figure (payments, checks, totals are never
+ * touched), and a frozen Z snapshot is stored JSON that is never
+ * recomputed — a late declaration changes the LIVE tips report (its
+ * declared column) but never the frozen snapshot. Freezing declarations
+ * would strand the common case (server declares after the manager ran
+ * the Z) behind a full day-reopen that unfreezes ALL money — a worse
+ * integrity posture. The exemption is visible: reviews of a closed date
+ * carry day_closed, and manager amendments still need a fresh PIN.
+ *
+ * TIP-OUT BOUNDARY (locked policy): the tip-out computation is NOT
+ * touched — the review reads the per-server row out of the very same
+ * tipoutReport() the /api/tipout/report route serves. Declarations do
+ * not feed tip-out. */
+function declarationView(row) {
+  if (!row) return null;
+  return {
+    id: row.id, server_id: row.user_id, date: row.business_date,
+    declared_cash_tips_cents: row.declared_cash_tips_cents,
+    declared_by: row.declared_by, declared_at: row.declared_at,
+    updated_by: row.updated_by, updated_at: row.updated_at,
+  };
+}
+
+function declarationFor(serverId, date) {
+  return db.prepare('SELECT * FROM tip_declarations WHERE site_id = ? AND user_id = ? AND business_date = ?')
+    .get(SITE_ID, serverId, date) || null;
+}
+
+/** POST /api/finance/tip-declarations {declared_cash_tips_cents, date?,
+ *  server_id?, manager_pin?} — declare (or amend) the cash-tip figure of
+ *  record for one server + business date. Own declaration: your session
+ *  is the attestation, no PIN. Someone else's: manager role + a FRESH
+ *  manager PIN (the tip-adjust idiom), approver recorded. Every write
+ *  is approval-audited with before/after; the first declarant is kept
+ *  on the row (declared_by/declared_at), the last writer in updated_*. */
+app.post('/api/finance/tip-declarations', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const date = b.date != null ? String(b.date) : todaySite();
+  if (!DATE_FMT_RE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  if (date > todaySite()) return res.status(400).json({ error: 'Cannot declare cash tips for a future date' });
+  const v = b.declared_cash_tips_cents;
+  if (!isInt(v) || v < 0) {
+    return res.status(400).json({ error: 'declared_cash_tips_cents must be a non-negative integer (whole cents)' });
+  }
+  const targetId = b.server_id != null ? Number(b.server_id) : req.user.id;
+  if (!isInt(targetId)) return res.status(400).json({ error: 'server_id must be an integer' });
+  const target = db.prepare('SELECT id, name, role FROM users WHERE id = ? AND site_id = ?').get(targetId, SITE_ID);
+  if (!target) return res.status(404).json({ error: 'Unknown server' });
+
+  let approver = req.user.name;
+  if (targetId !== req.user.id) {
+    if (req.user.role !== 'manager') {
+      return res.status(403).json({ error: 'You can only declare your own cash tips' });
+    }
+    const mgr = verifyManagerPin(b.manager_pin);
+    if (!mgr) {
+      recordManagerPinAttempt(req, false);
+      return res.status(403).json({ error: 'A fresh manager PIN is required to amend another server\u2019s declaration', need_manager_pin: true });
+    }
+    recordManagerPinAttempt(req, true);
+    approver = mgr.name;
+  }
+
+  const now = nowIso();
+  const existing = declarationFor(targetId, date);
+  if (!existing) {
+    const r = db.prepare(`INSERT INTO tip_declarations (uuid, site_id, user_id, business_date, declared_cash_tips_cents,
+        declared_by, declared_by_id, declared_at, updated_by, updated_by_id, updated_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(crypto.randomUUID(), SITE_ID, targetId, date, v,
+        req.user.name, req.user.id, now, req.user.name, req.user.id, now, now);
+    const row = db.prepare('SELECT * FROM tip_declarations WHERE id = ?').get(r.lastInsertRowid);
+    auditApproval(req, 'declare_cash_tips', {}, {
+      approver, server_id: targetId, server_name: target.name, date,
+      before: null, after: { declared_cash_tips_cents: v },
+    });
+    return res.status(201).json({ declaration: declarationView(row) });
+  }
+  db.prepare('UPDATE tip_declarations SET declared_cash_tips_cents = ?, updated_by = ?, updated_by_id = ?, updated_at = ? WHERE id = ?')
+    .run(v, req.user.name, req.user.id, now, existing.id);
+  const row = db.prepare('SELECT * FROM tip_declarations WHERE id = ?').get(existing.id);
+  auditApproval(req, 'amend_cash_tips', {}, {
+    approver, server_id: targetId, server_name: target.name, date,
+    before: { declared_cash_tips_cents: existing.declared_cash_tips_cents },
+    after: { declared_cash_tips_cents: v },
+  });
+  return res.json({ declaration: declarationView(row), amended: true });
+});
+
+/** GET /api/finance/shift-review?date=&server_id= — one server + one
+ *  business date, composed ENTIRELY from the existing builders:
+ *  sales from shiftDayFigures (the finance/shift aggregation), recorded
+ *  tips from the tips report builder, tip-out from tipoutReport() (the
+ *  /api/tipout/report computation), labor from clockCompute via
+ *  shiftView. A server reads their own review; a manager reads anyone's
+ *  (the finance/shift gate pattern, widened to the subject themselves). */
+app.get('/api/finance/shift-review', serverPlus(), (req, res) => {
+  const date = req.query.date || todaySite();
+  if (!DATE_FMT_RE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  const targetId = req.query.server_id != null ? Number(req.query.server_id) : req.user.id;
+  if (!isInt(targetId)) return res.status(400).json({ error: 'server_id must be an integer' });
+  if (targetId !== req.user.id && req.user.role !== 'manager') {
+    return res.status(403).json({ error: 'You can only review your own shift' });
+  }
+  const target = db.prepare('SELECT id, name, role FROM users WHERE id = ? AND site_id = ?').get(targetId, SITE_ID);
+  if (!target) return res.status(404).json({ error: 'Unknown server' });
+
+  const sales = shiftDayFigures(date, targetId);
+  const tipsRow = REPORT_DEFS.tips.build(date, date).rows.find((r) => r.server_id === targetId) || null;
+  const cardTips = tipsRow ? tipsRow.card_tips_cents || 0 : 0;
+  const recordedCashTips = tipsRow ? tipsRow.cash_tips_cents || 0 : 0;
+  const decl = declarationFor(targetId, date);
+  const declared = decl ? decl.declared_cash_tips_cents : null;
+  // THE composition formula (see the section header): the declaration,
+  // when one exists, IS the cash figure of record; the recorded cash
+  // tips are only the fallback before anyone declares — never a sum.
+  const cashOfRecord = declared != null ? declared : recordedCashTips;
+  const toRow = parityKdsPay.tipoutReport(db, SITE_ID, date, tzDate).servers.find((s) => s.server_id === targetId) || null;
+  const openChecks = db.prepare("SELECT id FROM checks WHERE site_id = ? AND server_id = ? AND status = 'open' ORDER BY id").all(SITE_ID, targetId);
+  const cfg = clockConfig();
+  const dayShifts = db.prepare('SELECT * FROM clock_shifts WHERE site_id = ? AND user_id = ? ORDER BY clock_in, id')
+    .all(SITE_ID, targetId).filter((s) => tzDate(s.clock_in) === date);
+  const shiftViews = dayShifts.map((s) => shiftView(s, breaksFor(s.id), cfg));
+
+  res.json({
+    scope: 'server_business_date',
+    date,
+    server_id: targetId,
+    server_name: target.name,
+    day_closed: isDayClosed(date),
+    sales: {
+      checks_closed: sales.checks_closed,
+      subtotal_cents: sales.subtotal_cents,
+      service_charge_cents: sales.service_charge_cents,
+      cash_sales_cents: sales.cash_sales_cents,
+      card_brand_breakdown: sales.card_brand_breakdown,
+    },
+    tips: {
+      card_tips_cents: cardTips,
+      recorded_cash_tips_cents: recordedCashTips,
+      declared_cash_tips_cents: declared,
+      declared: declared != null,
+      cash_tips_of_record_cents: cashOfRecord,
+      total_tips_cents: cardTips + cashOfRecord,
+      cash_owed_to_server_cents: cardTips,
+    },
+    tipout: toRow ? {
+      tips_cents: toRow.tips_cents,
+      food_sales_cents: toRow.food_sales_cents,
+      gross_sales_cents: toRow.gross_sales_cents,
+      tipouts: toRow.tipouts,
+      total_tipout_cents: toRow.total_tipout_cents,
+      net_tips_cents: toRow.net_tips_cents,
+    } : null,
+    open_checks: { count: openChecks.length, check_ids: openChecks.map((c) => c.id) },
+    labor: {
+      shifts: shiftViews.map((v) => ({
+        id: v.id, clock_in: v.clock_in, clock_out: v.clock_out, open: v.open,
+        hours: v.hours, total_cents: v.pay.total_cents,
+      })),
+      hours: r2(shiftViews.reduce((a, v) => a + (v.hours || 0), 0)),
+      total_cents: shiftViews.reduce((a, v) => a + (v.pay.total_cents || 0), 0),
+    },
+    declaration: declarationView(decl),
+    notes: [
+      'Scope: one server + one business date (two clock shifts in a day review together). Sales bucket by check closed date; recorded tips by payment date; tip-out by check opened date — the bucketing each source report already uses.',
+      'Declared cash tips are the figure of record for cash tips once filed; recorded cash tips stay as a memo and are never added to the declaration.',
+      'Tip-out is read-only from the tip-out report (completed payments only) — the declaration does not change it.',
+      'Cash owed to the server is the card tips: cash tips are already in the server\u2019s pocket.',
+    ],
   });
 });
 
@@ -4720,15 +4981,17 @@ const REPORT_DEFS = {
   tips: {
     title: 'Tips',
     notes: ['Tips are not sales and are not taxed. Cash tips are kept by the server directly; card tips are paid out by the house at checkout.',
-      'The mandatory service charge is NOT a tip and never appears here — it is restaurant revenue, never auto-distributed as tips; any distribution to staff follows house policy, not this report.'],
+      'The mandatory service charge is NOT a tip and never appears here — it is restaurant revenue, never auto-distributed as tips; any distribution to staff follows house policy, not this report.',
+      'Declared cash tips are the server attested figure of record for cash tips (shift review, audit gap #6) — most cash tips never pass through a payment record. The Cash tips column stays the RECORDED figure from payments; the two are never added together. A server who declared but recorded no payment tips still gets a row.'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'server_name', label: 'Server', kind: 'text' },
       { key: 'cash_tips_cents', label: 'Cash tips', kind: 'money' },
       { key: 'card_tips_cents', label: 'Card tips', kind: 'money' },
       { key: 'total_tips_cents', label: 'Total tips', kind: 'money' },
+      { key: 'declared_cash_tips_cents', label: 'Declared cash tips', kind: 'money' },
     ],
-    totalKeys: ['cash_tips_cents', 'card_tips_cents', 'total_tips_cents'],
+    totalKeys: ['cash_tips_cents', 'card_tips_cents', 'total_tips_cents', 'declared_cash_tips_cents'],
     build(from, to) {
       const serverByCheck = new Map();
       for (const c of db.prepare('SELECT id, server_id FROM checks WHERE site_id = ?').all(SITE_ID)) serverByCheck.set(c.id, c.server_id);
@@ -4739,13 +5002,27 @@ const REPORT_DEFS = {
         const d = tzDate(p.created_at);
         if (!d || d < from || d > to) continue;
         if (!(p.tip_cents > 0)) continue;
-        const nm = nameByUser.get(serverByCheck.get(p.check_id)) || 'Unknown';
+        const sid = serverByCheck.get(p.check_id);
+        const nm = nameByUser.get(sid) || 'Unknown';
         const k = d + '|' + nm;
-        if (!byKey.has(k)) byKey.set(k, { date: d, server_name: nm, cash_tips_cents: 0, card_tips_cents: 0, total_tips_cents: 0 });
+        if (!byKey.has(k)) byKey.set(k, { date: d, server_name: nm, server_id: sid != null ? sid : null, cash_tips_cents: 0, card_tips_cents: 0, total_tips_cents: 0, declared_cash_tips_cents: 0 });
         const r = byKey.get(k);
         if (p.method === 'cash' || p.method === 'gift_card') r.cash_tips_cents += p.tip_cents;
         else r.card_tips_cents += p.tip_cents;
         r.total_tips_cents += p.tip_cents;
+      }
+      /* Declared cash tips join by (business date, server) from the
+       * declarations table — an ATTESTATION figure riding alongside the
+       * recorded columns, never folded into them. A declaration with no
+       * recorded payment tips that day still produces a row (zeros +
+       * the declared figure), so a declaration is never invisible. */
+      for (const decl of db.prepare('SELECT * FROM tip_declarations WHERE site_id = ?').all(SITE_ID)) {
+        const d = decl.business_date;
+        if (!d || d < from || d > to) continue;
+        const nm = nameByUser.get(decl.user_id) || 'Unknown';
+        const k = d + '|' + nm;
+        if (!byKey.has(k)) byKey.set(k, { date: d, server_name: nm, server_id: decl.user_id, cash_tips_cents: 0, card_tips_cents: 0, total_tips_cents: 0, declared_cash_tips_cents: 0 });
+        byKey.get(k).declared_cash_tips_cents = decl.declared_cash_tips_cents || 0;
       }
       const rows = [...byKey.values()].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.server_name.localeCompare(b.server_name));
       return { rows, extraTables: [] };
@@ -5172,6 +5449,11 @@ function buildZSnapshot(date, cash) {
         cash_tips_cents: tipsTotalsRaw.cash_tips_cents || 0,
         card_tips_cents: tipsTotalsRaw.card_tips_cents || 0,
         total_tips_cents: tipsTotalsRaw.total_tips_cents || 0,
+        /* The declared-cash-tips total rides the builder pass-through
+         * like the other three (audit gap #6) — the snapshot stores
+         * what the tips builder reported at close time. A declaration
+         * filed AFTER the close never rewrites this frozen figure. */
+        declared_cash_tips_cents: tipsTotalsRaw.declared_cash_tips_cents || 0,
       },
     },
     payments_by_method: agg.by_method,
@@ -8201,6 +8483,8 @@ const API_DOCS = [
   { method: 'GET', path: '/api/kds/recall', auth: 'kitchen+', summary: 'Recall bumped tickets', params: '—' },
   { method: 'GET', path: '/api/finance/payouts', auth: 'manager', summary: 'Honest payout reconciliation', params: 'date?' },
   { method: 'GET', path: '/api/finance/shift', auth: 'manager', summary: 'Shift report: sales, tips, cash owed', params: 'date?, server_id?' },
+  { method: 'GET', path: '/api/finance/shift-review', auth: 'server+ (own) / manager (any)', summary: 'Shift review: one server + one business date — sales, recorded + declared tips, tip-out, open checks, labor', params: 'date?, server_id?' },
+  { method: 'POST', path: '/api/finance/tip-declarations', auth: 'server+ (own) / manager + fresh PIN (another server)', summary: 'Declare or amend the cash-tip figure of record for a server + business date (approval-audited)', params: 'declared_cash_tips_cents, date?, server_id?, manager_pin?' },
   { method: 'GET', path: '/api/finance/reports/:report', auth: 'manager', summary: 'sales|payouts|tax|labor|tips export', params: 'period|from&to, format=xlsx|csv|pdf|docx|json' },
   { method: 'GET', path: '/api/finance/close-day', auth: 'manager', summary: 'EOD day status: closed out?, the close-out if so, expected cash for the date', params: 'date?' },
   { method: 'POST', path: '/api/finance/close-day', auth: 'manager (+fresh manager PIN)', summary: 'Z close-out: snapshot the day from the report builders, count cash vs expected, lock the business date', params: 'date?, counted_cash_cents, manager_pin, note?' },
@@ -8320,7 +8604,7 @@ require('./routes/insights').register(app, {
 
 /* Phase 3B staff routes: KDS aging settings/alerts, tip-out rules + report,
    delivery aggregation, cash-collect requests, guest-split reverse, table QR. */
-require('./routes/parity_kds_pay').registerStaff(app, {
+parityKdsPay.registerStaff(app, {
   db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
   persistTotals, checkResponse, broadcastCheckUpdated, broadcastTicket, ticketView,
   effectivePriceCents, dayClosedToday, isDayClosed,

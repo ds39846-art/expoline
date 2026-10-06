@@ -212,6 +212,29 @@ CREATE TABLE closeouts (
 
 CREATE INDEX idx_closeouts_site_date ON closeouts(site_id, business_date, status);
 
+/* Cash-tip declarations (audit gap #6): one row per (server, business
+   date); the server attested cash-tip figure of record. Amendments are
+   approval-audited with before/after; the first declarant is preserved
+   in declared_by/declared_at, the last writer in updated_by/updated_at. */
+CREATE TABLE tip_declarations (
+  id INTEGER PRIMARY KEY,
+  uuid TEXT UNIQUE,
+  site_id TEXT,
+  user_id INTEGER,
+  business_date TEXT,
+  declared_cash_tips_cents INTEGER,
+  declared_by TEXT,
+  declared_by_id INTEGER,
+  declared_at TEXT,
+  updated_by TEXT,
+  updated_by_id INTEGER,
+  updated_at TEXT,
+  created_at TEXT,
+  UNIQUE(site_id, user_id, business_date)
+);
+
+CREATE INDEX idx_tip_declarations_site_date ON tip_declarations(site_id, business_date);
+
 /* House accounts (LOCKED POLICY 2026-09-27: manager-created only).
    A house_account tender must name an existing ACTIVE account; servers
    cannot invent accounts at payment time. */

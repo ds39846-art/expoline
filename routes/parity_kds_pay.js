@@ -587,6 +587,94 @@ function registerPublic(app, ctx) {
   });
 }
 
+/* ------------------------- tip-out computation ---------------------------
+ * The tip-out report math lives at module scope (not inside the route
+ * closure) so the host (server.js shift review, audit gap #6) computes
+ * the per-server figure from the SAME code the /api/tipout/report route
+ * serves — one computation, two readers, never a divergent re-derivation.
+ * Buckets: servers/checks by site-local date of check opened_at, tips by
+ * site-local date of payment created_at, completed payments only.
+ * READ-ONLY: nothing here is affected by cash-tip declarations. */
+function tipoutRuleView(r) {
+  return {
+    id: r.id, name: r.name, role: r.role, basis: r.basis,
+    pct_bps: r.pct_bps, pct: r.pct_bps / 100, active: !!r.active, created_at: r.created_at,
+  };
+}
+
+function tipoutReport(db, SITE_ID, date, siteDateOf) {
+  const rules = db.prepare(
+    'SELECT * FROM tipout_rules WHERE site_id = ? AND active = 1 ORDER BY id'
+  ).all(SITE_ID);
+
+  const servers = [];
+  {
+    const seen = new Set();
+    const rows = db.prepare(
+      `SELECT c.server_id AS id, u.name, c.opened_at FROM checks c
+       JOIN users u ON u.id = c.server_id
+       WHERE c.site_id = ? AND c.status IN ('paid','closed')`
+    ).all(SITE_ID);
+    for (const r of rows) {
+      if (siteDateOf(r.opened_at) !== date || seen.has(r.id)) continue;
+      seen.add(r.id);
+      servers.push({ id: r.id, name: r.name });
+    }
+  }
+
+  const itemStmt = db.prepare(
+    `SELECT ci.qty, ci.unit_price_cents, ci.modifiers_json, ci.course
+     FROM check_items ci WHERE ci.check_id = ? AND ci.state IN ('held','sent','fulfilled')`
+  );
+  const tipStmt = db.prepare(
+    `SELECT p.tip_cents AS tip, p.created_at FROM payments p
+     JOIN checks c ON c.id = p.check_id
+     WHERE p.site_id = ? AND c.server_id = ? AND p.status = 'completed'`
+  );
+
+  const serverRows = [];
+  const byRole = {};
+  let grandTipout = 0;
+  for (const s of servers) {
+    /* Sales bases come from PAID/CLOSED checks only — open (unpaid) checks
+     * must not inflate tip-outs. */
+    const checks = db.prepare(
+      "SELECT id, opened_at FROM checks WHERE site_id = ? AND server_id = ? AND status IN ('paid','closed')"
+    ).all(SITE_ID, s.id).filter((c) => siteDateOf(c.opened_at) === date);
+    let foodSales = 0, grossSales = 0;
+    for (const c of checks) {
+      for (const it of itemStmt.all(c.id)) {
+        const line = lineCents(it);
+        grossSales += line;
+        if (it.course !== 'drink') foodSales += line;
+      }
+    }
+    const tips = tipStmt.all(SITE_ID, s.id)
+      .filter((p) => siteDateOf(p.created_at) === date)
+      .reduce((a, p) => a + (p.tip || 0), 0);
+    const basisOf = { food_sales: foodSales, gross_sales: grossSales, tips };
+    const tipouts = rules.map((r) => {
+      const owed = Math.round(basisOf[r.basis] * r.pct_bps / 10000);
+      byRole[r.role] = (byRole[r.role] || 0) + owed;
+      grandTipout += owed;
+      return { rule_id: r.id, name: r.name, role: r.role, basis: r.basis, pct_bps: r.pct_bps, basis_cents: basisOf[r.basis], owed_cents: owed };
+    });
+    const totalTipout = tipouts.reduce((a, t) => a + t.owed_cents, 0);
+    serverRows.push({
+      server_id: s.id, server_name: s.name,
+      tips_cents: tips, food_sales_cents: foodSales, gross_sales_cents: grossSales,
+      tipouts, total_tipout_cents: totalTipout, net_tips_cents: tips - totalTipout,
+    });
+  }
+  return {
+    date,
+    rules: rules.map(tipoutRuleView),
+    servers: serverRows,
+    by_role: Object.entries(byRole).map(([role, total_owed_cents]) => ({ role, total_owed_cents })),
+    total_tipout_cents: grandTipout,
+  };
+}
+
 /* ============================ STAFF (behind auth wall) ============================ */
 function registerStaff(app, ctx) {
   const { db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
@@ -667,10 +755,7 @@ function registerStaff(app, ctx) {
   });
 
   /* ---- Tip-out rules (pooling rules as data) ---- */
-  const ruleView = (r) => ({
-    id: r.id, name: r.name, role: r.role, basis: r.basis,
-    pct_bps: r.pct_bps, pct: r.pct_bps / 100, active: !!r.active, created_at: r.created_at,
-  });
+  const ruleView = tipoutRuleView;
 
   app.get('/api/tipout/rules', managerOnly(), (req, res) => {
     const rows = db.prepare(
@@ -723,82 +808,15 @@ function registerStaff(app, ctx) {
 
   /* ---- Tip-out report: auto-computed at shift review, no spreadsheet. ----
      Per server per date: tips earned + food/gross sales, rules applied in
-     integer cents (basis × pct_bps / 10000, rounded). */
+     integer cents (basis × pct_bps / 10000, rounded). The computation is
+     the module-scope tipoutReport() above — the host shift review reads
+     the same figures from it (audit gap #6). */
   app.get('/api/tipout/report', managerOnly(), (req, res) => {
     const date = req.query.date;
     if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
     }
-    const rules = db.prepare(
-      'SELECT * FROM tipout_rules WHERE site_id = ? AND active = 1 ORDER BY id'
-    ).all(SITE_ID);
-
-    const servers = [];
-    {
-      const seen = new Set();
-      const rows = db.prepare(
-        `SELECT c.server_id AS id, u.name, c.opened_at FROM checks c
-         JOIN users u ON u.id = c.server_id
-         WHERE c.site_id = ? AND c.status IN ('paid','closed')`
-      ).all(SITE_ID);
-      for (const r of rows) {
-        if (siteDateOf(r.opened_at) !== date || seen.has(r.id)) continue;
-        seen.add(r.id);
-        servers.push({ id: r.id, name: r.name });
-      }
-    }
-
-    const itemStmt = db.prepare(
-      `SELECT ci.qty, ci.unit_price_cents, ci.modifiers_json, ci.course
-       FROM check_items ci WHERE ci.check_id = ? AND ci.state IN ('held','sent','fulfilled')`
-    );
-    const tipStmt = db.prepare(
-      `SELECT p.tip_cents AS tip, p.created_at FROM payments p
-       JOIN checks c ON c.id = p.check_id
-       WHERE p.site_id = ? AND c.server_id = ? AND p.status = 'completed'`
-    );
-
-    const serverRows = [];
-    const byRole = {};
-    let grandTipout = 0;
-    for (const s of servers) {
-      /* Sales bases come from PAID/CLOSED checks only — open (unpaid) checks
-       * must not inflate tip-outs. */
-      const checks = db.prepare(
-        "SELECT id, opened_at FROM checks WHERE site_id = ? AND server_id = ? AND status IN ('paid','closed')"
-      ).all(SITE_ID, s.id).filter((c) => siteDateOf(c.opened_at) === date);
-      let foodSales = 0, grossSales = 0;
-      for (const c of checks) {
-        for (const it of itemStmt.all(c.id)) {
-          const line = lineCents(it);
-          grossSales += line;
-          if (it.course !== 'drink') foodSales += line;
-        }
-      }
-      const tips = tipStmt.all(SITE_ID, s.id)
-        .filter((p) => siteDateOf(p.created_at) === date)
-        .reduce((a, p) => a + (p.tip || 0), 0);
-      const basisOf = { food_sales: foodSales, gross_sales: grossSales, tips };
-      const tipouts = rules.map((r) => {
-        const owed = Math.round(basisOf[r.basis] * r.pct_bps / 10000);
-        byRole[r.role] = (byRole[r.role] || 0) + owed;
-        grandTipout += owed;
-        return { rule_id: r.id, name: r.name, role: r.role, basis: r.basis, pct_bps: r.pct_bps, basis_cents: basisOf[r.basis], owed_cents: owed };
-      });
-      const totalTipout = tipouts.reduce((a, t) => a + t.owed_cents, 0);
-      serverRows.push({
-        server_id: s.id, server_name: s.name,
-        tips_cents: tips, food_sales_cents: foodSales, gross_sales_cents: grossSales,
-        tipouts, total_tipout_cents: totalTipout, net_tips_cents: tips - totalTipout,
-      });
-    }
-    res.json({
-      date,
-      rules: rules.map(ruleView),
-      servers: serverRows,
-      by_role: Object.entries(byRole).map(([role, total_owed_cents]) => ({ role, total_owed_cents })),
-      total_tipout_cents: grandTipout,
-    });
+    res.json(tipoutReport(db, SITE_ID, date, siteDateOf));
   });
 
   /* ---- Delivery-order aggregation: SAME single KDS queue, no tablet farm ---- */
@@ -1005,4 +1023,4 @@ function priceGuestLines(db, siteId, items, effPrice) {
   return { lines };
 }
 
-module.exports = { migrate, registerPublic, registerStaff };
+module.exports = { migrate, registerPublic, registerStaff, tipoutReport };

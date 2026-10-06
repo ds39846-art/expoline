@@ -3316,6 +3316,40 @@ function overShortPreview(countedStr, expectedCents) {
   return { counted_cents: p.cents, over_short_cents: p.cents - (expectedCents || 0) };
 }
 
+/* Shift review helpers (audit gap #6): the declared-cash parser for the
+   declaration field (same typed-dollars idiom — integer cents or an
+   honest error, never NaN) and the tips composition the review
+   headlines. The composition mirrors the server rule exactly: once a
+   declaration exists it IS the cash figure of record, and the recorded
+   cash tips from payments are only the fallback before anyone declares
+   — the two are never added together, so the headline can never
+   double-count cash tips. */
+function parseDeclaredCash(str) {
+  const raw = String(str == null ? '' : str).trim();
+  if (!raw) return { error: 'Enter the cash tips you received' };
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return { error: 'Enter cash tips as dollars, e.g. 42.50' };
+  if (v < 0) return { error: 'Declared cash tips cannot be negative' };
+  return { cents: Math.round(v * 100) };
+}
+
+function tipsOfRecord(cardCents, recordedCashCents, declaredCents) {
+  const declared = declaredCents != null;
+  const cashOfRecord = declared ? declaredCents : (recordedCashCents || 0);
+  return {
+    declared,
+    cash_of_record_cents: cashOfRecord,
+    total_tips_cents: (cardCents || 0) + cashOfRecord,
+  };
+}
+
+function declaredTipsPreview(cardCents, recordedCashCents, declaredStr) {
+  const p = parseDeclaredCash(declaredStr);
+  if (p.error) return { error: p.error };
+  const t = tipsOfRecord(cardCents, recordedCashCents, p.cents);
+  return { declared_cents: p.cents, cash_of_record_cents: t.cash_of_record_cents, total_tips_cents: t.total_tips_cents };
+}
+
 /* Discount library (audit gap #4): three small helpers carry the
    client logic for the floor picker and the settings editor. The
    value label renders a definition the way staff say it. The savings
@@ -5637,7 +5671,7 @@ const ckElapsedFmt = (h) => {
 
 async function renderClock(app) {
   app.innerHTML = '<div class="view-head"><h1>Time clock</h1><span class="spacer"></span><span class="muted small" id="clock-now"></span></div>' +
-    '<div id="clock-body"><p class="muted">Loading…</p></div>';
+    '<div id="clock-body"><p class="muted">Loading…</p></div><div id="sr-section"></div>';
   const body = $('#clock-body');
   const tickNow = () => { const c = $('#clock-now'); if (c) c.textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); };
   tickNow();
@@ -5727,9 +5761,133 @@ async function renderClock(app) {
   };
 
   await load();
+  wireShiftReview();
   const iv1 = setInterval(load, CLOCK_POLL_MS);
   const iv2 = setInterval(tickNow, 20000);
   app._cleanup = () => { clearInterval(iv1); clearInterval(iv2); };
+}
+
+/* ============================================================
+   SHIFT REVIEW + CASH-TIP DECLARATION (audit gap #6) — lives on
+   the Clock view, where the shift starts and ends: review the day
+   (sales, recorded tips, tip-out, labor, open checks) and declare
+   the cash tips received. Scope is one server + one business date.
+   A server sees only their own review; a manager can pick any
+   server and amends their declaration through the fresh-PIN modal
+   (the server refuses a cross-server declaration without one).
+   ============================================================ */
+function shiftReviewHtml(r, sr) {
+  const t = r.tips || {};
+  const declared = t.declared_cash_tips_cents != null;
+  const brandRows = Object.keys(r.sales.card_brand_breakdown || {}).map((b) =>
+    '<tr><td>' + esc(b) + ' sales</td><td class="num">' + fmt(r.sales.card_brand_breakdown[b]) + '</td></tr>').join('');
+  const laborRows = (r.labor.shifts || []).map((s) =>
+    '<tr><td>' + esc(fmtClock(s.clock_in)) + ' – ' + (s.clock_out ? esc(fmtClock(s.clock_out)) : 'still in') + '</td><td class="num">' + (Math.round((s.hours || 0) * 100) / 100) + ' h</td></tr>').join('');
+  const tipoutRows = r.tipout
+    ? '<tr><td>Tips (tip-out basis)</td><td class="num">' + fmt(r.tipout.tips_cents) + '</td></tr>' +
+      '<tr><td>Tip-out owed</td><td class="num">' + fmt(r.tipout.total_tipout_cents) + '</td></tr>' +
+      '<tr><td>Net tips after tip-out</td><td class="num">' + fmt(r.tipout.net_tips_cents) + '</td></tr>'
+    : '<tr><td colspan="2" class="muted">No tip-out activity for this date.</td></tr>';
+  const serverPicker = sr.isManager
+    ? '<label class="muted small">Server <select id="sr-server" class="date-in">' +
+      sr.users.map((u) => '<option value="' + u.id + '"' + (u.id === sr.serverId ? ' selected' : '') + '>' + esc(u.name) + ' (' + esc(u.role) + ')</option>').join('') +
+      '</select></label>'
+    : '';
+  return '<div class="card mt"><h2>Shift review — ' + esc(r.server_name) + '</h2>' +
+    '<div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">' +
+    '<label class="muted small">Date <input type="date" id="sr-date" class="date-in" value="' + esc(sr.date) + '"></label>' + serverPicker +
+    '<span class="muted small">One business date — sales, tips, tip-out and labor for the day.</span></div>' +
+    (r.day_closed ? '<p class="muted small" style="margin-top:8px">This date is closed out (Z). Declarations are still accepted — a declaration never changes the frozen close-out figures.</p>' : '') +
+    '<div class="report-grid" style="margin-top:10px">' +
+    '<div><h3>Sales</h3><table class="fin-table">' +
+    '<tr><td>Checks closed</td><td class="num">' + r.sales.checks_closed + '</td></tr>' +
+    '<tr><td>Subtotal</td><td class="num">' + fmt(r.sales.subtotal_cents) + '</td></tr>' +
+    '<tr><td>Service charge</td><td class="num">' + fmt(r.sales.service_charge_cents) + '</td></tr>' +
+    '<tr><td>Cash sales</td><td class="num">' + fmt(r.sales.cash_sales_cents) + '</td></tr>' + brandRows +
+    '<tr><td>Open checks still held</td><td class="num">' + r.open_checks.count + '</td></tr></table></div>' +
+    '<div><h3>Tips</h3><table class="fin-table">' +
+    '<tr><td>Card tips</td><td class="num">' + fmt(t.card_tips_cents) + '</td></tr>' +
+    '<tr><td>Cash tips recorded on payments <span class="lbl-note">memo</span></td><td class="num">' + fmt(t.recorded_cash_tips_cents) + '</td></tr>' +
+    '<tr><td>Cash tips declared</td><td class="num">' + (declared ? fmt(t.declared_cash_tips_cents) : '<span class="muted">Not declared</span>') + '</td></tr>' +
+    '<tr><td>Cash tips of record</td><td class="num">' + fmt(t.cash_tips_of_record_cents) + '</td></tr>' +
+    '<tr class="result"><td>Total tips</td><td class="num">' + fmt(t.total_tips_cents) + '</td></tr>' +
+    '<tr><td>Card tips owed to server <span class="lbl-note">paid out at checkout</span></td><td class="num">' + fmt(t.cash_owed_to_server_cents) + '</td></tr></table></div>' +
+    '<div><h3>Tip-out</h3><table class="fin-table">' + tipoutRows + '</table>' +
+    '<p class="muted small">Read-only from the tip-out report — a declaration does not change tip-out.</p></div>' +
+    '<div><h3>Labor</h3><table class="fin-table">' +
+    (laborRows || '<tr><td colspan="2" class="muted">No clock shifts this date.</td></tr>') +
+    '<tr class="result"><td>Total hours</td><td class="num">' + (Math.round((r.labor.hours || 0) * 100) / 100) + ' h</td></tr></table></div>' +
+    '</div>' +
+    '<h3 style="margin-top:12px">' + (sr.serverId === sr.meId ? 'Declare your cash tips' : 'Declare cash tips for ' + esc(r.server_name)) + '</h3>' +
+    '<p class="muted small">The cash tips you actually received — most never pass through a payment. Once declared, this is the figure of record; the recorded amount above stays as a memo and the two are never added together.</p>' +
+    '<div class="row" style="gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">' +
+    '<input type="text" id="sr-amt" inputmode="decimal" placeholder="0.00" style="max-width:160px" value="' + (declared ? (t.declared_cash_tips_cents / 100).toFixed(2) : '') + '">' +
+    '<button class="btn btn-primary" id="sr-declare">' + (declared ? 'Update declaration' : 'Declare cash tips') + '</button>' +
+    '<span class="muted small" id="sr-prev"></span></div>' +
+    (declared && r.declaration ? '<p class="muted small" style="margin-top:6px">Declared by ' + esc(r.declaration.declared_by) + ' · last updated by ' + esc(r.declaration.updated_by) + '</p>' : '') +
+    '</div>';
+}
+
+async function wireShiftReview() {
+  const host = $('#sr-section');
+  if (!host) return;
+  const me = state.user;
+  const sr = { date: await siteDate(), serverId: me.id, meId: me.id, isManager: me.role === 'manager', users: [] };
+  if (sr.isManager) {
+    try { sr.users = await api('/api/admin/clock/users'); } catch (e) { sr.users = [{ id: me.id, name: me.name, role: me.role }]; }
+  }
+  const draw = async () => {
+    let r;
+    try {
+      r = await api('/api/finance/shift-review?date=' + encodeURIComponent(sr.date) + (sr.serverId !== me.id ? '&server_id=' + sr.serverId : ''));
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 403 || e.status === 404)) { host.innerHTML = ''; return; }
+      host.innerHTML = '<div class="card mt"><h2>Shift review</h2><p class="muted">Could not load the shift review.</p></div>';
+      return;
+    }
+    host.innerHTML = shiftReviewHtml(r, sr);
+    const dateEl = $('#sr-date', host);
+    if (dateEl) dateEl.addEventListener('change', () => { sr.date = dateEl.value || sr.date; draw(); });
+    const sel = $('#sr-server', host);
+    if (sel) sel.addEventListener('change', () => { sr.serverId = Number(sel.value); draw(); });
+    const amt = $('#sr-amt', host), prev = $('#sr-prev', host), btn = $('#sr-declare', host);
+    const paintPrev = () => {
+      if (!amt.value.trim()) { prev.textContent = ''; return; }
+      const p = declaredTipsPreview(r.tips.card_tips_cents, r.tips.recorded_cash_tips_cents, amt.value);
+      prev.textContent = p.error ? p.error : 'Total tips will read ' + fmt(p.total_tips_cents);
+    };
+    amt.addEventListener('input', paintPrev);
+    paintPrev();
+    btn.onclick = async () => {
+      const p = declaredTipsPreview(r.tips.card_tips_cents, r.tips.recorded_cash_tips_cents, amt.value);
+      if (p.error) { toast(p.error, 'err'); return; }
+      const post = async (pin) => {
+        const body = { declared_cash_tips_cents: p.declared_cents, date: sr.date };
+        if (sr.serverId !== me.id) { body.server_id = sr.serverId; body.manager_pin = pin; }
+        await api('/api/finance/tip-declarations', 'POST', body);
+      };
+      try {
+        if (sr.serverId !== me.id) {
+          const bd = openModal('<h2>Manager approval</h2>' +
+            '<p>Declaring <b>' + fmt(p.declared_cents) + '</b> in cash tips for <b>' + esc(r.server_name) + '</b> on ' + esc(sr.date) + '. Amending another server\u2019s declaration needs a fresh manager PIN — the change is audit-logged.</p>' +
+            '<div class="field"><label for="sr-pin">Manager PIN</label><input type="password" id="sr-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' +
+            '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Save declaration</button></div>');
+          $('[data-x="c"]', bd).onclick = () => closeModal();
+          $('[data-x="go"]', bd).onclick = async () => {
+            const pin = ($('#sr-pin', bd).value || '').trim();
+            if (!pin) { toast('Enter the manager PIN', 'err'); return; }
+            try { await post(pin); closeModal(); toast('Declaration saved', 'ok'); draw(); }
+            catch (e) { if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e); }
+          };
+          return;
+        }
+        await post(null);
+        toast('Cash tips declared — total tips ' + fmt(p.total_tips_cents), 'ok');
+        draw();
+      } catch (e) { if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e); }
+    };
+  };
+  await draw();
 }
 
 /* ============================================================
