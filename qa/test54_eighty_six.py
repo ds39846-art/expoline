@@ -39,6 +39,16 @@ Sections:
   L  the remaining=1 RACE: two concurrent rings, exactly one 201
   M  send-now aggregation: two lines of the same item cannot jointly
      overrun the countdown (2+2 vs 3 refuses whole; 2+1 consumes to 0)
+  P  duplicate endpoint (the QA-reject fix): POST
+     /api/checks/:id/items/:item_id/duplicate inserts a brand-new
+     billable 'held' line — a new ring — yet the original census
+     missed it, so it sold 86'd items end-to-end (duplicate -> fire ->
+     pay) and never consumed the countdown. It now clears the same
+     gate as POST /items: 86'd source item -> 400 naming it, countdown
+     consumed for the copied qty inside a write transaction, oversize
+     copies refuse consuming nothing, happy path unchanged. Control
+     at afd9fdb (pre-fix): P2/P7/P8/P10/P13 fail — the duplicate
+     returns 201 for 86'd and counting items alike.
   N  LAN: floor 86 on the brain refuses synced add_items (item_86d,
      nothing stored); a menu_update op carries remaining and the brain
      consumes + auto-flips; an op carrying is_86 round-trips into the
@@ -502,6 +512,114 @@ def main():
         ok("M4 the batch consumed the count to 0 and auto-86'd",
            mi.get("remaining") == 0 and mi.get("is_86") is True, f"{mi}")
         floor86(eda["id"], {"action": "restore"}, token=tok)
+
+        # ================= P: duplicate endpoint =================
+        print("\n== P: duplicate is a new ring — it clears the 86 gate too ==")
+
+        def dup(cid, line_id):
+            return req("POST", f"/api/checks/{cid}/items/{line_id}/duplicate", {}, token=tok)
+
+        def line_id(cid, item_id):
+            rows = q(DB, "SELECT id FROM check_items WHERE check_id = ? AND menu_item_id = ? "
+                         "AND state != 'cancelled' ORDER BY id", (cid, item_id))
+            return rows[0][0] if rows else None
+
+        def n_lines(cid, item_id):
+            return len(q(DB, "SELECT id FROM check_items WHERE check_id = ? AND menu_item_id = ? "
+                             "AND state != 'cancelled'", (cid, item_id)))
+
+        # The J-case through duplicate: the item is 86'd AFTER its line
+        # was rung. The original line is untouchable (section J), but a
+        # duplicate is a NEW ring and must refuse.
+        cidP = mkcheck()
+        s, r = ring(cidP, rib)
+        ok("P1 setup: ribeye rung before the 86", s == 201, f"{s} {r}")
+        rib_line = line_id(cidP, rib["id"])
+        floor86(rib["id"], {"action": "out"}, token=tok)
+        s, r = dup(cidP, rib_line)
+        ok("P2 duplicate of an 86'd item's line -> 400 naming it sold out",
+           s == 400 and "sold out" in (r.get("error") or "") and "Ribeye" in (r.get("error") or ""),
+           f"{s} {r}")
+        ok("P3 the refused duplicate landed NO new line",
+           n_lines(cidP, rib["id"]) == 1, f"lines={n_lines(cidP, rib['id'])}")
+        s, r = req("POST", f"/api/checks/{cidP}/send", {}, token=tok)
+        ticket_qty = 0
+        for (ij,) in q(DB, "SELECT items_json FROM kds_tickets WHERE check_id = ?", (cidP,)):
+            for ent in json.loads(ij or "[]"):
+                if ent.get("name") == rib["name"]:
+                    ticket_qty += ent.get("qty", 1)
+        ok("P4 the original line fires alone — exactly one ribeye on the kitchen ticket",
+           s == 200 and ticket_qty == 1, f"send={s} ticket_qty={ticket_qty}")
+        s, chk = req("GET", f"/api/checks/{cidP}", token=tok)
+        tot = chk["totals"]["total"]
+        s, r = req("POST", f"/api/checks/{cidP}/payments",
+                   {"method": "cash", "amount_cents": tot, "tip_cents": 0, "tendered_cents": tot},
+                   token=tok)
+        s2, r2 = req("POST", f"/api/checks/{cidP}/close", {}, token=tok)
+        ok("P5 the original line's check still pays + closes normally",
+           s in (200, 201) and s2 == 200, f"pay={s} {r} close={s2} {r2}")
+        floor86(rib["id"], {"action": "restore"}, token=tok)
+
+        # Countdown consumption through duplicate: the line was rung
+        # BEFORE its countdown was set, so the full count is live.
+        cidP2 = mkcheck()
+        s, r = ring(cidP2, eda)
+        ok("P6 setup: edamame rung before its countdown was set", s == 201, f"{s} {r}")
+        eda_line = line_id(cidP2, eda["id"])
+        floor86(eda["id"], {"action": "out", "remaining": 2}, token=ktok)
+        auto_before = len(audit_rows(DB, eda["id"], "item.86_auto"))
+        s, r = dup(cidP2, eda_line)
+        mi = menu_item(eda["id"])
+        ok("P7 duplicate against remaining 2 -> 201 and consumes one (1 left)",
+           s == 201 and mi.get("remaining") == 1, f"{s} {r} {mi}")
+        s, r = dup(cidP2, eda_line)
+        mi = menu_item(eda["id"])
+        ok("P8 second duplicate consumes the last one: 0 left + auto-86",
+           s == 201 and mi.get("remaining") == 0 and mi.get("is_86") is True, f"{s} {r} {mi}")
+        auto = audit_rows(DB, eda["id"], "item.86_auto")
+        ok("P9 the duplicate-driven auto-86 is audit-logged to 'system'",
+           len(auto) == auto_before + 1 and auto[-1][0] == "system", f"{auto}")
+        s, r = dup(cidP2, eda_line)
+        ok("P10 a third duplicate now refuses as sold out",
+           s == 400 and "sold out" in (r.get("error") or ""), f"{s} {r}")
+        ok("P11 exactly the original + two duplicate lines exist (no oversell)",
+           n_lines(cidP2, eda["id"]) == 3, f"lines={n_lines(cidP2, eda['id'])}")
+        floor86(eda["id"], {"action": "restore"}, token=tok)
+
+        # An oversize copy (line qty 2) against remaining 1 refuses and
+        # consumes nothing — exactly like an oversize ring.
+        cidP3 = mkcheck()
+        s, r = ring(cidP3, eda, qty=2)
+        ok("P12 setup: a qty-2 edamame line", s == 201, f"{s} {r}")
+        eda2_line = line_id(cidP3, eda["id"])
+        floor86(eda["id"], {"action": "out", "remaining": 1}, token=tok)
+        s, r = dup(cidP3, eda2_line)
+        mi = menu_item(eda["id"])
+        ok("P13 duplicating a qty-2 line against 1 left -> 400 'only 1 left', nothing consumed, no line",
+           s == 400 and "only 1 left" in (r.get("error") or "") and mi.get("remaining") == 1
+           and n_lines(cidP3, eda["id"]) == 1, f"{s} {r} {mi}")
+        floor86(eda["id"], {"action": "restore"}, token=tok)
+
+        # The normal happy path is unchanged: the copy carries the
+        # source line's fields verbatim and starts 'held'.
+        cidP4 = mkcheck()
+        s, r = ring(cidP4, rib, qty=2)
+        ok("P14 setup: qty-2 ribeye line", s == 201, f"{s} {r}")
+        rib2_line = line_id(cidP4, rib["id"])
+        before = q(DB, "SELECT qty, unit_price_cents, modifiers_json, seat, course, note, allergy "
+                       "FROM check_items WHERE id = ?", (rib2_line,))[0]
+        s, r = dup(cidP4, rib2_line)
+        ok("P15 duplicate of a normal item -> 201 with totals in the response",
+           s == 201 and r.get("totals") is not None, f"{s} {r}")
+        rows = q(DB, "SELECT qty, unit_price_cents, modifiers_json, seat, course, note, allergy "
+                     "FROM check_items WHERE check_id = ? AND menu_item_id = ? "
+                     "AND state != 'cancelled' ORDER BY id", (cidP4, rib["id"]))
+        ok("P16 the copy matches the source line field-for-field",
+           len(rows) == 2 and rows[0] == before and rows[1] == before, f"{rows}")
+        states = q(DB, "SELECT state FROM check_items WHERE check_id = ? AND menu_item_id = ? ORDER BY id",
+                   (cidP4, rib["id"]))
+        ok("P17 both lines are 'held' (the duplicate is not fired)",
+           states == [("held",), ("held",)], f"{states}")
 
         # ================= N: LAN =================
         print("\n== N: LAN brain enforces + syncs the 86 state ==")
