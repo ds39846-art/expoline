@@ -9603,6 +9603,11 @@ require('./routes/loyalty').register(app, {
 require('./routes/online').register(app, {
   db, SITE_ID, serverPlus, kitchenPlus, nowIso, crypto,
   persistTotals, checkResponse, broadcastCheckUpdated,
+  // Online-ordering parity: the SAME happy-hour resolver and floor-86
+  // helpers the check flows use, so a web order prices and sells out
+  // exactly like a ring at the bar (see routes/online.js).
+  effectivePriceCents, hhPricingActive, eightySixRefusal, consumeEightySixCountdown,
+  broadcastMenuUpdated,
 });
 
 /* Phase 4: proactive P&L insights + "Ask the restaurant anything" (manager-only).

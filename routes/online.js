@@ -10,6 +10,19 @@
  *        → ready → picked_up. Cancel allowed from placed/confirmed.
  * Money: ALL totals recomputed server-side in integer cents from menu_items.
  * Client-sent totals are ignored. v1 is pay-at-pickup (no card processing).
+ * Pricing/availability parity with the floor: the unit price resolves
+ * through the host's happy-hour resolver (ctx.effectivePriceCents — HH
+ * price during a pricing window, MP items never HH-priced) and snapshots
+ * onto the order line exactly like a check line; floor-86 (is_86 +
+ * remaining countdown) is enforced with the host's helpers — 86'd items
+ * are excluded from this guest menu and refused at placement, and the
+ * countdown is consumed inside the placement transaction with the same
+ * conditional-UPDATE discipline (aggregated per item across the cart),
+ * auto-86ing at zero with the 'system' audit row. The menu below reads
+ * menu_items LIVE (there is no snapshot table), so an 86 or an HH price
+ * set mid-service takes effect on the next menu read / order — nothing
+ * can go stale. All ctx helpers are guarded: a host that does not wire
+ * them gets the pre-parity behavior (plain price, active-flag only).
  *
  * INTEGRATION (integrator adds these lines to server.js — see bottom):
  *   1. in authMiddleware's public-path early return, add the online paths
@@ -95,6 +108,18 @@ function orderView(row) {
 function register(app, ctx) {
   const { db, SITE_ID, kitchenPlus, nowIso, crypto } = ctx;
 
+  /* Floor-parity helpers, injected by the host (guarded — see header). */
+  const hhPricingActive = typeof ctx.hhPricingActive === 'function'
+    ? ctx.hhPricingActive : () => false;
+  const effectivePriceCents = typeof ctx.effectivePriceCents === 'function'
+    ? ctx.effectivePriceCents : (mi) => (mi ? mi.price_cents : 0);
+  const eightySixRefusal = typeof ctx.eightySixRefusal === 'function'
+    ? ctx.eightySixRefusal : () => null;
+  const consumeEightySixCountdown = typeof ctx.consumeEightySixCountdown === 'function'
+    ? ctx.consumeEightySixCountdown : () => ({ consumed: false, flipped: false });
+  const pushMenuUpdated = typeof ctx.broadcastMenuUpdated === 'function'
+    ? ctx.broadcastMenuUpdated : () => {};
+
   const taxRate = () => {
     const r = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'tax_rate'").get(SITE_ID);
     const v = parseFloat(r ? r.value : '0.0775');
@@ -109,12 +134,16 @@ function register(app, ctx) {
     const cats = db.prepare(
       'SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id'
     ).all(SITE_ID);
+    // Guest surface: structurally-off (active = 0) AND floor-86'd items are
+    // both excluded server-side — same rule as the kiosk/guest menus (staff
+    // keep flagged-visible; guests never see a sold-out item at all).
     const itemStmt = db.prepare(
-      'SELECT id, name, description, price_cents, item_type, station, course, price_note FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
+      'SELECT id, name, description, price_cents, hh_price_cents, is_86, remaining, item_type, station, course, price_note FROM menu_items WHERE category_id = ? AND active = 1 AND COALESCE(is_86, 0) = 0 ORDER BY id'
     );
     const modStmt = db.prepare(
       'SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id'
     );
+    const hhActive = hhPricingActive();
     // Same shape as /api/menu; mergeCats is server-local so we inline a flat list.
     res.json(cats.map((c) => ({
       id: c.id,
@@ -126,6 +155,16 @@ function register(app, ctx) {
         name: it.name,
         description: it.description,
         price_cents: it.price_cents,
+        // Happy-hour pricing, mirroring the staff /api/menu fields: the
+        // manager-set HH price (null = none), the price an order placed
+        // right now would actually be charged, and whether the HH price
+        // is the one in effect for this item.
+        hh_price_cents: it.hh_price_cents != null ? it.hh_price_cents : null,
+        effective_price_cents: effectivePriceCents(it, hhActive),
+        hh_active: hhActive && it.price_cents > 0 && it.hh_price_cents != null,
+        // Portions still orderable under a floor-86 countdown, else null —
+        // shown honestly ("Only N left"), never invented.
+        remaining: it.remaining != null ? it.remaining : null,
         item_type: it.item_type,
         station: it.station,
         course: it.course,
@@ -169,7 +208,7 @@ function register(app, ctx) {
     const ids = [...new Set(lineReqs.map((l) => l.menuItemId))];
     const placeholders = ids.map(() => '?').join(',');
     const found = db.prepare(
-      `SELECT mi.id, mi.name, mi.price_cents, mi.station, mi.active, mi.category_id
+      `SELECT mi.id, mi.name, mi.price_cents, mi.hh_price_cents, mi.is_86, mi.remaining, mi.station, mi.active, mi.category_id
        FROM menu_items mi WHERE mi.id IN (${placeholders})`
     ).all(...ids);
     // Site-scope check: item must belong to this site via its category.
@@ -177,6 +216,12 @@ function register(app, ctx) {
       db.prepare(`SELECT id FROM menu_categories WHERE site_id = ?`).all(SITE_ID).map((c) => c.id)
     );
     const byId = new Map(found.map((r) => [r.id, r]));
+    // Aggregate the cart per item: a guest may submit the same item on
+    // several lines, and the floor-86 countdown answers for the TOTAL —
+    // 2+2 against 3 left must refuse whole, never slip through per-line.
+    const cartQty = new Map();
+    for (const l of lineReqs) cartQty.set(l.menuItemId, (cartQty.get(l.menuItemId) || 0) + l.qty);
+    const hhActive = hhPricingActive();
     const priced = [];
     for (const l of lineReqs) {
       const mi = byId.get(l.menuItemId);
@@ -190,9 +235,22 @@ function register(app, ctx) {
         menu_item_id: mi.id,
         name: mi.name,
         qty: l.qty,
-        unit_price_cents: mi.price_cents,
+        // The charged price resolves through the floor's HH resolver and
+        // snapshots onto the line — a line placed at 5:55pm keeps its HH
+        // price after 6:00pm, exactly like a rung check line.
+        unit_price_cents: effectivePriceCents(mi, hhActive),
         station: mi.station || 'expediter',
       });
+    }
+    /* Floor 86, up front (read-only — consumes nothing): a sold-out item
+       refuses by name even when a stale cart submits it, and a countdown
+       item refuses a cart whose AGGREGATED qty exceeds what is left. The
+       authoritative consume happens inside the write transaction below
+       (this read can race another order by design — the conditional
+       UPDATE there is the one that decides). */
+    for (const id of ids) {
+      const refusal86 = eightySixRefusal(byId.get(id), cartQty.get(id) || 0);
+      if (refusal86) return res.status(400).json({ error: refusal86 });
     }
 
     let pickupAt = null;
@@ -213,19 +271,40 @@ function register(app, ctx) {
     const createdAt = nowIso();
     // Phase 1B money audit (concurrency): re-check 86 flags inside a write
     // transaction — an item 86'd between validation and INSERT must not
-    // land on a placed online order.
+    // land on a placed online order. The floor-86 countdown consume runs
+    // in the SAME transaction: the conditional UPDATE inside
+    // consumeEightySixCountdown is what makes two orders racing the last
+    // portion produce exactly one success, and any refusal rolls the
+    // whole order (and any partial consume) back.
     let orderId;
+    let consumedAny86 = false;
     try {
       db.exec('BEGIN IMMEDIATE');
       const recheck = db.prepare(
-        `SELECT id, active FROM menu_items WHERE id IN (${placeholders})`
+        `SELECT id, active, is_86, remaining, name, category_id FROM menu_items WHERE id IN (${placeholders})`
       ).all(...ids);
-      const activeMap = new Map(recheck.map((r) => [r.id, r.active]));
+      const freshMap = new Map(recheck.map((r) => [r.id, r]));
       for (const l of priced) {
-        if (activeMap.get(l.menu_item_id) !== 1) {
+        const fresh = freshMap.get(l.menu_item_id);
+        if (!fresh || fresh.active !== 1) {
           db.exec('ROLLBACK');
           return res.status(400).json({ error: `“${l.name}” is 86'd right now — please pick something else` });
         }
+      }
+      for (const id of ids) {
+        const fresh = freshMap.get(id);
+        if (fresh.is_86) {
+          db.exec('ROLLBACK');
+          return res.status(400).json({ error: `86: "${fresh.name}" is sold out` });
+        }
+        const cr = consumeEightySixCountdown(
+          { id, name: fresh.name, category_id: fresh.category_id, remaining: fresh.remaining },
+          cartQty.get(id) || 0);
+        if (cr.error) {
+          db.exec('ROLLBACK');
+          return res.status(400).json({ error: cr.error });
+        }
+        if (cr.consumed) consumedAny86 = true;
       }
       const r = db.prepare(
         `INSERT INTO online_orders
@@ -238,6 +317,9 @@ function register(app, ctx) {
       try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
       throw e;
     }
+    // A countdown that ran out flipped an item to 86 — staff surfaces
+    // re-read the menu, exactly like a floor ring that burns the last one.
+    if (consumedAny86) { try { pushMenuUpdated(); } catch { /* best-effort */ } }
     res.status(201).json(orderView(getOrder(orderId)));
   });
 

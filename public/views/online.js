@@ -39,6 +39,10 @@ const OLO_CSS = `
 .olo-item .nm{font-weight:600;font-size:15px}
 .olo-item .ds{color:var(--text-dim);font-size:13px;margin-top:2px}
 .olo-item .pr{color:var(--brass-hi);font-weight:700;margin-top:4px;font-size:15px}
+.olo-item .pr s{color:var(--text-dim);font-weight:400;margin-right:6px}
+.olo-hh{display:inline-block;margin-left:8px;padding:1px 8px;border:1px solid var(--brass-dim);
+  border-radius:999px;color:var(--brass-hi);font-size:11px;letter-spacing:.06em;text-transform:uppercase;vertical-align:1px}
+.olo-left{color:var(--brass-hi);font-size:12px;margin-top:3px;font-weight:600}
 .olo-step{display:flex;align-items:center;gap:8px}
 .olo-step button{width:40px;height:40px;border-radius:50%;border:1px solid var(--brass-dim);
   background:transparent;color:var(--brass-hi);font-size:20px;cursor:pointer}
@@ -101,10 +105,20 @@ async function renderOnlineOrder(container, api) {
   const byId = new Map();
   st.menu.forEach((c) => (c.items || []).forEach((it) => byId.set(it.id, it)));
 
+  // The price an order placed right now would be charged: the server's
+  // effective price (happy-hour price while a pricing window is live),
+  // falling back to the regular price on payloads that predate it. The
+  // server re-prices every order anyway — this only keeps the guest's
+  // running total honest.
+  const oloPrice = (it) => (it.effective_price_cents != null ? it.effective_price_cents : it.price_cents);
+  const priceHtml = (it) => it.hh_active
+    ? `<s>${oloFmt(it.price_cents)}</s>${oloFmt(it.effective_price_cents)}<span class="olo-hh">Happy hour</span>`
+    : oloFmt(oloPrice(it));
+
   const cartCount = () => { let n = 0; st.cart.forEach((q) => (n += q)); return n; };
   const cartSubtotal = () => {
     let s = 0;
-    st.cart.forEach((q, id) => { const it = byId.get(id); if (it) s += q * it.price_cents; });
+    st.cart.forEach((q, id) => { const it = byId.get(id); if (it) s += q * oloPrice(it); });
     return s;
   };
 
@@ -142,7 +156,9 @@ async function renderOnlineOrder(container, api) {
         const q = st.cart.get(it.id) || 0;
         h += `<div class="olo-item"><div class="inf"><div class="nm">${oloEsc(it.name)}</div>` +
           (it.description ? `<div class="ds">${oloEsc(it.description)}</div>` : '') +
-          `<div class="pr">${oloFmt(it.price_cents)}</div></div>
+          `<div class="pr">${priceHtml(it)}</div>` +
+          (it.remaining != null ? `<div class="olo-left">Only ${it.remaining} left</div>` : '') +
+          `</div>
           <div class="olo-step">
             <button data-dec="${it.id}" aria-label="remove">−</button>
             <span class="q">${q}</span>
@@ -172,7 +188,7 @@ async function renderOnlineOrder(container, api) {
     h += `</div></div><div class="olo-sum">`;
     st.cart.forEach((q, id) => {
       const it = byId.get(id);
-      if (it) h += `<div class="r"><span>${q}× ${oloEsc(it.name)}</span><span>${oloFmt(q * it.price_cents)}</span></div>`;
+      if (it) h += `<div class="r"><span>${q}× ${oloEsc(it.name)}</span><span>${oloFmt(q * oloPrice(it))}</span></div>`;
     });
     h += `<div class="r"><span>Subtotal</span><span>${oloFmt(sub)}</span></div>
       <div class="r"><span>Tax (7.75%)</span><span>calc. at confirmation</span></div>
