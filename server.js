@@ -7311,7 +7311,7 @@ require('./routes/insights').register(app, {
 /* Phase 3B staff routes: KDS aging settings/alerts, tip-out rules + report,
    delivery aggregation, cash-collect requests, guest-split reverse, table QR. */
 require('./routes/parity_kds_pay').registerStaff(app, {
-  db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
+  db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
   persistTotals, checkResponse, broadcastCheckUpdated, broadcastTicket, ticketView,
 });
 /* Phase 3A competitor parity: order & check flow (dayparts, timers, guest

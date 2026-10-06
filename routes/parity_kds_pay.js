@@ -573,7 +573,12 @@ function registerPublic(app, ctx) {
 /* ============================ STAFF (behind auth wall) ============================ */
 function registerStaff(app, ctx) {
   const { db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
-    persistTotals, broadcastCheckUpdated, broadcastTicket, ticketView } = ctx;
+    persistTotals, broadcastCheckUpdated, broadcastTicket, ticketView, tzDate } = ctx;
+  /* Business-date bucketing matches Finance payouts: the SITE-LOCAL date of
+   * a timestamp (server.js tzDate), never the raw UTC date inside the stored
+   * string — California evening service is already the next UTC day, and the
+   * two reports must agree on which day a sale belongs to. */
+  const siteDateOf = typeof tzDate === 'function' ? tzDate : (iso) => (iso ? String(iso).slice(0, 10) : null);
 
   /* ---- KDS aging thresholds (data, not code) ---- */
   app.get('/api/kds/settings', kitchenPlus(), (req, res) => {
@@ -706,22 +711,29 @@ function registerStaff(app, ctx) {
       'SELECT * FROM tipout_rules WHERE site_id = ? AND active = 1 ORDER BY id'
     ).all(SITE_ID);
 
-    const servers = db.prepare(
-      `SELECT DISTINCT c.server_id AS id, u.name FROM checks c
-       JOIN users u ON u.id = c.server_id
-       WHERE c.site_id = ? AND substr(c.opened_at, 1, 10) = ?
-         AND c.status IN ('paid','closed')`
-    ).all(SITE_ID, date);
+    const servers = [];
+    {
+      const seen = new Set();
+      const rows = db.prepare(
+        `SELECT c.server_id AS id, u.name, c.opened_at FROM checks c
+         JOIN users u ON u.id = c.server_id
+         WHERE c.site_id = ? AND c.status IN ('paid','closed')`
+      ).all(SITE_ID);
+      for (const r of rows) {
+        if (siteDateOf(r.opened_at) !== date || seen.has(r.id)) continue;
+        seen.add(r.id);
+        servers.push({ id: r.id, name: r.name });
+      }
+    }
 
     const itemStmt = db.prepare(
       `SELECT ci.qty, ci.unit_price_cents, ci.modifiers_json, ci.course
        FROM check_items ci WHERE ci.check_id = ? AND ci.state IN ('held','sent','fulfilled')`
     );
     const tipStmt = db.prepare(
-      `SELECT COALESCE(SUM(p.tip_cents), 0) AS tips FROM payments p
+      `SELECT p.tip_cents AS tip, p.created_at FROM payments p
        JOIN checks c ON c.id = p.check_id
-       WHERE p.site_id = ? AND c.server_id = ? AND substr(p.created_at, 1, 10) = ?
-         AND p.status = 'completed'`
+       WHERE p.site_id = ? AND c.server_id = ? AND p.status = 'completed'`
     );
 
     const serverRows = [];
@@ -731,8 +743,8 @@ function registerStaff(app, ctx) {
       /* Sales bases come from PAID/CLOSED checks only — open (unpaid) checks
        * must not inflate tip-outs. */
       const checks = db.prepare(
-        "SELECT id FROM checks WHERE site_id = ? AND server_id = ? AND substr(opened_at, 1, 10) = ? AND status IN ('paid','closed')"
-      ).all(SITE_ID, s.id, date);
+        "SELECT id, opened_at FROM checks WHERE site_id = ? AND server_id = ? AND status IN ('paid','closed')"
+      ).all(SITE_ID, s.id).filter((c) => siteDateOf(c.opened_at) === date);
       let foodSales = 0, grossSales = 0;
       for (const c of checks) {
         for (const it of itemStmt.all(c.id)) {
@@ -741,7 +753,9 @@ function registerStaff(app, ctx) {
           if (it.course !== 'drink') foodSales += line;
         }
       }
-      const tips = tipStmt.get(SITE_ID, s.id, date).tips || 0;
+      const tips = tipStmt.all(SITE_ID, s.id)
+        .filter((p) => siteDateOf(p.created_at) === date)
+        .reduce((a, p) => a + (p.tip || 0), 0);
       const basisOf = { food_sales: foodSales, gross_sales: grossSales, tips };
       const tipouts = rules.map((r) => {
         const owed = Math.round(basisOf[r.basis] * r.pct_bps / 10000);

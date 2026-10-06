@@ -213,9 +213,17 @@ s, b = call("POST", f"/api/checks/{cid}/payments", AUTH["st"],
             {"method": "card_demo", "amount_cents": total, "tip_cents": 600})
 check("C7 paid with $6 tip", s == 201 and b["check"]["total_cents"] == total, f"got {s} total={total}")
 # Server's own date (site timezone) straight from the DB — no guessing.
+# Business dates are site-local (America/Los_Angeles), matching the API:
+# bucketing by the raw UTC date in the stored string puts California
+# evening service on the wrong day.
 import sqlite3 as _sq
+from zoneinfo import ZoneInfo as _ZI
+from datetime import datetime as _DT
+def _site_date(iso):
+    return _DT.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(_ZI("America/Los_Angeles")).strftime("%Y-%m-%d")
 _con = _sq.connect(DB)
-date = _con.execute("SELECT substr(opened_at,1,10) FROM checks WHERE id = ?", (cid,)).fetchone()[0]
+_opened = _con.execute("SELECT opened_at FROM checks WHERE id = ?", (cid,)).fetchone()[0]
+date = _site_date(_opened)
 _con.close()
 s, b = call("GET", f"/api/tipout/report?date={date}", AUTH["mt"])
 check("C8 report 200", s == 200, f"got {s} {str(b)[:150]}")
@@ -224,26 +232,21 @@ srv = next((x for x in b["servers"] if x["server_name"] == "Daniel S"), None)
 # Daniel's PAID/CLOSED checks opened today (open checks must not inflate the
 # base); drinks excluded from food_sales by definition.
 _con = _sq.connect(DB)
-exp_food = _con.execute(
-    """SELECT COALESCE(SUM(ci.qty * (ci.unit_price_cents +
+_line_rows = _con.execute(
+    """SELECT c.opened_at, ci.course, ci.qty * (ci.unit_price_cents +
         COALESCE((SELECT SUM(CAST(json_extract(m.value,'$.price_delta_cents') AS INTEGER))
-                 FROM json_each(ci.modifiers_json) m), 0))), 0)
+                 FROM json_each(ci.modifiers_json) m), 0))
        FROM check_items ci JOIN checks c ON c.id = ci.check_id
-       WHERE c.server_id = 1 AND substr(c.opened_at,1,10) = ?
+       WHERE c.server_id = 1
          AND c.status IN ('paid','closed')
-         AND ci.state IN ('held','sent','fulfilled') AND ci.course != 'drink'""", (date,)).fetchone()[0]
-exp_gross = _con.execute(
-    """SELECT COALESCE(SUM(ci.qty * (ci.unit_price_cents +
-        COALESCE((SELECT SUM(CAST(json_extract(m.value,'$.price_delta_cents') AS INTEGER))
-                 FROM json_each(ci.modifiers_json) m), 0))), 0)
-       FROM check_items ci JOIN checks c ON c.id = ci.check_id
-       WHERE c.server_id = 1 AND substr(c.opened_at,1,10) = ?
-         AND c.status IN ('paid','closed')
-         AND ci.state IN ('held','sent','fulfilled')""", (date,)).fetchone()[0]
-exp_tips = _con.execute(
-    """SELECT COALESCE(SUM(p.tip_cents),0) FROM payments p JOIN checks c ON c.id = p.check_id
-       WHERE p.site_id = 'bali-hai' AND c.server_id = 1 AND substr(p.created_at,1,10) = ?
-         AND p.status = 'completed'""", (date,)).fetchone()[0]
+         AND ci.state IN ('held','sent','fulfilled')""").fetchall()
+exp_food = sum(v for o, course, v in _line_rows if _site_date(o) == date and course != 'drink')
+exp_gross = sum(v for o, course, v in _line_rows if _site_date(o) == date)
+_tip_rows = _con.execute(
+    """SELECT p.tip_cents, p.created_at FROM payments p JOIN checks c ON c.id = p.check_id
+       WHERE p.site_id = 'bali-hai' AND c.server_id = 1
+         AND p.status = 'completed'""").fetchall()
+exp_tips = sum(t for t, ca in _tip_rows if _site_date(ca) == date)
 _con.close()
 check("C9 food_sales basis excludes drinks (DB cross-check)",
       srv and srv["food_sales_cents"] == exp_food and srv["gross_sales_cents"] == exp_gross and srv["tips_cents"] == exp_tips,
@@ -516,7 +519,14 @@ print("--- I: refund UI API surface + audit fixes ---")
 restart_server()
 relogin()
 qr = table_qr(AUTH["st"], 1)
-today = time.strftime("%Y-%m-%d", time.gmtime())
+# Business date is site-local (America/Los_Angeles), matching the API's
+# bucketing — a UTC "today" flakes J17 between 17:00–24:00 Pacific.
+try:
+    from zoneinfo import ZoneInfo
+    from datetime import datetime as _dt
+    today = _dt.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+except Exception:
+    today = time.strftime("%Y-%m-%d", time.gmtime())
 cid = mk_check(AUTH["st"], table_id=6)
 add_item(AUTH["st"], cid, 90)  # Soda 400
 s, b = call("GET", f"/api/checks/{cid}", AUTH["mt"])
