@@ -3121,6 +3121,34 @@ function readSplitTender(bd, balance) {
   return out;
 }
 
+/* Tip adjustment (PATCH /api/payments/:id/tip): a payment tip can be
+   adjusted only while the payment is a settled card charge with no
+   refund activity — a real server id (not a queued offline row), the
+   card tender, completed status, zero refunded cents. The server
+   enforces the same rules; this predicate only decides whether the
+   Adjust tip button renders. */
+function tipAdjustable(p) {
+  if (!p || p.pending) return false;
+  if (typeof p.id !== 'number') return false;
+  if (p.method !== 'card_demo') return false;
+  if ((p.status || 'completed') !== 'completed') return false;
+  if ((p.refunded_cents || 0) > 0) return false;
+  return true;
+}
+
+/* Parse a typed tip dollar string into integer cents for the tip-adjust
+   dialog. Returns {cents} on success or {error} with a staff-readable
+   message. A tip is a non-negative amount of money: empty, non-numeric,
+   and negative input are errors here, never NaN cents downstream. */
+function parseTipInput(str) {
+  const raw = String(str == null ? '' : str).trim();
+  if (!raw) return { error: 'Enter the new tip amount' };
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return { error: 'Enter the tip as dollars, e.g. 4.50' };
+  if (v < 0) return { error: 'A tip cannot be negative' };
+  return { cents: Math.round(v * 100) };
+}
+
 /* ============================================================
    VIEW: PAY (server) — line-by-line math, splits, payments, close.
    ============================================================ */
@@ -3175,7 +3203,7 @@ async function renderPay(app, checkId) {
 
     (state.user.role === 'manager' && (check.payments || []).length
       ? '<div class="card"><h2>Refunds</h2>' +
-        '<p class="muted small">Manager only — partial or full refunds, no hoops. A refund that returns a balance to a paid check reopens it.</p>' +
+        '<p class="muted small">Manager only — partial or full refunds, no hoops. A refund that returns a balance to a paid check reopens it. Card tips can be adjusted until any refund is taken on the payment.</p>' +
         '<table class="money-table">' +
         (check.payments || []).map((p) => {
           const refunded = p.refunded_cents || 0;
@@ -3184,9 +3212,11 @@ async function renderPay(app, checkId) {
           const pill = st === 'refunded' ? ' <span class="pill sent">refunded</span>'
             : st === 'partial_refund' ? ' <span class="pill held">partial refund</span>' : '';
           return '<tr><td>' + paymentLabel(p) + pill +
-            (refunded ? '<div class="small muted">refunded ' + fmt(refunded) + '</div>' : '') + '</td>' +
+            (refunded ? '<div class="small muted">refunded ' + fmt(refunded) + '</div>' : '') +
+            (p.tip_cents ? '<div class="small muted">tip ' + fmt(p.tip_cents) + '</div>' : '') + '</td>' +
             '<td>' + fmt(p.amount_cents) + '</td>' +
             '<td style="text-align:right;white-space:nowrap">' +
+            (tipAdjustable(p) ? '<button class="btn btn-sm" data-adjust-tip="' + p.id + '">Adjust tip</button> ' : '') +
             (remaining > 0 ? '<button class="btn btn-sm" data-refund="' + p.id + '">Refund</button>' : '<span class="muted small">—</span>') +
             '</td></tr>';
         }).join('') + '</table></div>'
@@ -3451,6 +3481,34 @@ async function renderPay(app, checkId) {
         const r = await api('/api/payments/' + p.id + '/refund', 'POST', { amount_cents: cents });
         const rp = (r && r.payment) || {};
         toast(rp.status === 'refunded' ? 'Payment fully refunded' : 'Partial refund — ' + fmt(rp.refunded_cents || cents) + ' refunded', 'ok');
+        renderRoute(true);
+      } catch (e) { handleApiError(e); }
+    };
+  });
+
+  /* ---- tip adjustment (manager only; API takes a manager session or a
+     manager PIN — this card renders for manager sessions, like refunds) ---- */
+  $$('[data-adjust-tip]', app).forEach((b) => b.onclick = () => {
+    const p = (check.payments || []).find((x) => String(x.id) === b.dataset.adjustTip);
+    if (!p) return;
+    const plainLabel = paymentLabel(p).replace(/<[^>]+>/g, '');
+    const bd = openModal('<h2>Adjust tip</h2>' +
+      '<p class="muted">' + esc(plainLabel) + ' — paid ' + fmt(p.amount_cents) + ', current tip <b>' + fmt(p.tip_cents || 0) + '</b></p>' +
+      '<div class="field"><label for="tip-adj-val">New tip ($)</label>' +
+      '<input type="number" id="tip-adj-val" min="0" step="0.01" inputmode="decimal" value="' + ((p.tip_cents || 0) / 100).toFixed(2) + '"></div>' +
+      '<p class="muted small">Only the tip changes — the amount paid never does. The adjustment is audit-logged.</p>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="go">Save tip</button></div>');
+    $('[data-x="c"]', bd).onclick = closeModal;
+    $('[data-x="go"]', bd).onclick = async () => {
+      const parsed = parseTipInput($('#tip-adj-val', bd).value);
+      if (parsed.error) { toast(parsed.error, 'err'); return; }
+      if (isOffline()) { toast('Tip adjustments need a connection — reconnect first', 'err'); return; }
+      closeModal();
+      try {
+        const r = await api('/api/payments/' + p.id + '/tip', 'PATCH', { tip_cents: parsed.cents });
+        const np = (r && r.payment) || {};
+        toast('Tip adjusted — ' + fmt(r.previous_tip_cents || 0) + ' → ' + fmt(np.tip_cents || 0), 'ok');
         renderRoute(true);
       } catch (e) { handleApiError(e); }
     };

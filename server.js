@@ -2103,6 +2103,13 @@ app.get('/api/checks/open', serverPlus(), (req, res) => {
 app.get('/api/checks/:id', serverPlus(), (req, res) => {
   const check = checkResponse(req.params.id);
   if (!check) return res.status(404).json({ error: 'Check not found' });
+  /* The pay screen renders its Payments list and the manager refunds /
+   * tip-adjust card from check.payments — attach the real payment rows
+   * here, on this staff surface only. checkResponse itself is shared with
+   * guest and LAN consumers and stays payment-free. (Before this, the pay
+   * screen only ever saw payments queued on the same device this session,
+   * so the refunds card was empty on any fresh load.) */
+  check.payments = db.prepare('SELECT * FROM payments WHERE check_id = ? ORDER BY id').all(check.id).map(paymentView);
   res.json(check);
 });
 
@@ -3650,6 +3657,98 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
   if (idem) idemClear('refunds', idem);
   throw e;
 }
+});
+
+/* Adjust the tip on a card payment after the fact (Toast/SpotOn tip
+ * adjust): the guest wrote a different tip on the signed slip, or the
+ * server mis-keyed it. Only tip_cents can change here — the principal
+ * (amount_cents) is immutable — and every downstream reader (tip-out
+ * report, finance payouts / shift, exports, insights) reads the payments
+ * rows live, so the correction flows through everywhere automatically.
+ * Timing: allowed while the parent check is open, paid, or closed —
+ * Expoline has no batch / EOD settlement marker to gate on yet (EOD
+ * close-out is a later batch); the tip freezes once any refund has been
+ * taken against the payment. */
+app.patch('/api/payments/:id/tip', serverPlus(), (req, res) => {
+  const payment = db.prepare('SELECT * FROM payments WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!payment) return res.status(404).json({ error: 'Payment not found' });
+
+  /* Manager gate, in either of the two forms this codebase already uses:
+   * a manager-role session (the refund gate) or a fresh manager PIN in
+   * the body (the void / comp gate) — a server at the terminal with the
+   * manager standing next to them is the normal tip-fix flow. Failed PIN
+   * attempts are audit-logged (audit-only policy, no lockout). */
+  const b = req.body || {};
+  let approver = null;
+  if (req.user && req.user.role === 'manager') {
+    approver = { id: req.user.id, name: req.user.name };
+  } else {
+    const mgr = verifyManagerPin(b.manager_pin);
+    if (!mgr) {
+      recordManagerPinAttempt(req, false);
+      return res.status(403).json({ error: 'Adjusting a tip needs a manager — sign in as a manager or enter a manager PIN', need_manager_pin: true });
+    }
+    recordManagerPinAttempt(req, true);
+    approver = { id: mgr.id, name: mgr.name };
+  }
+
+  /* Only tip_cents (plus the gate PIN and an optional reason) is read from
+   * the body — a request that tries to smuggle amount_cents, status, or
+   * refunded_cents changes nothing but the tip. */
+  if (b.tip_cents === undefined || b.tip_cents === null) {
+    return res.status(400).json({ error: 'tip_cents is required' });
+  }
+  if (!isInt(b.tip_cents) || b.tip_cents < 0) {
+    return res.status(400).json({ error: 'tip_cents must be a non-negative integer' });
+  }
+  const reason = typeof b.reason === 'string' ? b.reason.trim() : '';
+  if (reason.length > 120) return res.status(400).json({ error: 'reason must be at most 120 characters' });
+
+  /* Tip adjustment is the card-batch correction (signed slip vs keyed
+   * amount): card payments only. Cash and house-account tips are money
+   * the house does not batch — correct those by refund and re-ring.
+   * Gift cards never carry a tip (rejected at payment time). */
+  if (payment.method !== 'card_demo') {
+    return res.status(400).json({ error: `Tip adjustment is for card payments only — this payment is ${payment.method}; correct it by refund and re-ring instead` });
+  }
+  /* Once any refund has been taken against a payment, its tip is final:
+   * the payment is settled history (the tip-out report counts only
+   * 'completed' payments, so a post-refund tip would be money the reports
+   * disagree about). */
+  if (payment.status === 'refunded') {
+    return res.status(400).json({ error: 'Payment already fully refunded — its tip can no longer be adjusted' });
+  }
+  if ((payment.refunded_cents || 0) > 0) {
+    return res.status(400).json({ error: 'Payment has a refund — its tip is final once any refund is taken' });
+  }
+
+  const oldTip = payment.tip_cents || 0;
+  const newTip = b.tip_cents;
+  /* An absolute-value PATCH is naturally idempotent: replaying the same
+   * request lands on the same value. A replay that changes nothing is a
+   * successful no-op, not a second adjustment — no audit row is written
+   * for a change that did not happen. */
+  if (newTip === oldTip) {
+    return res.json({ payment: paymentView(payment), previous_tip_cents: oldTip, unchanged: true });
+  }
+
+  // Conditional UPDATE on the exact tip we read (the refund idiom): the
+  // check-and-set is atomic, so a concurrent adjustment cannot be lost.
+  const upd = db.prepare('UPDATE payments SET tip_cents = ? WHERE id = ? AND COALESCE(tip_cents, 0) = ?')
+    .run(newTip, payment.id, oldTip);
+  if (upd.changes !== 1) {
+    return res.status(409).json({ error: 'Payment changed while adjusting — please retry' });
+  }
+  /* tip_cents never enters totals or balance (paid is amount minus
+   * refunds, and tips are never taxed), so no persistTotals and no status
+   * change: an adjusted tip cannot resurrect a balance on a closed check
+   * or un-close it. */
+  auditApproval(req, 'adjust_tip', { check_id: payment.check_id },
+    { approver: approver.name, approver_id: approver.id, payment_id: payment.id,
+      before: { tip_cents: oldTip }, after: { tip_cents: newTip },
+      ...(reason ? { reason } : {}) });
+  broadcastCheckUpdated(payment.check_id);
+  return res.json({ payment: paymentView(db.prepare('SELECT * FROM payments WHERE id = ?').get(payment.id)), previous_tip_cents: oldTip });
 });
 
 /* Reopen a 'paid' check that still carries a positive balance (e.g. a refund
@@ -7366,6 +7465,7 @@ const API_DOCS = [
   { method: 'POST', path: '/api/admin/house-accounts', auth: 'manager', summary: 'Create a house account', params: 'name' },
   { method: 'PATCH', path: '/api/admin/house-accounts/:id', auth: 'manager', summary: 'Activate/deactivate a house account', params: 'active' },
   { method: 'POST', path: '/api/payments/:id/refund', auth: 'manager', summary: 'Refund a payment', params: 'amount_cents?' },
+  { method: 'PATCH', path: '/api/payments/:id/tip', auth: 'server+ (manager role or manager PIN)', summary: 'Adjust the tip on a card payment — principal immutable, frozen after any refund, audit-logged', params: 'tip_cents, manager_pin?, reason?' },
   { method: 'POST', path: '/api/checks/:id/close', auth: 'server+', summary: 'Close a fully-paid check', params: '—' },
   { method: 'GET', path: '/api/kds/tickets', auth: 'kitchen+', summary: 'KDS tickets by station', params: 'station?' },
   { method: 'POST', path: '/api/kds/tickets/:id/bump', auth: 'kitchen+', summary: 'Bump a ticket', params: '—' },
