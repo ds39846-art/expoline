@@ -3331,7 +3331,7 @@ async function oloBoardPatch(apiFn, id, nextStatus) {
 }
 
 async function renderKds(app) {
-  if (state.user.role === 'server') { app.innerHTML = notAuthorized('The kitchen display is for kitchen and manager roles.'); return; }
+  if (!roleHasCap(state.user, 'kitchen_ops')) { app.innerHTML = notAuthorized('The kitchen display is for kitchen and manager roles.'); return; }
   closeKdsSocket();
   state.kds.recall = false;
   state.kds.tickets = [];
