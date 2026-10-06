@@ -143,6 +143,49 @@ CREATE TABLE payments (
   created_at TEXT
 );
 
+/* Discount library (audit gap #4): named manager-defined discounts and
+   their applications. Applications snapshot the definition (name, kind,
+   value) plus the computed amount, so later edits never rewrite history. */
+CREATE TABLE discounts (
+  id INTEGER PRIMARY KEY,
+  site_id TEXT,
+  name TEXT,
+  kind TEXT CHECK(kind IN ('percent','fixed')),
+  percent REAL,
+  amount_cents INTEGER,
+  scope TEXT CHECK(scope IN ('check','item')),
+  requires_approval INTEGER DEFAULT 0,
+  active INTEGER DEFAULT 1,
+  created_at TEXT,
+  updated_at TEXT
+);
+
+CREATE TABLE check_discounts (
+  id INTEGER PRIMARY KEY,
+  site_id TEXT,
+  check_id INTEGER,
+  item_id INTEGER,
+  discount_id INTEGER,
+  name TEXT,
+  kind TEXT,
+  percent REAL,
+  amount_cents INTEGER,
+  scope TEXT,
+  applied_cents INTEGER,
+  requires_approval INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'applied' CHECK(status IN ('applied','removed')),
+  applied_by_id INTEGER,
+  applied_by_name TEXT,
+  approver_id INTEGER,
+  approver_name TEXT,
+  created_at TEXT,
+  removed_at TEXT,
+  removed_by_id INTEGER,
+  removed_by_name TEXT
+);
+
+CREATE INDEX idx_check_discounts_check ON check_discounts(check_id, status);
+
 /* House accounts (LOCKED POLICY 2026-09-27: manager-created only).
    A house_account tender must name an existing ACTIVE account; servers
    cannot invent accounts at payment time. */

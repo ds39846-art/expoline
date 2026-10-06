@@ -136,6 +136,54 @@ db.exec('PRAGMA busy_timeout=5000;');
   )`);
 })();
 
+/* Discount library (audit gap #4): manager-defined named discounts and
+   their per-check applications. Definitions are a real table (the
+   menu_items precedent — independently CRUD'd named entities that
+   history rows reference), NOT site_config JSON (dayparts are a single
+   schedule document edited atomically; discounts are a list).
+   Applications snapshot name/kind/value + the computed amount, so
+   editing or deactivating a definition never rewrites a live check —
+   the same snapshot discipline as line prices. */
+(() => {
+  db.exec(`CREATE TABLE IF NOT EXISTS discounts (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    name TEXT,
+    kind TEXT CHECK(kind IN ('percent','fixed')),
+    percent REAL,
+    amount_cents INTEGER,
+    scope TEXT CHECK(scope IN ('check','item')),
+    requires_approval INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    created_at TEXT,
+    updated_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS check_discounts (
+    id INTEGER PRIMARY KEY,
+    site_id TEXT,
+    check_id INTEGER,
+    item_id INTEGER,
+    discount_id INTEGER,
+    name TEXT,
+    kind TEXT,
+    percent REAL,
+    amount_cents INTEGER,
+    scope TEXT,
+    applied_cents INTEGER,
+    requires_approval INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'applied' CHECK(status IN ('applied','removed')),
+    applied_by_id INTEGER,
+    applied_by_name TEXT,
+    approver_id INTEGER,
+    approver_name TEXT,
+    created_at TEXT,
+    removed_at TEXT,
+    removed_by_id INTEGER,
+    removed_by_name TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_check_discounts_check ON check_discounts(check_id, status)');
+})();
+
 /* Time clock + CA break-compliance migration (phase 2). Runs on every boot;
    guards via PRAGMA / CREATE TABLE IF NOT EXISTS. Demo wage defaults are
    applied once (only where no rate is set); the manager sets real rates in
@@ -2110,6 +2158,11 @@ app.get('/api/checks/:id', serverPlus(), (req, res) => {
    * screen only ever saw payments queued on the same device this session,
    * so the refunds card was empty on any fresh load.) */
   check.payments = db.prepare('SELECT * FROM payments WHERE check_id = ? ORDER BY id').all(check.id).map(paymentView);
+  /* Same staff-only attach for discount-library applications (audit
+   * gap #4): the order screen renders the applied-discount strip and
+   * the pay screen itemizes library lines from this list. Removed
+   * applications stay off the live check; they live in the audit. */
+  check.library_discounts = appliedDiscountsForCheck(check.id).map(discountAppView);
   res.json(check);
 });
 
@@ -2888,6 +2941,12 @@ app.post('/api/checks/:id/items/:item_id/discount', serverPlus(), (req, res) => 
     .get(itemId, check.id);
   if (!item) return res.status(404).json({ error: 'Item not found on this check' });
   if (item.state === 'cancelled') return res.status(400).json({ error: 'Cannot discount a voided item' });
+  /* A live library application owns this line's discount slot: the
+   * ad-hoc replace would silently orphan the application's snapshot
+   * (its removal reverses exactly the applied amount). Remove the
+   * library discount first, then discount ad-hoc. */
+  const libApp = db.prepare("SELECT * FROM check_discounts WHERE check_id = ? AND item_id = ? AND status = 'applied'").get(check.id, item.id);
+  if (libApp) return res.status(400).json({ error: `This line has the library discount “${libApp.name}” — remove it before applying an ad-hoc discount` });
   const gross = lineGross(item);
   if (gross <= 0) return res.status(400).json({ error: 'Cannot discount a zero-value line' });
   let discount;
@@ -3009,6 +3068,327 @@ app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
   auditApproval(req, 'comp', { check_id: check.id },
     { approver: mgr.name, approver_id: mgr.id, before: { comp_cents: before }, after: { comp_cents: after }, added_cents: comp, percent: b.percent ?? null, reason });
   res.json({ check_id: check.id, comp_cents: after, added_cents: comp, approved_by: mgr.name, totals: t });
+});
+
+/* ============================ discount library =============================
+ * Audit gap #4 (Toast/SpotOn parity): a LIBRARY of named discounts that
+ * managers define once ("Military 10%", "Employee meal 50%", "$5 off")
+ * and servers apply from a picker — instead of the ad-hoc comp / item
+ * discount above, which invent the value at the terminal every time.
+ *
+ * The library is a thin control layer over the EXISTING money machinery
+ * (the totals math is untouched):
+ *   - check-scope applications add their computed amount onto
+ *     checks.comp_cents — the same accumulator ad-hoc comps and loyalty
+ *     redemptions use, under the same cumulative guard (never above the
+ *     subtotal) and the same tax treatment (comps reduce the total
+ *     after tax; they never enter the taxable base).
+ *   - item-scope applications write check_items.discount_cents +
+ *     discount_reason (the name snapshot) — the same slot the ad-hoc
+ *     item discount writes, so the line discount reduces the subtotal
+ *     (and therefore the tax base) exactly like an ad-hoc one, and
+ *     finance/insights reporting counts both with no new code.
+ * Percent math mirrors the house idiom everywhere: Math.round of the
+ * base (check: the net subtotal, as comps compute; item: the pre-
+ * discount line gross, as the item-discount endpoint computes).
+ *
+ * Control rules:
+ *   - One library discount per slot: one check-scope application per
+ *     check, one application per line. A second application is a 400
+ *     naming the incumbent — nothing is silently replaced. (Ad-hoc
+ *     comps still stack on comp_cents exactly as before.)
+ *   - A definition flagged requires_approval needs a fresh manager PIN
+ *     at apply time AND at remove time (403 + need_manager_pin without
+ *     one; failed attempts audit-logged, audit-only, no lockout).
+ *     Item-scope applications to already-fired lines ALSO need the PIN,
+ *     mirroring the ad-hoc item-discount rule for sent lines.
+ *   - Applications snapshot the definition; editing or deactivating a
+ *     definition never changes a live check. Removal reverses EXACTLY
+ *     the applied amount and restores the prior totals byte-for-byte.
+ *   - Online-only, like comps: the LAN op vocabulary has no comp or
+ *     discount op and the offline outbox never queues one, so there is
+ *     nothing to fake — the client says so and refuses offline.
+ * ========================================================================== */
+
+function discountDefById(id) {
+  return db.prepare('SELECT * FROM discounts WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+}
+function discountDefView(r) {
+  return {
+    id: r.id, name: r.name, kind: r.kind,
+    percent: r.percent != null ? r.percent : null,
+    amount_cents: r.amount_cents != null ? r.amount_cents : null,
+    scope: r.scope, requires_approval: !!r.requires_approval, active: !!r.active,
+    created_at: r.created_at, updated_at: r.updated_at,
+  };
+}
+function discountAppView(r) {
+  return {
+    id: r.id, check_id: r.check_id, item_id: r.item_id != null ? r.item_id : null,
+    discount_id: r.discount_id, name: r.name, kind: r.kind,
+    percent: r.percent != null ? r.percent : null,
+    amount_cents: r.amount_cents != null ? r.amount_cents : null,
+    scope: r.scope, applied_cents: r.applied_cents,
+    requires_approval: !!r.requires_approval, status: r.status,
+    applied_by: r.applied_by_name, approver: r.approver_name,
+    created_at: r.created_at,
+    removed_at: r.removed_at || null, removed_by: r.removed_by_name || null,
+  };
+}
+function appliedDiscountsForCheck(checkId) {
+  return db.prepare("SELECT * FROM check_discounts WHERE check_id = ? AND status = 'applied' ORDER BY id").all(checkId);
+}
+
+/* Merge + validate a definition body over an existing row (PUT
+ * semantics: absent fields keep their stored values; POST passes
+ * existing = null). Switching kind re-validates the merged result and
+ * nulls the other kind's value, so a row can never carry both. */
+function validateDiscountDef(b, existing) {
+  const name = b.name === undefined ? (existing ? existing.name : '') : cleanLabel(b.name);
+  if (!name) return { error: 'Discount name is required' };
+  if (name.length > 40) return { error: 'Discount name must be at most 40 characters' };
+  const kind = b.kind === undefined ? (existing ? existing.kind : '') : String(b.kind || '').trim().toLowerCase();
+  if (kind !== 'percent' && kind !== 'fixed') return { error: "kind must be 'percent' or 'fixed'" };
+  let percent = b.percent === undefined ? (existing ? existing.percent : null) : b.percent;
+  let amount_cents = b.amount_cents === undefined ? (existing ? existing.amount_cents : null) : b.amount_cents;
+  if (kind === 'percent') {
+    if (typeof percent !== 'number' || !Number.isFinite(percent) || percent <= 0 || percent > 100) {
+      return { error: 'percent must be a number greater than 0 and at most 100' };
+    }
+    amount_cents = null;
+  } else {
+    if (!isInt(amount_cents) || amount_cents <= 0) {
+      return { error: 'amount_cents must be a positive whole number of cents' };
+    }
+    percent = null;
+  }
+  const scope = b.scope === undefined ? (existing ? existing.scope : '') : String(b.scope || '').trim().toLowerCase();
+  if (scope !== 'check' && scope !== 'item') return { error: "scope must be 'check' or 'item'" };
+  const boolField = (v, cur, dflt) => {
+    if (v === undefined) return cur != null ? !!cur : dflt;
+    if (typeof v === 'boolean') return v;
+    if (v === 0 || v === 1) return !!v;
+    return null;
+  };
+  const requires_approval = boolField(b.requires_approval, existing ? existing.requires_approval : null, false);
+  if (requires_approval === null) return { error: 'requires_approval must be a boolean' };
+  const active = boolField(b.active, existing ? existing.active : null, true);
+  if (active === null) return { error: 'active must be a boolean' };
+  return { fields: { name, kind, percent, amount_cents, scope, requires_approval, active } };
+}
+
+app.get('/api/admin/discounts', managerOnly(), (req, res) => {
+  res.json(db.prepare('SELECT * FROM discounts WHERE site_id = ? ORDER BY active DESC, name').all(SITE_ID).map(discountDefView));
+});
+
+app.post('/api/admin/discounts', managerOnly(), (req, res) => {
+  const v = validateDiscountDef(req.body || {}, null);
+  if (v.error) return res.status(400).json({ error: v.error });
+  const f = v.fields;
+  const now = nowIso();
+  const r = db.prepare(`INSERT INTO discounts (site_id, name, kind, percent, amount_cents, scope, requires_approval, active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(SITE_ID, f.name, f.kind, f.percent, f.amount_cents, f.scope, f.requires_approval ? 1 : 0, f.active ? 1 : 0, now, now);
+  const row = discountDefById(r.lastInsertRowid);
+  auditApproval(req, 'discount_create', {}, { discount_id: row.id, after: discountDefView(row) });
+  res.status(201).json(discountDefView(row));
+});
+
+app.put('/api/admin/discounts/:id', managerOnly(), (req, res) => {
+  const cur = discountDefById(req.params.id);
+  if (!cur) return res.status(404).json({ error: 'Discount not found' });
+  const v = validateDiscountDef(req.body || {}, cur);
+  if (v.error) return res.status(400).json({ error: v.error });
+  const f = v.fields;
+  db.prepare('UPDATE discounts SET name = ?, kind = ?, percent = ?, amount_cents = ?, scope = ?, requires_approval = ?, active = ?, updated_at = ? WHERE id = ?')
+    .run(f.name, f.kind, f.percent, f.amount_cents, f.scope, f.requires_approval ? 1 : 0, f.active ? 1 : 0, nowIso(), cur.id);
+  const row = discountDefById(cur.id);
+  auditApproval(req, 'discount_update', {}, { discount_id: cur.id, before: discountDefView(cur), after: discountDefView(row) });
+  res.json(discountDefView(row));
+});
+
+/* Deleting a definition that checks have used would strand its
+ * applications pointing at nothing — the menu-item rule: refuse and
+ * point at deactivation, which keeps history readable forever. */
+app.delete('/api/admin/discounts/:id', managerOnly(), (req, res) => {
+  const cur = discountDefById(req.params.id);
+  if (!cur) return res.status(404).json({ error: 'Discount not found' });
+  const used = db.prepare('SELECT COUNT(*) AS n FROM check_discounts WHERE discount_id = ?').get(cur.id).n;
+  if (used > 0) {
+    return res.status(400).json({ error: `“${cur.name}” has been applied to checks — deactivate it instead of deleting, so the history stays readable` });
+  }
+  db.prepare('DELETE FROM discounts WHERE id = ?').run(cur.id);
+  auditApproval(req, 'discount_delete', {}, { discount_id: cur.id, before: discountDefView(cur) });
+  res.json({ deleted: cur.id });
+});
+
+/* The floor picker feed: active definitions only, server+ (the same
+ * authority that applies them). */
+app.get('/api/discounts', serverPlus(), (req, res) => {
+  res.json(db.prepare('SELECT * FROM discounts WHERE site_id = ? AND active = 1 ORDER BY name').all(SITE_ID).map(discountDefView));
+});
+
+/**
+ * POST /api/checks/:id/discounts {discount_id, item_id?, manager_pin?}
+ * Apply a library discount. The response carries the application (with
+ * its snapshots + computed amount) and the recomputed totals.
+ */
+app.post('/api/checks/:id/discounts', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot discount a ${check.status} check` });
+  const def = discountDefById(b.discount_id);
+  if (!def) return res.status(404).json({ error: 'Discount not found' });
+  if (!def.active) return res.status(400).json({ error: `“${def.name}” is not active — it cannot be applied` });
+
+  let item = null;
+  if (def.scope === 'check') {
+    if (b.item_id != null) return res.status(400).json({ error: `“${def.name}” is a check-level discount — apply it without an item_id` });
+  } else {
+    if (b.item_id == null) return res.status(400).json({ error: `“${def.name}” is an item-level discount — item_id is required` });
+    item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ? AND ci.check_id = ?')
+      .get(b.item_id, check.id);
+    if (!item) return res.status(404).json({ error: 'Item not found on this check' });
+    if (item.state === 'cancelled') return res.status(400).json({ error: 'Cannot discount a voided item' });
+  }
+
+  /* Approval gate: a flagged definition always needs a fresh manager
+   * PIN, and so does ANY item-scope application to an already-fired
+   * line (the ad-hoc item-discount rule for sent lines — money out the
+   * door after the food is gone). Failed attempts are audit-logged
+   * (audit-only policy, no lockout). */
+  const firedLine = !!item && item.state !== 'held';
+  let approver = { id: req.user.id, name: req.user.name };
+  if (def.requires_approval || firedLine) {
+    const mgr = verifyManagerPin(b.manager_pin);
+    if (!mgr) {
+      recordManagerPinAttempt(req, false);
+      return res.status(403).json({ error: `Applying “${def.name}” needs a manager PIN`, need_manager_pin: true });
+    }
+    recordManagerPinAttempt(req, true);
+    approver = { id: mgr.id, name: mgr.name };
+  }
+
+  let amount;
+  let before, after;
+  if (def.scope === 'check') {
+    const clash = db.prepare("SELECT * FROM check_discounts WHERE check_id = ? AND item_id IS NULL AND status = 'applied'").get(check.id);
+    if (clash) return res.status(400).json({ error: `This check already has the library discount “${clash.name}” — remove it before applying another` });
+    const t0 = calcTotals(check.id);
+    if (t0.subtotal <= 0) return res.status(400).json({ error: 'Check subtotal is zero — nothing to discount' });
+    amount = def.kind === 'percent' ? Math.round(t0.subtotal * def.percent / 100) : def.amount_cents;
+    if (amount <= 0) return res.status(400).json({ error: 'That discount computes to zero on this check — nothing to apply' });
+    const beforeComp = check.comp_cents || 0;
+    // The comp guard, inherited exactly: cumulative money-off on the
+    // comp accumulator may never exceed the subtotal.
+    if (beforeComp + amount > t0.subtotal) {
+      return res.status(400).json({ error: `Discount of ${beforeComp + amount}¢ exceeds the check subtotal of ${t0.subtotal}¢` });
+    }
+    before = { comp_cents: beforeComp };
+    after = { comp_cents: beforeComp + amount };
+  } else {
+    const clash = db.prepare("SELECT * FROM check_discounts WHERE check_id = ? AND item_id = ? AND status = 'applied'").get(check.id, item.id);
+    if (clash) return res.status(400).json({ error: `This line already has the library discount “${clash.name}” — remove it before applying another` });
+    if ((item.discount_cents || 0) > 0) {
+      return res.status(400).json({ error: `This line already has a discount (${item.discount_reason || 'ad-hoc'}) — remove it before applying a library discount` });
+    }
+    const gross = lineGross(item);
+    if (gross <= 0) return res.status(400).json({ error: 'Cannot discount a zero-value line' });
+    amount = def.kind === 'percent' ? Math.round(gross * def.percent / 100) : def.amount_cents;
+    if (amount <= 0) return res.status(400).json({ error: 'That discount computes to zero on this line — nothing to apply' });
+    if (amount > gross) return res.status(400).json({ error: `Discount ${amount}¢ exceeds the line value of ${gross}¢` });
+    before = { discount_cents: item.discount_cents || 0, discount_reason: item.discount_reason || null };
+    after = { discount_cents: amount, discount_reason: def.name };
+  }
+
+  let appRow;
+  withTransaction(() => {
+    const r = db.prepare(`INSERT INTO check_discounts (site_id, check_id, item_id, discount_id, name, kind, percent, amount_cents, scope,
+        applied_cents, requires_approval, status, applied_by_id, applied_by_name, approver_id, approver_name, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?, ?)`)
+      .run(SITE_ID, check.id, item ? item.id : null, def.id, def.name, def.kind, def.percent, def.amount_cents, def.scope,
+        amount, def.requires_approval ? 1 : 0, req.user.id, req.user.name, approver.id, approver.name, nowIso());
+    if (def.scope === 'check') {
+      db.prepare('UPDATE checks SET comp_cents = comp_cents + ? WHERE id = ?').run(amount, check.id);
+    } else {
+      db.prepare('UPDATE check_items SET discount_cents = ?, discount_reason = ? WHERE id = ?').run(amount, def.name, item.id);
+    }
+    appRow = db.prepare('SELECT * FROM check_discounts WHERE id = ?').get(r.lastInsertRowid);
+  });
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  auditApproval(req, 'discount_apply', { check_id: check.id, item_id: item ? item.id : null },
+    { approver: approver.name, approver_id: approver.id, discount_id: def.id, application_id: appRow.id,
+      name: def.name, kind: def.kind, percent: def.percent, amount_cents: def.amount_cents, scope: def.scope,
+      applied_cents: amount, before, after });
+  res.status(201).json({ application: discountAppView(appRow), totals: t, approved_by: approver.name });
+});
+
+/**
+ * POST /api/checks/:id/discounts/:app_id/remove {manager_pin?}
+ * Remove an applied library discount, reversing EXACTLY its applied
+ * amount. If the application required approval to apply, removal needs
+ * the same fresh manager PIN. Removal reads only the application's
+ * snapshots — the definition may have been edited or deactivated since.
+ */
+app.post('/api/checks/:id/discounts/:app_id/remove', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot change discounts on a ${check.status} check` });
+  const application = db.prepare('SELECT * FROM check_discounts WHERE id = ? AND check_id = ? AND site_id = ?')
+    .get(req.params.app_id, check.id, SITE_ID);
+  if (!application) return res.status(404).json({ error: 'Discount application not found on this check' });
+  if (application.status !== 'applied') return res.status(400).json({ error: 'That discount was already removed' });
+
+  let approver = { id: req.user.id, name: req.user.name };
+  if (application.requires_approval) {
+    const mgr = verifyManagerPin(b.manager_pin);
+    if (!mgr) {
+      recordManagerPinAttempt(req, false);
+      return res.status(403).json({ error: `Removing “${application.name}” needs a manager PIN — it required approval to apply`, need_manager_pin: true });
+    }
+    recordManagerPinAttempt(req, true);
+    approver = { id: mgr.id, name: mgr.name };
+  }
+
+  let before, after;
+  let item = null;
+  if (application.scope === 'check') {
+    const beforeComp = check.comp_cents || 0;
+    if (beforeComp < application.applied_cents) {
+      return res.status(400).json({ error: 'The check comp total no longer covers this discount — resolve it with a manager before removing' });
+    }
+    before = { comp_cents: beforeComp };
+    after = { comp_cents: beforeComp - application.applied_cents };
+  } else {
+    item = db.prepare('SELECT * FROM check_items WHERE id = ? AND check_id = ?').get(application.item_id, check.id);
+    if (!item) return res.status(400).json({ error: 'The discounted line is no longer on this check — the discount cannot be removed cleanly' });
+    if ((item.discount_cents || 0) !== application.applied_cents) {
+      return res.status(400).json({ error: 'The line discount changed since this discount was applied — resolve it from the line before removing' });
+    }
+    before = { discount_cents: item.discount_cents || 0, discount_reason: item.discount_reason || null };
+    after = { discount_cents: 0, discount_reason: null };
+  }
+
+  withTransaction(() => {
+    if (application.scope === 'check') {
+      db.prepare('UPDATE checks SET comp_cents = comp_cents - ? WHERE id = ?').run(application.applied_cents, check.id);
+    } else {
+      db.prepare('UPDATE check_items SET discount_cents = 0, discount_reason = NULL WHERE id = ?').run(item.id);
+    }
+    db.prepare("UPDATE check_discounts SET status = 'removed', removed_at = ?, removed_by_id = ?, removed_by_name = ? WHERE id = ?")
+      .run(nowIso(), req.user.id, req.user.name, application.id);
+  });
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  auditApproval(req, 'discount_remove', { check_id: check.id, item_id: application.item_id != null ? application.item_id : null },
+    { approver: approver.name, approver_id: approver.id, discount_id: application.discount_id, application_id: application.id,
+      name: application.name, kind: application.kind, percent: application.percent, amount_cents: application.amount_cents,
+      scope: application.scope, applied_cents: application.applied_cents, before, after });
+  const updated = db.prepare('SELECT * FROM check_discounts WHERE id = ?').get(application.id);
+  res.json({ application: discountAppView(updated), totals: t });
 });
 
 /* ------------------------------ send + KDS --------------------------------- */
@@ -3349,6 +3729,15 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
 
   const items = billableItems(check.id);
   if (items.length === 0) return res.status(400).json({ error: 'Nothing to split: no billable items' });
+  /* Library item discounts are exact line snapshots whose removal
+   * reverses exactly the applied amount — prorating one across a split
+   * (the ad-hoc behavior) would orphan the application row. Refuse the
+   * split until they are removed. Check-level library discounts ride
+   * comp_cents and, like ad-hoc comps, stay on the source check. */
+  const libItemApps = db.prepare("SELECT * FROM check_discounts WHERE check_id = ? AND item_id IS NOT NULL AND status = 'applied' ORDER BY id").all(check.id);
+  if (libItemApps.length) {
+    return res.status(400).json({ error: `Remove the library discount “${libItemApps[0].name}” before splitting — library item discounts do not split` });
+  }
   const withTotals = items.map((it) => ({ it, line: lineTotal(it) }));
 
   const { mode } = req.body || {};
@@ -7457,6 +7846,13 @@ const API_DOCS = [
   { method: 'POST', path: '/api/checks/:id/send', auth: 'server+', summary: 'Fire held items → KDS, depletes inventory', params: '—' },
   { method: 'POST', path: '/api/checks/:id/void-item', auth: 'server+ (+manager PIN approval)', summary: 'Void an item, audit-logged', params: 'item_id, manager_pin, reason' },
   { method: 'POST', path: '/api/checks/:id/comp', auth: 'server+ (+manager PIN approval)', summary: 'Comp value on a check', params: 'amount_cents, manager_pin, reason' },
+  { method: 'GET', path: '/api/discounts', auth: 'server+', summary: 'Active discount library definitions (the floor picker feed)', params: '—' },
+  { method: 'POST', path: '/api/checks/:id/discounts', auth: 'server+ (+manager PIN when the definition requires approval, or the line already fired)', summary: 'Apply a library discount to a check or one of its lines — snapshots the definition, flows through comp_cents / line discount_cents', params: 'discount_id, item_id?, manager_pin?' },
+  { method: 'POST', path: '/api/checks/:id/discounts/:app_id/remove', auth: 'server+ (+manager PIN when the application required approval)', summary: 'Remove an applied library discount, reversing exactly its applied amount', params: 'manager_pin?' },
+  { method: 'GET', path: '/api/admin/discounts', auth: 'manager', summary: 'List discount library definitions, including inactive', params: '—' },
+  { method: 'POST', path: '/api/admin/discounts', auth: 'manager', summary: 'Create a discount definition', params: 'name, kind, percent|amount_cents, scope, requires_approval?, active?' },
+  { method: 'PUT', path: '/api/admin/discounts/:id', auth: 'manager', summary: 'Update a discount definition (live applications keep their snapshots)', params: 'name?, kind?, percent?, amount_cents?, scope?, requires_approval?, active?' },
+  { method: 'DELETE', path: '/api/admin/discounts/:id', auth: 'manager', summary: 'Delete a never-applied discount definition (applied ones deactivate instead)', params: '—' },
   { method: 'POST', path: '/api/checks/:id/transfer', auth: 'server+ (+manager PIN to take another server\'s check)', summary: 'Transfer check to another server / claim unassigned (NEW 3.6)', params: 'to_server_id, from_server_id, manager_pin?, reason?' },
   { method: 'POST', path: '/api/checks/:id/reopen', auth: 'manager (+fresh manager PIN)', summary: 'Reopen a paid check that still has a positive balance (e.g. refund could not auto-reopen because table was re-seated)', params: 'manager_pin' },
   { method: 'POST', path: '/api/checks/:id/split', auth: 'server+', summary: 'Even / by-seat / by-item split', params: 'mode, ...' },

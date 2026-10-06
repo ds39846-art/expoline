@@ -288,6 +288,17 @@ button, input, select, textarea { font-family: var(--sans); font-size: 1rem; col
 .seat-chip.add { border-style: dashed; color: var(--brass-hi); }
 .seat-chip .seat-ren { margin-left: 8px; font-size: .8rem; opacity: .85; }
 .cart-tools { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+/* Discount library (audit gap #4): picker rows, applied strip, line tag. */
+.disc-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.disc-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--ink-3);
+  color: var(--text); font-size: 1rem; cursor: pointer; text-align: left; }
+.disc-row:hover { border-color: var(--brass-hi); }
+.disc-save { font-weight: 700; color: var(--brass-hi); white-space: nowrap; }
+.libdisc-strip { margin-top: 10px; border-top: 1px dashed var(--line-soft); padding-top: 8px;
+  display: flex; flex-direction: column; gap: 6px; }
+.libdisc-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: .92rem; }
+.cart-line .disc-tag { color: var(--brass-hi); font-weight: 600; }
 .cart-line { cursor: pointer; }
 .cart-line.qsel { background: var(--ink-3); border-radius: 8px; }
 .quick-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 8px 2px 10px; border-bottom: 1px dashed var(--line-soft); }

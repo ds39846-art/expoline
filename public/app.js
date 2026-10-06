@@ -1950,6 +1950,120 @@ async function renderOrder(app, checkId) {
     toast(item.name + ' → Seat ' + seat);
   }
 
+  /* Discount library picker (audit gap #4): one modal flow for both
+     scopes. Check scope bases the savings preview on the current
+     subtotal; item scope on the line gross — the same bases the
+     server computes on, so the preview matches the applied amount.
+     Online-only, like comps: the offline outbox and the LAN op
+     vocabulary have no discount op, so offline gets a plain refusal
+     instead of a queue entry that could never sync. */
+  const openDiscountPicker = async (opts) => {
+    const scope = opts.scope;
+    const item = opts.item || null;
+    if (isOffline()) { toast('Discounts apply online — reconnect first (offline has no discount op, same as comps)', 'err'); return; }
+    const mine = (check.library_discounts || []).filter((a) => scope === 'check' ? !a.item_id : (item && a.item_id === item.id));
+    const title = scope === 'check' ? 'Discount — whole check' : 'Discount — ' + (item ? item.name : 'line');
+    if (mine.length) {
+      const a = mine[0];
+      const bd = openModal('<h2>' + esc(title) + '</h2>' +
+        '<p>Applied: <b>' + esc(a.name) + '</b> — −' + fmt(a.applied_cents) +
+        (a.requires_approval ? ' <span class="pill held">manager PIN to remove</span>' : '') + '</p>' +
+        (a.requires_approval ? '<div class="field"><label for="ld-pin">Manager PIN</label><input type="password" id="ld-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' : '') +
+        '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Keep</button>' +
+        '<button class="btn btn-danger" data-x="rm">Remove discount</button></div>');
+      $('[data-x="c"]', bd).onclick = () => closeModal();
+      $('[data-x="rm"]', bd).onclick = async () => {
+        const pin = a.requires_approval ? ($('#ld-pin', bd).value || '').trim() : '';
+        if (a.requires_approval && !pin) { toast('Enter the manager PIN', 'err'); return; }
+        await doRemoveDiscount(a, pin);
+      };
+      return;
+    }
+    let defs = [];
+    try { defs = await api('/api/discounts'); } catch (e) { handleApiError(e); return; }
+    const list = discountsForScope(defs, scope);
+    if (!list.length) { toast('No active ' + (scope === 'check' ? 'check-level' : 'item-level') + ' discounts in the library', 'err'); return; }
+    const base = scope === 'check' ? ((check.totals || {}).subtotal || 0)
+      : (item ? (item.unit_price_cents || 0) * (item.qty || 1) + (item.modifiers || []).reduce((s, m) => s + (m.price_delta_cents || 0) * (item.qty || 1), 0) : 0);
+    const bd = openModal('<h2>' + esc(title) + '</h2>' +
+      '<p class="muted small">Savings preview on ' + fmt(base) + (scope === 'check' ? ' subtotal' : ' line value') + '. The server computes the final amount.</p>' +
+      '<div class="disc-list">' + list.map((d) =>
+        '<button class="disc-row" data-pick="' + d.id + '"><span><b>' + esc(d.name) + '</b> <span class="muted">' + esc(discountValueLabel(d)) + '</span>' +
+        (d.requires_approval ? ' <span class="pill held">manager PIN</span>' : '') + '</span>' +
+        '<span class="disc-save">−' + fmt(discountSavingsCents(d, base)) + '</span></button>').join('') + '</div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button></div>');
+    $('[data-x="c"]', bd).onclick = () => closeModal();
+    $$('[data-pick]', bd).forEach((btn) => btn.onclick = () => {
+      const d = list.find((x) => String(x.id) === String(btn.dataset.pick));
+      if (d) applyDiscountFlow(d, { scope, item, base });
+    });
+  };
+
+  /* Apply one picked definition. Approval-flagged definitions — and
+     any item pick on a fired line, mirroring the ad-hoc rule — detour
+     through a PIN step first. A 403 need_manager_pin from the server
+     (the flag changed under us) lands in the same PIN step and
+     retries, the split-flow pattern. */
+  const applyDiscountFlow = (d, ctx) => {
+    const post = async (pin) => {
+      try {
+        const body = { discount_id: d.id };
+        if (ctx.scope === 'item') body.item_id = ctx.item.id;
+        if (pin) body.manager_pin = pin;
+        const r = await api('/api/checks/' + realId(checkId) + '/discounts', 'POST', body);
+        closeModal();
+        toast('Discount applied — ' + d.name + ' −' + fmt(r.application.applied_cents), 'ok');
+        await refreshAfterQuick(r.totals);
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 403 && e.body && e.body.need_manager_pin) { pinStep(); return; }
+        if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e);
+      }
+    };
+    const pinStep = () => {
+      const bd = openModal('<h2>Manager approval</h2>' +
+        '<p><b>' + esc(d.name) + '</b> — saves ' + fmt(discountSavingsCents(d, ctx.base)) + '. A manager enters their PIN to apply it.</p>' +
+        '<div class="field"><label for="ld-pin">Manager PIN</label><input type="password" id="ld-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' +
+        '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Apply discount</button></div>');
+      $('[data-x="c"]', bd).onclick = () => closeModal();
+      $('[data-x="go"]', bd).onclick = () => {
+        const pin = ($('#ld-pin', bd).value || '').trim();
+        if (!pin) { toast('Enter the manager PIN', 'err'); return; }
+        post(pin);
+      };
+    };
+    const needsPin = d.requires_approval || (ctx.scope === 'item' && ctx.item && ctx.item.state !== 'held');
+    if (needsPin) pinStep(); else post('');
+  };
+
+  const doRemoveDiscount = async (a, pin) => {
+    try {
+      const body = {};
+      if (pin) body.manager_pin = pin;
+      const r = await api('/api/checks/' + realId(checkId) + '/discounts/' + a.id + '/remove', 'POST', body);
+      closeModal();
+      toast('Discount removed — ' + a.name + ' (' + fmt(a.applied_cents) + ' restored)', 'ok');
+      await refreshAfterQuick(r.totals);
+    } catch (e) {
+      if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e);
+    }
+  };
+  const removeDiscountFlow = (a) => {
+    if (a.requires_approval) {
+      const bd = openModal('<h2>Manager approval</h2>' +
+        '<p>Removing <b>' + esc(a.name) + '</b> (−' + fmt(a.applied_cents) + ') needs a manager PIN — it required approval to apply.</p>' +
+        '<div class="field"><label for="ld-pin">Manager PIN</label><input type="password" id="ld-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' +
+        '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-danger" data-x="go">Remove discount</button></div>');
+      $('[data-x="c"]', bd).onclick = () => closeModal();
+      $('[data-x="go"]', bd).onclick = () => {
+        const pin = ($('#ld-pin', bd).value || '').trim();
+        if (!pin) { toast('Enter the manager PIN', 'err'); return; }
+        doRemoveDiscount(a, pin);
+      };
+      return;
+    }
+    confirmDialog('Remove discount', 'Remove ' + a.name + ' (−' + fmt(a.applied_cents) + ')? The totals go back to what they were before it was applied.', 'Remove', () => doRemoveDiscount(a, ''));
+  };
+
   function drawCart() {
     /* The seat strip's per-seat counts derive from the same staged + held
        lines the cart renders — repaint it on EVERY cart mutation (stage,
@@ -1965,7 +2079,16 @@ async function renderOrder(app, checkId) {
     const toolsHtml = '<div class="cart-tools">' +
       '<button class="btn btn-sm' + (selectMode ? ' btn-primary' : ' btn-ghost') + '" id="sel-toggle" aria-pressed="' + selectMode + '">' +
       (selectMode ? '✓ Selecting' : '☰ Select') + '</button>' +
+      '<button class="btn btn-sm btn-ghost" id="disc-open" title="Apply a library discount to the whole check">％ Discount</button>' +
       '<span class="muted small">' + (selectMode ? 'Tick lines, then Move to seat…' : 'Tap a line for quick actions') + '</span></div>';
+    /* Applied library discounts strip: every live application with
+       its exact amount and a remove control, under the lines it
+       affects. Removal restores the pre-discount totals server-side. */
+    const libApps = check.library_discounts || [];
+    const stripHtml = libApps.length ? '<div class="libdisc-strip">' + libApps.map((a) =>
+      '<div class="libdisc-row"><span>％ <b>' + esc(a.name) + '</b>' + (a.item_id ? ' <span class="muted small">(line)</span>' : '') +
+      ' — −' + fmt(a.applied_cents) + (a.requires_approval ? ' <span class="pill held">PIN</span>' : '') + '</span>' +
+      '<button class="btn btn-sm btn-ghost" data-libdisc-remove="' + a.id + '">Remove</button></div>').join('') + '</div>' : '';
     cartBody.innerHTML = toolsHtml + seats.map((s) =>
       '<div class="seat-group"><div class="seat-name">' + (s ? 'Seat ' + s + (seatNames[s] ? ' · ' + esc(seatNames[s]) : '') : 'Unseated') + '</div>' +
       bySeat[s].map(({ kind, ref }) => {
@@ -2002,17 +2125,28 @@ async function renderOrder(app, checkId) {
         const editBtn = (kind !== 'staged' && (ref.state === 'held' || ref.state === 'sent'))
           ? '<button class="icon-btn" data-edit="' + esc(String(ref.id)) + '" aria-label="Edit item" title="Edit item (fired items need manager PIN)">✎</button>'
           : '';
+        /* Library discount for this line: opens the item-scope picker
+           (or the applied view with its remove control). */
+        const discBtn = (kind !== 'staged' && (ref.state === 'held' || ref.state === 'sent'))
+          ? '<button class="icon-btn" data-disc="' + esc(String(ref.id)) + '" aria-label="Library discount" title="Library discount">％</button>'
+          : '';
+        /* Any line discount (library or ad-hoc) shows its amount and
+           reason on the line — before this batch the cart priced a
+           discounted line at full value and said nothing. */
+        const discSeg = kind !== 'staged' && (ref.discount_cents || 0) > 0
+          ? '<span class="mods disc-tag">−' + fmt(ref.discount_cents) + (ref.discount_reason ? ' · ' + esc(ref.discount_reason) : '') + '</span>' : '';
         /* Line summary segments join with a real space: the note and
            allergy spans are inline, so bare concatenation rendered them
            run together as one blob (note text fused to the allergy
            flag). Block segments (mods, course) ignore the extra space. */
         const nmSegs = [esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '')];
         if (mods) nmSegs.push('<span class="mods">' + mods + '</span>');
+        if (discSeg) nmSegs.push(discSeg);
         if (courseHtml) nmSegs.push(courseHtml);
         if (noteHtml) nmSegs.push(noteHtml);
         if (allergyHtml) nmSegs.push(allergyHtml);
         const lineHtml = '<div class="cart-line' + (quickKey === selKey ? ' qsel' : '') + '" data-line="' + esc(selKey) + '">' + selBox + '<div class="nm">' + nmSegs.join(' ') + '</div>' + pill +
-          '<span class="pr">' + fmt(lineTotal) + '</span>' + editBtn + refireBtn + voidBtn + '</div>';
+          '<span class="pr">' + fmt(lineTotal) + '</span>' + discBtn + editBtn + refireBtn + voidBtn + '</div>';
         /* Quick-action bar: tapping the line opens qty/seat steppers plus
            Repeat / Void / Modify directly under it — qty and seat apply in
            one tap via PATCH, no modal round-trip. */
@@ -2029,7 +2163,7 @@ async function renderOrder(app, checkId) {
       '<span class="muted small" id="sel-count"></span>' +
       '<button class="btn btn-sm" id="sel-send">Send selected</button>' +
       '<button class="btn btn-sm" id="sel-move">Move to seat…</button>' +
-      '<button class="btn btn-sm btn-ghost" id="sel-clear">Clear</button></div>';
+      '<button class="btn btn-sm btn-ghost" id="sel-clear">Clear</button></div>' + stripHtml;
     $$('[data-void]', cartBody).forEach((b) => b.onclick = () => {
       const id = b.dataset.void, kind = b.dataset.kind;
       if (kind === 'staged') {
@@ -2048,6 +2182,18 @@ async function renderOrder(app, checkId) {
     $$('[data-edit]', cartBody).forEach((b) => b.onclick = async () => {
       const it = (check.items || []).find((x) => String(x.id) === String(b.dataset.edit));
       if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
+    });
+    /* Discount library: check-scope picker from the tools row, item-
+       scope picker from each line, removal from the applied strip. */
+    const discOpen = $('#disc-open', cartBody);
+    if (discOpen) discOpen.onclick = () => openDiscountPicker({ scope: 'check' });
+    $$('[data-disc]', cartBody).forEach((b) => b.onclick = () => {
+      const it = (check.items || []).find((x) => String(x.id) === String(b.dataset.disc));
+      if (it) openDiscountPicker({ scope: 'item', item: it });
+    });
+    $$('[data-libdisc-remove]', cartBody).forEach((b) => b.onclick = () => {
+      const a = (check.library_discounts || []).find((x) => String(x.id) === String(b.dataset.libdiscRemove));
+      if (a) removeDiscountFlow(a);
     });
     /* Select toggle: the multi-select checkboxes render only in select
        mode, so the default cart stays clean for line tapping. */
@@ -3149,6 +3295,30 @@ function parseTipInput(str) {
   return { cents: Math.round(v * 100) };
 }
 
+/* Discount library (audit gap #4): three small helpers carry the
+   client logic for the floor picker and the settings editor. The
+   value label renders a definition the way staff say it. The savings
+   preview mirrors the server math exactly (percent rounds with
+   Math.round on the base; fixed is the stored cents) and clamps at
+   the base for display only — the server recomputes and enforces on
+   apply, so a stale preview can never over-discount. The scope
+   filter keeps inactive definitions out of the picker even if a
+   cached list still carries them. */
+function discountValueLabel(d) {
+  if (!d) return '';
+  if (d.kind === 'percent') return (Math.round((Number(d.percent) || 0) * 100) / 100) + '% off';
+  return fmt(d.amount_cents || 0) + ' off';
+}
+function discountSavingsCents(d, baseCents) {
+  const base = Math.max(0, Math.round(Number(baseCents) || 0));
+  if (!d || base <= 0) return 0;
+  const raw = d.kind === 'percent' ? Math.round(base * (Number(d.percent) || 0) / 100) : (Number(d.amount_cents) || 0);
+  return Math.max(0, Math.min(base, raw));
+}
+function discountsForScope(list, scope) {
+  return (Array.isArray(list) ? list : []).filter((d) => d && d.scope === scope && d.active !== false && d.active !== 0);
+}
+
 /* ============================================================
    VIEW: PAY (server) — line-by-line math, splits, payments, close.
    ============================================================ */
@@ -3166,12 +3336,19 @@ async function renderPay(app, checkId) {
 
   const sc = await siteConfig();
 
+  /* Library discounts ride the comp accumulator server-side, so the
+     summary itemizes them by name and the Comp row shows only the
+     ad-hoc remainder — the guest sees exactly which named discount
+     they got, and the two never double-print. */
+  const libCheckApps = (check.library_discounts || []).filter((a) => !a.item_id);
+  const libSum = libCheckApps.reduce((s, a) => s + (a.applied_cents || 0), 0);
   const moneyRows = [
     ['Subtotal', fmt(t.subtotal)],
     [pctLabel(sc.surcharge_pct) + ' surcharge', fmt(t.surcharge)],
     t.service_charge ? [pctLabel(sc.service_charge_pct) + ' service charge <span class="lbl-note">' + sc.service_charge_min_guests + '+ guests · mandatory — not a tip</span>', fmt(t.service_charge)] : null,
     ['Tax', fmt(t.tax)],
-    t.comp ? ['Comp <span class="lbl-note">manager approved</span>', '−' + fmt(t.comp)] : null,
+    ...libCheckApps.map((a) => ['Discount · ' + esc(a.name) + ' <span class="lbl-note">library</span>', '−' + fmt(a.applied_cents)]),
+    (t.comp - libSum) > 0 ? ['Comp <span class="lbl-note">manager approved</span>', '−' + fmt(t.comp - libSum)] : null,
   ].filter(Boolean);
 
   app.innerHTML =
@@ -3742,6 +3919,10 @@ async function renderPay(app, checkId) {
    accountant disclaimer. Never invents values — all from server totals.
    ============================================================ */
 function printReceipt(check, t, items, sc) {
+  /* Library check discounts itemize by name; the Comp line prints
+     only the ad-hoc remainder (they share the comp accumulator). */
+  const libApps = (check.library_discounts || []).filter((a) => !a.item_id);
+  const libSum = libApps.reduce((s, a) => s + (a.applied_cents || 0), 0);
   const rows = (items || []).map((i) => {
     const q = i.qty || 1, p = i.price_cents || 0;
     return '<tr><td>' + esc(i.name || 'Item') + (q > 1 ? ' × ' + q : '') + '</td><td class="r">' + fmt(p * q) + '</td></tr>';
@@ -3766,7 +3947,10 @@ function printReceipt(check, t, items, sc) {
     (t.surcharge ? '<tr><td>' + pctLabel(sc.surcharge_pct) + ' surcharge</td><td class="r">' + fmt(t.surcharge) + '</td></tr>' : '') +
     (t.service_charge ? '<tr><td>' + pctLabel(sc.service_charge_pct) + ' service charge<br><span class="dim">' + sc.service_charge_min_guests + '+ guests · mandatory — NOT a tip</span></td><td class="r">' + fmt(t.service_charge) + '</td></tr>' : '') +
     '<tr><td>Tax</td><td class="r">' + fmt(t.tax) + '</td></tr>' +
-    (t.comp ? '<tr><td>Comp (manager approved)</td><td class="r">−' + fmt(t.comp) + '</td></tr>' : '') +
+    (libApps.map((a) =>
+      '<tr><td>Discount · ' + esc(a.name) + '</td><td class="r">−' + fmt(a.applied_cents) + '</td></tr>').join('')) +
+    ((t.comp - libSum) > 0
+      ? '<tr><td>Comp (manager approved)</td><td class="r">−' + fmt(t.comp - libSum) + '</td></tr>' : '') +
     '<tr class="tot"><td>Total</td><td class="r">' + fmt(t.total) + '</td></tr></table>' +
     (payRows ? '<table style="margin-top:8px">' + payRows +
       '<tr><td>Paid</td><td class="r">' + fmt(t.paid) + '</td></tr>' +
@@ -3861,6 +4045,12 @@ async function renderSvcChargeSettings(app) {
     '<label>Manager PIN<input type="password" id="dr-pin" inputmode="numeric" maxlength="8" placeholder="••••" style="max-width:140px"></label>' +
     '</div>' +
     '<button class="btn btn-primary" id="dr-save">Save drawer policy</button></div>' +
+    '<div class="card mt"><h2>Discount library</h2>' +
+    '<p class="muted small">Named discounts servers apply from a picker on the order screen — no more inventing amounts at the terminal. Percent comes off the check subtotal (whole check) or the line value (single line); a fixed discount is a dollar amount. Flag a discount <b>manager PIN</b> and applying or removing it needs a manager at the terminal. Editing or deactivating a definition never changes checks already discounted — they keep the name and amount they were given.</p>' +
+    '<div class="t-scroll"><table class="t-table" id="disc-table">' +
+    '<thead><tr><th>Name</th><th>Value</th><th>Applies to</th><th>Approval</th><th>Status</th><th></th></tr></thead>' +
+    '<tbody><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table></div>' +
+    '<button class="btn btn-primary" id="disc-new" style="margin-top:10px">+ New discount</button></div>' +
     '<div class="card mt"><h3>Change history</h3><p class="muted small">Every change is audit-logged with before/after values.</p>' +
     '<div class="t-scroll"><table class="t-table" id="sc-audit">' +
     '<thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Detail</th></tr></thead>' +
@@ -3931,8 +4121,94 @@ async function renderSvcChargeSettings(app) {
       $('#dr-role').value = cfg.drawer_close_role === 'server' ? 'server' : 'manager';
     } catch (e) { /* leave default */ }
   };
+
+  /* Discount library editor (audit gap #4): list + create/edit in a
+     modal, deactivate instead of delete once a discount has history
+     (the server refuses the delete and says why). Every save lands in
+     the approval audit via the endpoints. */
+  const discRow = (d) => '<tr><td><b>' + esc(d.name) + '</b></td>' +
+    '<td>' + esc(discountValueLabel(d)) + '</td>' +
+    '<td>' + (d.scope === 'check' ? 'Whole check' : 'Single line') + '</td>' +
+    '<td>' + (d.requires_approval ? '<span class="pill held">manager PIN</span>' : '<span class="muted small">—</span>') + '</td>' +
+    '<td>' + (d.active ? '<span class="pill">active</span>' : '<span class="pill sent">inactive</span>') + '</td>' +
+    '<td style="text-align:right;white-space:nowrap">' +
+    '<button class="btn btn-sm" data-disc-edit="' + d.id + '">Edit</button> ' +
+    '<button class="btn btn-sm btn-ghost" data-disc-toggle="' + d.id + '">' + (d.active ? 'Deactivate' : 'Activate') + '</button> ' +
+    '<button class="btn btn-sm btn-ghost" data-disc-del="' + d.id + '">Delete</button></td></tr>';
+  const loadDiscounts = async () => {
+    let rows = [];
+    try { rows = await api('/api/admin/discounts'); } catch (e) { rows = []; }
+    const tb = $('#disc-table tbody', app);
+    if (tb) tb.innerHTML = rows.length ? rows.map(discRow).join('') : '<tr><td colspan="6" class="muted">No discounts yet — create the first one.</td></tr>';
+    $$('[data-disc-edit]', app).forEach((b) => b.onclick = () =>
+      openDiscountEditor(rows.find((x) => String(x.id) === String(b.dataset.discEdit))));
+    $$('[data-disc-toggle]', app).forEach((b) => b.onclick = async () => {
+      const d = rows.find((x) => String(x.id) === String(b.dataset.discToggle));
+      if (!d) return;
+      try {
+        await api('/api/admin/discounts/' + d.id, 'PUT', { active: !d.active });
+        toast(d.name + (d.active ? ' deactivated' : ' activated'), 'ok');
+        await loadDiscounts();
+      } catch (e) { handleApiError(e); }
+    });
+    $$('[data-disc-del]', app).forEach((b) => b.onclick = () => {
+      const d = rows.find((x) => String(x.id) === String(b.dataset.discDel));
+      if (!d) return;
+      confirmDialog('Delete discount', 'Delete “' + d.name + '” for good? A discount that has been applied to checks cannot be deleted — deactivate it instead, and its history stays readable.', 'Delete', async () => {
+        try { await api('/api/admin/discounts/' + d.id, 'DELETE'); toast(d.name + ' deleted', 'ok'); await loadDiscounts(); }
+        catch (e) { if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e); }
+      });
+    });
+  };
+  const openDiscountEditor = (d) => {
+    const isNew = !d;
+    d = d || { name: '', kind: 'percent', percent: 10, amount_cents: 500, scope: 'check', requires_approval: false, active: true };
+    const bd = openModal('<h2>' + (isNew ? 'New discount' : 'Edit discount') + '</h2>' +
+      '<div class="field"><label for="de-name">Name</label><input type="text" id="de-name" maxlength="40" value="' + esc(d.name) + '" placeholder="e.g. Military" autocomplete="off"></div>' +
+      '<div class="form-grid">' +
+      '<label>Type<select id="de-kind"><option value="percent"' + (d.kind === 'percent' ? ' selected' : '') + '>Percent off</option><option value="fixed"' + (d.kind === 'fixed' ? ' selected' : '') + '>Fixed amount off</option></select></label>' +
+      '<label>Applies to<select id="de-scope"><option value="check"' + (d.scope === 'check' ? ' selected' : '') + '>Whole check</option><option value="item"' + (d.scope === 'item' ? ' selected' : '') + '>Single line</option></select></label></div>' +
+      '<div class="field"><label for="de-val" id="de-val-label">Value</label><input type="number" id="de-val" min="0" step="0.01" inputmode="decimal"></div>' +
+      '<div class="field"><label class="check-line"><input type="checkbox" id="de-appr"' + (d.requires_approval ? ' checked' : '') + '> Requires a manager PIN to apply and remove</label></div>' +
+      '<div class="field"><label class="check-line"><input type="checkbox" id="de-active"' + (d.active ? ' checked' : '') + '> Active — servers can apply it</label></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">' + (isNew ? 'Create discount' : 'Save changes') + '</button></div>');
+    const valInput = $('#de-val', bd), valLabel = $('#de-val-label', bd), kindSel = $('#de-kind', bd);
+    valInput.value = d.kind === 'percent' ? (d.percent != null ? d.percent : '') : (d.amount_cents != null ? d.amount_cents / 100 : '');
+    const syncLabel = () => {
+      valLabel.textContent = kindSel.value === 'percent' ? 'Percent (%)' : 'Amount ($)';
+      valInput.placeholder = kindSel.value === 'percent' ? '10' : '5.00';
+    };
+    syncLabel();
+    kindSel.onchange = syncLabel;
+    $('[data-x="c"]', bd).onclick = () => closeModal();
+    $('[data-x="go"]', bd).onclick = async () => {
+      const name = $('#de-name', bd).value.trim();
+      if (!name) { toast('Give the discount a name', 'err'); return; }
+      const v = parseFloat(valInput.value);
+      if (!(v > 0)) { toast('Enter a value above zero', 'err'); return; }
+      const body = { name, kind: kindSel.value, scope: $('#de-scope', bd).value,
+        requires_approval: $('#de-appr', bd).checked, active: $('#de-active', bd).checked };
+      if (body.kind === 'percent') {
+        if (v > 100) { toast('Percent cannot exceed 100', 'err'); return; }
+        body.percent = v;
+      } else {
+        body.amount_cents = Math.round(v * 100);
+      }
+      try {
+        if (isNew) await api('/api/admin/discounts', 'POST', body);
+        else await api('/api/admin/discounts/' + d.id, 'PUT', body);
+        closeModal();
+        toast('Discount saved', 'ok');
+        await loadDiscounts();
+      } catch (e) { if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e); }
+    };
+  };
+  const discNew = $('#disc-new');
+  if (discNew) discNew.onclick = () => openDiscountEditor(null);
+
   await load();
   await loadDrawer();
+  await loadDiscounts();
 }
 
 /* ============================================================
