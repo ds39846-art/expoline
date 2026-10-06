@@ -1040,6 +1040,10 @@ async function renderFloor(app) {
       '<button class="btn btn-primary" data-x="go">Open check</button></div>');
     $('[data-s="dec"]', bd).onclick = () => { guests = Math.max(1, guests - 1); $('#g-val', bd).textContent = guests; };
     $('[data-s="inc"]', bd).onclick = () => { guests = Math.min(24, guests + 1); $('#g-val', bd).textContent = guests; };
+    /* Tap the number to type the party size (WS-B) — same local guests
+       value the steppers drive, same 1..24 bounds and bounce toast. */
+    window.ParityOrders.tappableValue($('#g-val', bd), { get: () => guests, min: 1, max: 24, label: 'Guests',
+      onApply: (n) => { guests = n; $('#g-val', bd).textContent = n; } });
     $('[data-x="cancel"]', bd).onclick = closeModal;
     $('[data-x="go"]', bd).onclick = async () => {
       tabName = $('#tab-name', bd).value.trim();
@@ -1392,7 +1396,7 @@ async function renderOrder(app, checkId) {
     '<a class="btn btn-ghost" href="#/floor" aria-label="Back to floor">‹</a>' +
     '<span class="table-label">' + esc(check.table_label || check.table || ('Check ' + String(checkId).slice(-4))) + '</span>' +
     (check.tab_name ? '<span class="muted">· ' + esc(check.tab_name) + '</span>' : '') +
-    '<span class="muted small" id="hdr-guests">' + guests + ' guests</span>' +
+    '<span class="muted small" id="hdr-guests"><span id="hdr-guests-n">' + guests + '</span> guests</span>' +
     '<button class="icon-btn" id="check-settings" title="Check settings — guests, tab name, coursing, order note, void check" aria-label="Check settings">⚙</button>' +
     '<span class="spacer"></span>' +
     '<button class="pill dp-pill" id="dp-pill" title="Menu daypart — auto by clock, tap to override">' + esc(dpLabel()) + '</button>' +
@@ -1433,7 +1437,44 @@ async function renderOrder(app, checkId) {
   /* Header guests label: the header is only rebuilt on full renders, so
      guest_count changes (seat add, typed-seat growth) repaint it in place
      from the light-refresh paths — otherwise it reads stale until HOLD. */
-  const paintGuests = () => { const el = $('#hdr-guests'); if (el) el.textContent = guests + ' guests'; };
+  const paintGuests = () => {
+    /* The count lives in its own span (#hdr-guests-n) so tap-to-type can
+       own the number without eating the " guests" suffix on restore. */
+    const n = $('#hdr-guests-n');
+    if (n) { n.textContent = guests; return; }
+    const el = $('#hdr-guests');
+    if (el) el.textContent = guests + ' guests';
+  };
+
+  /* The header count itself is tap-to-type (WS-B): type the party size
+     and the check PATCHes to match — the same endpoint "+ Seat" and
+     Check settings use, no stepper-tapping and no modal round-trip.
+     A shrink the server refuses (seats beyond the new count still hold
+     lines or names) surfaces the server's message and the label keeps
+     the real count. */
+  const applyGuestCount = async (n) => {
+    if (n === guests) return;
+    if (String(checkId).startsWith('tmp-')) {
+      try {
+        const d = JSON.parse(localStorage.getItem('expoline.draft:' + checkId));
+        if (d) { d.guest_count = n; localStorage.setItem('expoline.draft:' + checkId, JSON.stringify(d)); }
+      } catch (e) { /* best effort — the draft re-syncs on next render */ }
+      check.guest_count = n; guests = n;
+      paintGuests(); drawSeats(); drawCart();
+      return;
+    }
+    if (isOffline()) { toast('Changing the guest count needs a connection — reconnect first', 'err'); paintGuests(); return; }
+    try {
+      await api('/api/checks/' + realId(checkId), 'PATCH', { guest_count: n });
+      const v = await getCheckView(checkId).catch(() => null);
+      if (v) { check = v.check; guests = check.guest_count || n; }
+      else guests = n;
+    } catch (e) { handleApiError(e); }
+    paintGuests(); drawSeats(); drawCart();
+  };
+  const hdrGuestsEl = $('#hdr-guests-n');
+  if (hdrGuestsEl) PO.tappableValue(hdrGuestsEl, { get: () => guests, min: 1, max: 24, label: 'Guests',
+    onApply: (n) => { applyGuestCount(n); } });
 
   /* Seat strip: chips carry per-seat line counts; "+ Seat" grows the check
      (PATCH guest_count — server-level, no manager PIN) and selects the new
@@ -2482,6 +2523,10 @@ async function renderOrder(app, checkId) {
       '<button class="btn btn-primary" data-x="go">Save</button></div>');
     $('[data-gc="dec"]', bd).onclick = () => { gc = Math.max(1, gc - 1); $('#cs-gc', bd).textContent = gc; };
     $('[data-gc="inc"]', bd).onclick = () => { gc = Math.min(24, gc + 1); $('#cs-gc', bd).textContent = gc; };
+    /* Tap the number to type the guest count (WS-B) — same local gc the
+       steppers drive; Save PATCHes it exactly as before. */
+    PO.tappableValue($('#cs-gc', bd), { get: () => gc, min: 1, max: 24, label: 'Guests',
+      onApply: (n) => { gc = n; $('#cs-gc', bd).textContent = n; } });
     $('[data-x="c"]', bd).onclick = closeModal;
     $('[data-x="go"]', bd).onclick = async () => {
       const body = { guest_count: gc, tab_name: $('#cs-tab', bd).value.trim() || null,
