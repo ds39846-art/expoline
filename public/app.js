@@ -3073,6 +3073,55 @@ async function renderKds(app) {
 }
 
 /* ============================================================
+   Split-tender fields for the Cash / Card / House payment
+   dialogs. One Amount field (the principal applied to the bill)
+   plus one Tip field, shared by all three tenders so a payment
+   can be split across tenders or recorded partially. The rules
+   mirror POST /api/checks/:id/payments exactly: the principal
+   must be a positive integer-cent amount no larger than the
+   remaining balance, and the tip must be zero or more with no
+   server-side cap. Cash over-tender is expressed through the
+   cash dialog Tendered field (change = tendered - payTotal),
+   never by inflating the principal past the balance.
+   ============================================================ */
+function splitTenderFields(due, tipCents) {
+  const tip = Math.max(0, Math.round(Number(tipCents) || 0));
+  const principal = Math.max(0, Math.round(Number(due) || 0) - tip);
+  return '<div class="field"><label for="st-amount">Amount ($)</label>' +
+    '<input type="number" id="st-amount" min="0" step="0.01" inputmode="decimal" value="' + (principal / 100).toFixed(2) + '"></div>' +
+    '<div class="field"><label for="st-tip">Tip ($)</label>' +
+    '<input type="number" id="st-tip" min="0" step="0.01" inputmode="decimal" value="' + (tip / 100).toFixed(2) + '"></div>';
+}
+
+/* Read and validate the split-tender fields inside a dialog.
+   Returns { principal, tip, payTotal, error } in integer cents;
+   on any validation failure the money fields are 0 and error is
+   a human string the dialog can toast or gate its button on.
+   Empty or non-numeric input is an error, never NaN cents. */
+function readSplitTender(bd, balance) {
+  const out = { principal: 0, tip: 0, payTotal: 0, error: null };
+  const amtEl = $('#st-amount', bd);
+  const tipEl = $('#st-tip', bd);
+  if (!amtEl || !tipEl) { out.error = 'Payment fields are missing — close and reopen the payment dialog'; return out; }
+  const aRaw = String(amtEl.value == null ? '' : amtEl.value).trim();
+  const tRaw = String(tipEl.value == null ? '' : tipEl.value).trim();
+  const aNum = aRaw === '' ? NaN : Number(aRaw);
+  const tNum = tRaw === '' ? NaN : Number(tRaw);
+  if (!isFinite(aNum)) { out.error = 'Enter a payment amount'; return out; }
+  if (!isFinite(tNum)) { out.error = 'Enter a tip amount (0 for none)'; return out; }
+  const principal = Math.round(aNum * 100);
+  const tip = Math.round(tNum * 100);
+  const bal = Math.max(0, Math.round(Number(balance) || 0));
+  if (principal <= 0) { out.error = 'Amount must be more than $0.00'; return out; }
+  if (principal > bal) { out.error = 'Amount exceeds the balance due (' + fmt(bal) + ')'; return out; }
+  if (tip < 0) { out.error = 'Tip cannot be negative'; return out; }
+  out.principal = principal;
+  out.tip = tip;
+  out.payTotal = principal + tip;
+  return out;
+}
+
+/* ============================================================
    VIEW: PAY (server) — line-by-line math, splits, payments, close.
    ============================================================ */
 async function renderPay(app, checkId) {
