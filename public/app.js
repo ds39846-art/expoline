@@ -1545,6 +1545,12 @@ async function renderOrder(app, checkId) {
       ? item.modifier_groups : null;
     const flatMods = groups ? [] : itemModifiers(item);
     let qty = (preset && preset.qty) || 1;
+    /* Seat + course are pickable HERE, while the line is being rung —
+       not only later on the held line. Seat starts from the preset
+       (staged-line Modify) or the working seat; course from the preset,
+       else the item's menu default. */
+    let mSeat = (preset && preset.seat != null) ? preset.seat : seat;
+    const startCourse = preset && preset.course !== undefined ? preset.course : (item.course || null);
     /* Fast path for FRESH adds only: nothing to configure, so stage in
        one tap. In edit mode (preset from a staged line's "More…") the
        modal must ALWAYS open — even when the item has no modifiers —
@@ -1588,8 +1594,13 @@ async function renderOrder(app, checkId) {
         }).join('') + '</div>' : '');
     const bd = openModal(
       '<h2>' + esc(item.name) + ' <span class="muted">· ' + fmt(item.price_cents) + '</span></h2>' +
-      '<p class="muted small">Seat ' + seat + (isDrink(item, catName) ? ' · <span class="drink-tag">BAR</span> fires to bar on send' : '') + '</p>' +
+      '<p class="muted small">Seat <span id="m-seat-note">' + mSeat + '</span>' + (isDrink(item, catName) ? ' · <span class="drink-tag">BAR</span> fires to bar on send' : '') + '</p>' +
       '<div class="field"><label>Quantity</label><div class="stepper"><button data-q="dec">−</button><span class="val" id="m-qty">' + qty + '</span><button data-q="inc">+</button></div></div>' +
+      '<div class="field"><label>Seat</label><div class="stepper"><button data-sb="dec">−</button><span class="val" id="m-seat">' + mSeat + '</span><button data-sb="inc">+</button></div></div>' +
+      '<div class="field"><label for="m-course">Course</label><select id="m-course">' +
+      '<option value=""' + (startCourse ? '' : ' selected') + '>—</option>' +
+      ME_COURSES.map((c) => '<option value="' + c + '"' + (startCourse === c ? ' selected' : '') + '>' + c + '</option>').join('') +
+      '</select></div>' +
       groupsHtml +
       '<div class="field"><label for="m-note">Special request <span class="muted small">(optional, prints on the KDS ticket)</span></label>' +
       '<input type="text" id="m-note" maxlength="140" value="' + esc((preset && preset.note) || '') + '" placeholder="e.g. no onions, dressing on side" autocomplete="off"></div>' +
@@ -1602,6 +1613,18 @@ async function renderOrder(app, checkId) {
     /* Tap-to-type on the quantity — same local qty the steppers drive. */
     PO.tappableValue($('#m-qty', bd), { get: () => qty, min: 1, max: 24, label: 'Quantity',
       onApply: (n) => { qty = n; $('#m-qty', bd).textContent = n; } });
+    /* Seat stepper + tap-to-type, driving the same local mSeat. The
+       stepper clamps to the current guest count (a seat can't exist
+       past it); a typed seat beyond it grows the check at Add time —
+       the same grow-first rule the quick bar's typed seat uses. */
+    const paintMSeat = () => {
+      const el = $('#m-seat', bd); if (el) { delete el.dataset.editing; el.textContent = mSeat; }
+      const sn = $('#m-seat-note', bd); if (sn) sn.textContent = mSeat;
+    };
+    $('[data-sb="dec"]', bd).onclick = () => { mSeat = Math.max(1, mSeat - 1); paintMSeat(); };
+    $('[data-sb="inc"]', bd).onclick = () => { mSeat = Math.min(guests, mSeat + 1); paintMSeat(); };
+    PO.tappableValue($('#m-seat', bd), { get: () => mSeat, min: 1, max: 24, label: 'Seat',
+      onApply: (n) => { mSeat = n; paintMSeat(); } });
     $('#m-allergy', bd).onchange = (e) => { $('#m-allergy-detail', bd).style.display = e.target.checked ? 'block' : 'none'; };
     $('[data-x="cancel"]', bd).onclick = closeModal;
     // Show the per-modifier note field only while its modifier is checked;
@@ -1644,7 +1667,7 @@ async function renderOrder(app, checkId) {
     bd.addEventListener('change', enforceSinglePick);
     bd.addEventListener('change', refreshModUI);
     refreshModUI();
-    $('[data-x="add"]', bd).onclick = () => {
+    $('[data-x="add"]', bd).onclick = async () => {
       let picked = [];
       if (groups) {
         // Validate required/min/max against VISIBLE (applicable) groups only.
@@ -1681,8 +1704,25 @@ async function renderOrder(app, checkId) {
       const note = $('#m-note', bd).value.trim().slice(0, 140) || null;
       const allergy = $('#m-allergy', bd).checked;
       const allergyDetail = allergy ? ($('#m-allergy-detail', bd).value.trim().slice(0, 140) || null) : null;
+      const courseSel = $('#m-course', bd).value;
+      const course = courseSel ? courseSel : null;
+      /* A typed seat past the guest count grows the check first (the
+         HOLD POST would 400 on seat > guest_count) — same rule as the
+         quick bar's typed seat and the edit modal's save. If the grow
+         fails, the modal stays open and nothing is staged. */
+      if (mSeat > guests) {
+        if (isOffline()) { toast('Adding a seat needs a connection — reconnect first', 'err'); return; }
+        try {
+          await api('/api/checks/' + realId(checkId), 'PATCH', { guest_count: mSeat });
+          const v = await getCheckView(checkId).catch(() => null);
+          if (v) { check = v.check; guests = check.guest_count || mSeat; }
+          else guests = mSeat;
+          paintGuests();
+        } catch (e) { handleApiError(e); return; }
+      }
+      if (mSeat !== seat) setSeat(mSeat);
       closeModal();
-      stageItem(item, picked, qty, { note, allergy, allergy_detail: allergyDetail });
+      stageItem(item, picked, qty, { note, allergy, allergy_detail: allergyDetail, course });
     };
   }
 
@@ -1694,6 +1734,11 @@ async function renderOrder(app, checkId) {
       note: extra.note || null,
       allergy: !!extra.allergy,
       allergy_detail: extra.allergy_detail || null,
+      /* Ring-time course: the add modal's pick when given, else the menu
+         item's default. Rides the staged line so HOLD/SEND NOW can post
+         it — before this, a line's course was whatever the menu default
+         was until someone edited the held line. */
+      course: extra.course !== undefined ? extra.course : (item.course || null),
       drink: isDrink(item, (menu.find((c) => String(c.id) === String(activeCat)) || {}).name),
     });
     saveStaged(checkId, staged);
@@ -1728,6 +1773,9 @@ async function renderOrder(app, checkId) {
         const lineTotal = unitCents * (ref.qty || 1) + (ref.modifiers || []).reduce((a, m) => a + (m.price_delta_cents || 0) * (ref.qty || 1), 0);
         /* Phase 3A (P0-2/NG-E): special request + allergy ride the cart line. */
         const noteHtml = ref.note ? '<span class="line-note">📝 ' + esc(ref.note) + '</span>' : '';
+        /* The line's course rides the cart line too — it's picked at ring
+           time now, so the server can see it without opening the editor. */
+        const courseHtml = ref.course ? '<span class="mods course-tag">' + esc(ref.course) + '</span>' : '';
         const allergyHtml = ref.allergy ? '<span class="pill allergy">⚠️ allergy' + (ref.allergy_detail ? ' · ' + esc(ref.allergy_detail) : '') + '</span>' : '';
         /* Multi-select (Select toggle on): staged + held lines can be
            ticked for selective send / bulk seat moves. */
@@ -1751,13 +1799,15 @@ async function renderOrder(app, checkId) {
           ? '<button class="icon-btn" data-edit="' + esc(String(ref.id)) + '" aria-label="Edit item" title="Edit item (fired items need manager PIN)">✎</button>'
           : '';
         const lineHtml = '<div class="cart-line' + (quickKey === selKey ? ' qsel' : '') + '" data-line="' + esc(selKey) + '">' + selBox + '<div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
-          (mods ? '<span class="mods">' + mods + '</span>' : '') + noteHtml + allergyHtml + '</div>' + pill +
+          (mods ? '<span class="mods">' + mods + '</span>' : '') + courseHtml + noteHtml + allergyHtml + '</div>' + pill +
           '<span class="pr">' + fmt(lineTotal) + '</span>' + editBtn + refireBtn + voidBtn + '</div>';
         /* Quick-action bar: tapping the line opens qty/seat steppers plus
            Repeat / Void / More… directly under it — qty and seat apply in
            one tap via PATCH, no modal round-trip. */
         const quickHtml = quickKey === selKey
-          ? PO.quickBarHtml({ qty: ref.qty || 1, seat: ref.seat || s, guestCount: guests, staged: kind === 'staged' })
+          ? PO.quickBarHtml({ qty: ref.qty || 1, seat: ref.seat || s, guestCount: guests, staged: kind === 'staged',
+              course: ref.course != null ? ref.course : null,
+              canCourse: kind === 'staged' || ref.state === 'held' })
           : '';
         return lineHtml + quickHtml;
       }).join('') + '</div>').join('') +
@@ -1836,6 +1886,8 @@ async function renderOrder(app, checkId) {
       const countAfterRemoval = staged.length;
       addItemFlow(foundItem, foundCat, {
         qty: sref.qty || 1,
+        seat: sref.seat || seat,
+        course: sref.course,
         modifiers: sref.modifiers || [],
         note: sref.note || '',
         allergy: !!sref.allergy,
@@ -2000,6 +2052,17 @@ async function renderOrder(app, checkId) {
           if (seatValEl) PO.tappableValue(seatValEl, { get: () => ref.seat || 1, min: 1, max: 24, label: 'Seat',
             onApply: (n) => typedRun(() => applySeatVal(n)) });
         }
+        /* Course pills: one tap re-courses the line. Staged lines update
+           in place (local state + persisted staged storage — no server
+           round-trip until HOLD posts the course); held lines go through
+           the same PATCH the edit modal uses. Fired lines render no
+           pills — their edits stay behind the manager PIN in the modal. */
+        $$('[data-qc]', qb).forEach((b) => b.onclick = () => {
+          const c = b.dataset.qc || null;
+          if (!c || (ref.course || null) === c) return;
+          if (kind === 'staged') { ref.course = c; saveStaged(checkId, staged); drawCart(); }
+          else typedRun(() => patchItem({ course: c }));
+        });
       }
     }
     /* Phase 3A (P0-3/NG-C): line selection — selective send + item-first
@@ -2149,8 +2212,16 @@ async function renderOrder(app, checkId) {
 
   $('#btn-hold').onclick = async () => {
     if (!staged.length) { toast('Nothing staged — tap menu items first'); return; }
-    const items = staged.map((s) => ({ temp_id: s.temp_id, menu_item_id: s.menu_item_id, name: s.name, price_cents: s.price_cents, seat: s.seat, qty: s.qty, modifiers: s.modifiers,
-      note: s.note || null, allergy: !!s.allergy, allergy_detail: s.allergy_detail || null }));
+    const items = staged.map((s) => {
+      const it = { temp_id: s.temp_id, menu_item_id: s.menu_item_id, name: s.name, price_cents: s.price_cents, seat: s.seat, qty: s.qty, modifiers: s.modifiers,
+        note: s.note || null, allergy: !!s.allergy, allergy_detail: s.allergy_detail || null };
+      /* The ring-time course rides along when the staged line carries
+         one (post-change lines always do). Legacy staged lines without
+         the key omit it, so the server keeps applying the menu default
+         for them exactly as before. */
+      if (s.course !== undefined) it.course = s.course;
+      return it;
+    });
     /* Staged lines are removed ONLY as they are confirmed. The old shape
        cleared the list up front, so one rejected POST (e.g. a required
        modifier group the client menu never showed) destroyed the whole
@@ -2159,8 +2230,12 @@ async function renderOrder(app, checkId) {
       if (isOffline()) {
         if (String(checkId).startsWith('tmp-')) {
           const d = JSON.parse(localStorage.getItem('expoline.draft:' + checkId));
-          items.forEach((it) => d.items.push({ id: it.temp_id, menu_item_id: it.menu_item_id, name: it.name, price_cents: it.price_cents, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
-            note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null, state: 'held' }));
+          items.forEach((it) => {
+            const dItem = { id: it.temp_id, menu_item_id: it.menu_item_id, name: it.name, price_cents: it.price_cents, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
+              note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null, state: 'held' };
+            if (it.course !== undefined) dItem.course = it.course;
+            d.items.push(dItem);
+          });
           localStorage.setItem('expoline.draft:' + checkId, JSON.stringify(d));
         }
         try {
@@ -2186,8 +2261,10 @@ async function renderOrder(app, checkId) {
         let failure = null;
         for (const it of items) {
           try {
-            await api('/api/checks/' + rid + '/items', 'POST', { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
-              note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null });
+            const body = { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
+              note: it.note || null, allergy: !!it.allergy, allergy_detail: it.allergy_detail || null };
+            if (it.course !== undefined) body.course = it.course;
+            await api('/api/checks/' + rid + '/items', 'POST', body);
             heldIds.add(it.temp_id);
           } catch (e) { failure = e; break; }
         }
@@ -2261,8 +2338,12 @@ async function renderOrder(app, checkId) {
        offline SEND NOW (or one rejected POST) silently discarded the whole
        order behind a toast. */
     if (isOffline()) { toast('Send-now needs a connection — reconnect first', 'err'); return; }
-    const items = staged.map((s) => ({ menu_item_id: s.menu_item_id, seat: s.seat, qty: s.qty, modifiers: s.modifiers,
-      note: s.note || null, allergy: !!s.allergy, allergy_detail: s.allergy_detail || null }));
+    const items = staged.map((s) => {
+      const it = { menu_item_id: s.menu_item_id, seat: s.seat, qty: s.qty, modifiers: s.modifiers,
+        note: s.note || null, allergy: !!s.allergy, allergy_detail: s.allergy_detail || null };
+      if (s.course !== undefined) it.course = s.course;
+      return it;
+    });
     try {
       const r = await api('/api/checks/' + realId(checkId) + '/send-now', 'POST', { items });
       staged = []; saveStaged(checkId, staged);

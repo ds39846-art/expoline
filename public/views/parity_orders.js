@@ -20,6 +20,9 @@ function esc(s) {
 function fmt(cents) { return '$' + ((Number(cents) || 0) / 100).toFixed(2); }
 function $(sel, root) { return (root || document).querySelector(sel); }
 function $all(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+/* The one course taxonomy for this module (edit modal + quick bar) —
+   mirrors ME_COURSES in app.js and the server's COURSES set. */
+const COURSE_LIST = ['drink', 'appetizer', 'entree', 'dessert'];
 
 /* ------------------------- 1. daypart filtering -------------------------- */
 /** Mirror of the server visibility rule: all-day items (blank daypart) and
@@ -159,7 +162,7 @@ async function openEditItemModal(check, item) {
   } catch (e) { /* fall back to current modifiers */ }
   if (!groups && !flatOptions.length) flatOptions = curMods.map((m) => ({ name: m.name, price_delta_cents: m.price_delta_cents }));
 
-  const COURSES = ['drink', 'appetizer', 'entree', 'dessert'];
+  const COURSES = COURSE_LIST;
   return new Promise((resolve) => {
     const statePill = fired ? '<span class="pill sent">fired — manager approval needed</span>' : '<span class="pill held">held</span>';
     const modRow = (o, gi, oi) => {
@@ -546,11 +549,19 @@ function seatStripHtml(o) {
  *  The value spans carry data-qbval hooks: app.js makes them tap-to-type
  *  (tappableValue below) so a server can key the exact qty/seat instead
  *  of tapping + a dozen times. "More…" shows for staged lines too — it
- *  reopens the modifier flow on the staged line (app.js restage). */
+ *  reopens the modifier flow on the staged line (app.js restage).
+ *  Course pills (o.canCourse — staged + held lines): one tap re-courses
+ *  the line; app.js applies staged changes locally and held changes via
+ *  the item PATCH. Fired lines get no pills (PIN-gated modal instead). */
 function quickBarHtml(o) {
   const qty = Math.max(1, o.qty || 1), seat = Math.max(1, o.seat || 1);
   const guests = Math.max(1, o.guestCount || 1);
   const dis = (b) => (b ? ' disabled' : '');
+  const courseHtml = o.canCourse
+    ? '<span class="qb-group"><span class="qb-lbl">Course</span>' +
+      COURSE_LIST.map((c) => '<button class="btn btn-sm' + (o.course === c ? ' btn-primary' : ' btn-ghost') + '" data-qc="' + c + '">' +
+        c.charAt(0).toUpperCase() + c.slice(1) + '</button>').join('') + '</span>'
+    : '';
   return '<div class="quick-bar" data-quickbar="1">' +
     '<span class="qb-group"><span class="qb-lbl">Qty</span>' +
     '<button class="qb-btn" data-qa="qty-dec"' + dis(qty <= 1) + ' aria-label="One fewer">−</button>' +
@@ -560,6 +571,7 @@ function quickBarHtml(o) {
     '<button class="qb-btn" data-qa="seat-dec"' + dis(seat <= 1) + ' aria-label="Move to lower seat">−</button>' +
     '<span class="qb-val" data-qbval="seat">' + seat + '</span>' +
     '<button class="qb-btn" data-qa="seat-inc"' + dis(seat >= guests) + (seat >= guests ? ' title="Add a seat from the seat strip first"' : '') + ' aria-label="Move to higher seat">+</button></span>' +
+    courseHtml +
     '<button class="btn btn-sm" data-qa="repeat">Repeat 🔁</button>' +
     '<button class="btn btn-sm qb-void" data-qa="void">Void</button>' +
     '<button class="btn btn-sm" data-qa="more">More…</button>' +
