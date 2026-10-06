@@ -606,9 +606,9 @@ async function getMenu() {
       /* Same pass-through rule for the manager-set popular flag: the
          quick-pick row reads i.popular from these mapped items. */
       popular: !!i.popular,
-      /* And for the item's default course: addItemFlow's course picker
+      /* And for the item default course: the addItemFlow course picker
          and stageItem read item.course. This mapping used to drop it,
-         so a line's course could never be picked at ring time — the
+         so a line course could never be picked at ring time — the
          server silently substituted the menu default at HOLD. */
       course: i.course || null,
       station: i.station || i.kds_station || null,
@@ -1659,7 +1659,7 @@ async function renderOrder(app, checkId) {
     /* Seat stepper + tap-to-type, driving the same local mSeat. The
        stepper clamps to the current guest count (a seat can't exist
        past it); a typed seat beyond it grows the check at Add time —
-       the same grow-first rule the quick bar's typed seat uses. */
+       the same grow-first rule the quick-bar typed seat uses. */
     const paintMSeat = () => {
       const el = $('#m-seat', bd); if (el) { delete el.dataset.editing; el.textContent = mSeat; }
       const sn = $('#m-seat-note', bd); if (sn) sn.textContent = mSeat;
@@ -1751,7 +1751,7 @@ async function renderOrder(app, checkId) {
       const course = courseSel ? courseSel : null;
       /* A typed seat past the guest count grows the check first (the
          HOLD POST would 400 on seat > guest_count) — same rule as the
-         quick bar's typed seat and the edit modal's save. If the grow
+         quick-bar typed seat and the edit-modal save. If the grow
          fails, the modal stays open and nothing is staged. */
       if (mSeat > guests) {
         if (isOffline()) { toast('Adding a seat needs a connection — reconnect first', 'err'); return; }
@@ -1777,9 +1777,9 @@ async function renderOrder(app, checkId) {
       note: extra.note || null,
       allergy: !!extra.allergy,
       allergy_detail: extra.allergy_detail || null,
-      /* Ring-time course: the add modal's pick when given, else the menu
-         item's default. Rides the staged line so HOLD/SEND NOW can post
-         it — before this, a line's course was whatever the menu default
+      /* Ring-time course: the add-modal pick when given, else the menu
+         item default. Rides the staged line so HOLD/SEND NOW can post
+         it — before this, a line course was whatever the menu default
          was until someone edited the held line. */
       course: extra.course !== undefined ? extra.course : (item.course || null),
       drink: isDrink(item, (menu.find((c) => String(c.id) === String(activeCat)) || {}).name),
