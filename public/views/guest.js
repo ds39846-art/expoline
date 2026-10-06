@@ -46,7 +46,8 @@ var css = [
   '.gx-cat.on{background:var(--brass);color:#171106;font-weight:700;border-color:var(--brass)}',
   '.gx-item{background:var(--ink2);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px}',
   '.gx-item .nm{flex:1;min-width:0}.gx-item .nm b{display:block;font-size:17px}.gx-item .nm span{font-size:13px;color:var(--dim)}',
-  '.gx-item .pr{font-weight:700;color:var(--brass-hi);white-space:nowrap}',
+  '.gx-item .pr{font-weight:700;color:var(--brass-hi);white-space:nowrap;text-align:right}',
+  '.gx-taxincl{display:inline-block;margin-top:4px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--brass-hi);border:1px solid var(--line);border-radius:999px;padding:1px 8px}',
   '.gx-add{background:var(--brass);color:#171106;border:none;border-radius:12px;min-width:64px;min-height:56px;font-size:20px;font-weight:800;cursor:pointer}',
   '.gx-add:active{transform:scale(.95)}',
   '.gx-seat{display:flex;align-items:center;gap:12px;background:var(--ink2);border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:12px}',
@@ -152,7 +153,8 @@ function drawItems() {
     return '<div class="gx-item"><div class="nm"><b>' + esc(i.name) + '</b>' +
       (i.description ? '<span>' + esc(i.description) + '</span>' : '') +
       (i.modifiers && i.modifiers.length ? '<span> · ' + i.modifiers.length + ' options</span>' : '') + '</div>' +
-      '<div class="pr">' + money(priceOf(i)) + '</div>' +
+      '<div class="pr">' + money(priceOf(i)) +
+      (i.tax_inclusive ? '<br><span class="gx-taxincl">Tax included</span>' : '') + '</div>' +
       '<button class="gx-add" data-add="' + i.id + '">' + (q ? q + ' +' : '+') + '</button></div>';
   }).join('');
   host.querySelectorAll('[data-add]').forEach(function (b) {

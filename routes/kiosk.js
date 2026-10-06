@@ -109,7 +109,7 @@ function buildMenu(db, SITE_ID, forOrder, effPrice) {
   const rows = db.prepare(`
     SELECT c.id AS cat_id, c.name AS cat_name, c.sort AS cat_sort,
            i.id, i.name, i.description, i.price_cents, i.hh_price_cents, i.item_type,
-           i.station, i.course, i.price_note
+           i.station, i.course, i.price_note, i.tax_inclusive
       FROM menu_categories c
       JOIN menu_items i ON i.category_id = c.id
      WHERE c.site_id = ? AND i.site_id = ? AND i.active = 1 AND COALESCE(i.is_86, 0) = 0
@@ -152,6 +152,11 @@ function buildMenu(db, SITE_ID, forOrder, effPrice) {
       station: r.station,
       course: r.course,
       price_note: r.price_note,
+      // Tax-inclusive flag (gap #9): kiosk totals run through the host's
+      // persistTotals/calcTotals, which backs this item's tax OUT of the
+      // sticker price — so the view's "Tax included" label is true here.
+      // (Also rides the /api/menuboards payload, which shares buildMenu.)
+      tax_inclusive: r.tax_inclusive ? true : false,
       modifiers: modsByItem.get(r.id) || [],
     });
   }

@@ -34,6 +34,7 @@
     '.mb-it .nm{font-size:52px;font-weight:700;line-height:1.15}',
     '.mb-it .ds{font-size:30px;color:#a8a294;line-height:1.25;margin-top:.4vh}',
     '.mb-it .pr{font-size:52px;color:#c9a86a;font-weight:800;float:right;margin-left:2vw}',
+    '.mb-it .ti{font-size:26px;color:#a8a294;text-transform:uppercase;letter-spacing:2px;margin-top:.3vh}',
     '#mb-dots{flex:none;display:flex;gap:16px;justify-content:center;padding-top:2.5vh}',
     '.mb-dot{width:22px;height:22px;border-radius:50%;background:#2a3650}',
     '.mb-dot.on{background:#c9a86a}',
@@ -110,7 +111,8 @@
       box.appendChild(el('div', 'mb-it',
         '<span class="pr">' + price + '</span>' +
         '<div class="nm">' + esc(it.name) + '</div>' +
-        (it.description ? '<div class="ds">' + esc(it.description) + '</div>' : '')));
+        (it.description ? '<div class="ds">' + esc(it.description) + '</div>' : '') +
+        (it.tax_inclusive ? '<div class="ti">Tax included</div>' : '')));
     });
     var dots = document.getElementById('mb-dots');
     dots.innerHTML = '';

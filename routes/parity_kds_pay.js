@@ -344,7 +344,7 @@ function registerPublic(app, ctx) {
       'SELECT id, name FROM menu_categories WHERE site_id = ? ORDER BY id'
     ).all(SITE_ID);
     const itemStmt = db.prepare(
-      'SELECT id, name, description, price_cents, hh_price_cents, item_type, course FROM menu_items WHERE category_id = ? AND site_id = ? AND active = 1 AND COALESCE(is_86, 0) = 0 ORDER BY id'
+      'SELECT id, name, description, price_cents, hh_price_cents, tax_inclusive, item_type, course FROM menu_items WHERE category_id = ? AND site_id = ? AND active = 1 AND COALESCE(is_86, 0) = 0 ORDER BY id'
     );
     const modStmt = db.prepare('SELECT name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id');
     res.json({
@@ -356,6 +356,10 @@ function registerPublic(app, ctx) {
           hh_price_cents: i.hh_price_cents != null ? i.hh_price_cents : null,
           effective_price_cents: effPrice ? effPrice(i) : i.price_cents,
           hh_active: effPrice ? effPrice(i) !== i.price_cents : false,
+          // Tax-inclusive flag (gap #9): guest totals run through
+          // calcTotals, which backs this item's tax OUT of the sticker
+          // price — so the view's "Tax included" label is true here.
+          tax_inclusive: i.tax_inclusive ? true : false,
           item_type: i.item_type, course: i.course,
           modifiers: modStmt.all(i.id),
         })),

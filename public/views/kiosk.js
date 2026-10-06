@@ -40,6 +40,9 @@
     '.kx-item .nm{font-size:26px;font-weight:700;line-height:1.2}',
     '.kx-item .ds{font-size:17px;color:var(--dim);line-height:1.3}',
     '.kx-item .pr{font-size:24px;color:var(--brass);font-weight:700;margin-top:4px}',
+    '.kx-item .ti{display:inline-block;font-size:14px;letter-spacing:.05em;text-transform:uppercase;',
+    'color:var(--brass-hi);border:1px solid var(--brass);border-radius:999px;padding:1px 10px;margin-left:10px;vertical-align:3px}',
+    '.kx-taxnote{font-size:16px;color:var(--brass-hi);text-transform:uppercase;letter-spacing:.06em;margin-top:6px}',
     '#kx-bar{flex:none;background:var(--ink2);border-top:2px solid var(--line);padding:16px 24px;',
     'display:flex;gap:16px;align-items:center;min-height:104px}',
     '#kx-cartinfo{flex:1;font-size:22px}',
@@ -153,7 +156,8 @@
       var b = el('button', 'kx-item',
         '<span class="nm">' + esc(it.name) + '</span>' +
         (it.description ? '<span class="ds">' + esc(it.description) + '</span>' : '') +
-        '<span class="pr">' + money(priceOf(it)) + '</span>');
+        '<span class="pr">' + money(priceOf(it)) +
+        (it.tax_inclusive ? '<span class="ti">Tax included</span>' : '') + '</span>');
       b.addEventListener('click', function () { tapItem(it); });
       box.appendChild(b);
     });
@@ -174,6 +178,7 @@
     p.innerHTML = '<button class="kx-close" id="kxx">\u2715</button>' +
       '<h2>' + esc(it.name) + '</h2>' +
       '<div style="color:var(--dim);font-size:20px">' + esc(it.description || '') + '</div>' +
+      (it.tax_inclusive ? '<div class="kx-taxnote">Tax included</div>' : '') +
       '<div class="qtyrow"><button class="kx-qtybtn" id="kx-minus">\u2212</button>' +
       '<span id="kx-qty">1</span>' +
       '<button class="kx-qtybtn" id="kx-plus">+</button>' +
