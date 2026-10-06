@@ -3233,14 +3233,52 @@ app.post('/api/checks/:id/items/:item_id/duplicate', serverPlus(), (req, res) =>
     .get(itemId, check.id);
   if (!item) return res.status(404).json({ error: 'Item not found on this check' });
   if (item.state === 'cancelled') return res.status(400).json({ error: 'Cannot duplicate a voided item' });
-  const r = db.prepare(
-    `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
-       note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
-  ).run(crypto.randomUUID(), check.id, item.menu_item_id, item.seat, item.qty, item.unit_price_cents,
-    item.modifiers_json, item.course, nowIso(), item.note, item.allergy, item.allergy_detail);
-  const dup = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
-  const t = persistTotals(check.id);
+  /* Floor 86: a duplicate is a NEW ring of the same item (a fresh
+     billable 'held' line), so it clears the same gate as POST /items —
+     refuse up front when the item is sold out or the copy is larger
+     than what is left, then re-check + consume the countdown inside
+     the write transaction (the conditional UPDATE in
+     consumeEightySixCountdown decides races). QA caught this endpoint
+     selling 86'd items end-to-end when the census missed it. */
+  const mi0 = item.menu_item_id != null
+    ? db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ?').get(item.menu_item_id, SITE_ID)
+    : null;
+  const refusal86 = eightySixRefusal(mi0, item.qty);
+  if (refusal86) return res.status(400).json({ error: refusal86 });
+  let dup, t, consumed86 = false;
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const fresh = item.menu_item_id != null
+      ? db.prepare('SELECT is_86, remaining, name, category_id FROM menu_items WHERE id = ? AND site_id = ?')
+        .get(item.menu_item_id, SITE_ID)
+      : null;
+    if (fresh && fresh.is_86) {
+      db.exec('ROLLBACK');
+      return res.status(400).json({ error: `86: "${fresh.name}" is sold out` });
+    }
+    if (fresh) {
+      const cr = consumeEightySixCountdown(
+        { id: item.menu_item_id, name: fresh.name, category_id: fresh.category_id, remaining: fresh.remaining }, item.qty);
+      if (cr.error) {
+        db.exec('ROLLBACK');
+        return res.status(400).json({ error: cr.error });
+      }
+      consumed86 = cr.consumed;
+    }
+    const r = db.prepare(
+      `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
+         note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
+    ).run(crypto.randomUUID(), check.id, item.menu_item_id, item.seat, item.qty, item.unit_price_cents,
+      item.modifiers_json, item.course, nowIso(), item.note, item.allergy, item.allergy_detail);
+    dup = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
+    t = persistTotals(check.id);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+    throw e;
+  }
   broadcastCheckUpdated(check.id);
+  if (consumed86) broadcastMenuUpdated();
   res.status(201).json(Object.assign(itemView(dup), { totals: t }));
 });
 /**
