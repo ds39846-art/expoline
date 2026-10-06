@@ -2233,6 +2233,18 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
     }
     allergyDetail = b.allergy_detail.trim() || null;
   }
+  /* Ring-time course: a server may pick the line's course while adding
+     it (add-item modal / staged quick bar), not only afterwards via the
+     item PATCH. Absent → the menu item's default course (the historical
+     behavior); null → explicitly no course (mirrors the PATCH contract);
+     anything else must be a real course. */
+  let lineCourse = menuItem.course;
+  if (b.course !== undefined) {
+    if (b.course !== null && !COURSES.has(b.course)) {
+      return res.status(400).json({ error: 'course must be one of drink|appetizer|entree|dessert' });
+    }
+    lineCourse = b.course;
+  }
   // MP (market price) items: price_cents = 0 requires a manager-entered price.
   // Fixed-price items ALWAYS use the menu price — a request-supplied
   // unit_price_cents for them is ignored, never trusted.
@@ -2266,7 +2278,7 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
     const r = db.prepare(
       `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
          note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
-    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(cleanMods), menuItem.course, nowIso(),
+    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(cleanMods), lineCourse, nowIso(),
       note, allergy, allergyDetail);
     item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
     persistTotals(check.id);
@@ -3009,10 +3021,19 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
       if (typeof allergy_detail !== 'string' || allergy_detail.length > 140) return res.status(400).json({ error: 'allergy_detail must be ≤140 chars' });
       algD = allergy_detail.trim() || null;
     }
+    /* Ring-time course, same contract as POST /items: absent → the menu
+       item's default; null → no course; otherwise a valid course. */
+    let lineCourse = menuItem.course;
+    if (line && line.course !== undefined) {
+      if (line.course !== null && !COURSES.has(line.course)) {
+        return res.status(400).json({ error: 'course must be one of drink|appetizer|entree|dessert' });
+      }
+      lineCourse = line.course;
+    }
     const r = db.prepare(
       `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
          note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
-    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(rmod.modifiers), menuItem.course, nowIso(), ln, alg, algD);
+    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(rmod.modifiers), lineCourse, nowIso(), ln, alg, algD);
     insertedIds.push(r.lastInsertRowid);
   }
   // Now fire them via the standard send logic

@@ -606,6 +606,11 @@ async function getMenu() {
       /* Same pass-through rule for the manager-set popular flag: the
          quick-pick row reads i.popular from these mapped items. */
       popular: !!i.popular,
+      /* And for the item's default course: addItemFlow's course picker
+         and stageItem read item.course. This mapping used to drop it,
+         so a line's course could never be picked at ring time — the
+         server silently substituted the menu default at HOLD. */
+      course: i.course || null,
       station: i.station || i.kds_station || null,
       daypart: i.daypart || null,
     })),
