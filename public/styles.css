@@ -198,6 +198,18 @@ button, input, select, textarea { font-family: var(--sans); font-size: 1rem; col
   box-shadow: 0 0 0 1px var(--brass), 0 0 18px rgba(201,168,106,.25);
   background: linear-gradient(180deg, #1c1a12, var(--ink-2));
 }
+
+/* ---------- open bar tabs strip (floor) ---------- */
+.open-tabs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.open-tabs-title { font-size: .8rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+.tab-chip {
+  display: inline-flex; align-items: baseline; gap: 8px;
+  min-height: var(--tap); padding: 8px 14px;
+  border: 1px solid var(--brass); border-radius: 999px;
+  background: linear-gradient(180deg, #1c1a12, var(--ink-2));
+  color: var(--brass-hi); cursor: pointer; white-space: nowrap;
+}
+.tab-chip:active { transform: scale(.97); }
 .table-tile.open .sub { color: var(--brass); }
 
 /* ---------- login ---------- */

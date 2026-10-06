@@ -140,19 +140,32 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       if (existing) {
         return { ok: true, check_id: existing.id, check_uuid: existing.uuid, temp_id: checkUuid, replayed_row: true };
       }
-      const table = p.table_id != null
-        ? db.prepare('SELECT id FROM tables WHERE id = ? AND site_id = ?').get(p.table_id, siteSlug)
-        : null;
-      if (!table) return { ok: false, error: 'invalid_table', table_id: p.table_id };
-      if (!Number.isInteger(p.guest_count) || p.guest_count < 1) {
+      /* Bar tab: no table, a name instead — mirrors POST /api/checks
+       * (table_id absent + non-empty tab_name opens a tab). The insert
+       * stores channel 'bar_tab' (table checks store the dine_in
+       * default explicitly) so a synced tab is a tab everywhere,
+       * exactly as an online-opened one. Tabs never claim a table and
+       * are never merged: a replayed open finds its row by uuid above,
+       * and a fresh open always creates a distinct check. */
+      const isTab = p.table_id == null;
+      const tabName = (typeof p.tab_name === 'string' && p.tab_name.trim()) || null;
+      if (isTab && !tabName) return { ok: false, error: 'tab_name_required' };
+      if (isTab && tabName.length > 40) return { ok: false, error: 'tab_name_too_long' };
+      const table = isTab ? null
+        : db.prepare('SELECT id FROM tables WHERE id = ? AND site_id = ?').get(p.table_id, siteSlug);
+      if (!isTab && !table) return { ok: false, error: 'invalid_table', table_id: p.table_id };
+      const guests = isTab && p.guest_count == null ? 1 : p.guest_count;
+      if (!Number.isInteger(guests) || guests < 1) {
         return { ok: false, error: 'invalid_guest_count' };
       }
-      const taken = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1").get(p.table_id);
-      if (taken) return { ok: false, error: 'table_has_open_check', check_id: taken.id };
+      if (!isTab) {
+        const taken = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1").get(p.table_id);
+        if (taken) return { ok: false, error: 'table_has_open_check', check_id: taken.id };
+      }
       const r = db.prepare(
-        "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
-      ).run(checkUuid, siteSlug, p.table_id, actor ? actor.id : null,
-        (typeof p.tab_name === 'string' && p.tab_name.trim()) || null, p.guest_count, nowIso());
+        "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, channel, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)"
+      ).run(checkUuid, siteSlug, isTab ? null : p.table_id, actor ? actor.id : null,
+        tabName, guests, isTab ? 'bar_tab' : 'dine_in', nowIso());
       const check = h.checkResponse(r.lastInsertRowid);
       h.broadcastCheckUpdated(check.id);
       return { ok: true, check_id: check.id, check_uuid: checkUuid, temp_id: checkUuid };
@@ -326,7 +339,7 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       );
       for (const [station, items] of byStation) {
         const r = insTicket.run(crypto.randomUUID(), checkId, siteSlug, station,
-          table ? table.label : null, serverUser ? serverUser.name : null,
+          h.checkLocationLabel(table, check), serverUser ? serverUser.name : null,
           JSON.stringify(items), sentAt);
         const ticket = h.ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid));
         tickets.push(ticket);

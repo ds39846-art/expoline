@@ -12,6 +12,13 @@ const esc = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 const fmt = (cents) => '$' + ((Number(cents) || 0) / 100).toFixed(2);
+/* Location label for a check: a bar tab reads TAB · <name> (the same
+   prefixed form the server stamps on KDS tickets); a table check reads
+   its table label. Returns null when neither exists. */
+const locLabel = (check) => {
+  if (check && check.channel === 'bar_tab') return 'TAB · ' + (check.tab_name || 'Tab');
+  return (check && (check.table_label || check.table || check.tab_name)) || null;
+};
 const pad2 = (n) => String(n).padStart(2, '0');
 const fmtClock = (ts) => new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const fmtDate = (ts) => new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
@@ -972,10 +979,12 @@ async function renderFloor(app) {
   const role = state.user.role;
   if (role !== 'server' && role !== 'manager') { app.innerHTML = notAuthorized(); return; }
   app.innerHTML = '<div class="view-head"><h1>Floor</h1><span class="spacer"></span>' +
+    '<button class="btn btn-ghost btn-sm" id="floor-newtab" title="Open a bar tab — a named check with no table">New Tab</button> ' +
     '<button class="btn btn-ghost btn-sm" id="floor-merge" title="One-tap merge: fold one party into another">Merge</button> ' +
     '<button class="btn btn-ghost btn-sm" id="floor-move" title="Move a check to a different table">Move</button> ' +
     '<span class="muted small" id="floor-clock"></span></div>' +
     '<div id="floor-banner-slot"></div>' +
+    '<div id="open-tabs-slot"></div>' +
     '<div class="tabs" id="zone-tabs"></div><div class="zone-grid" id="zone-grid"></div>';
   const tick = () => { const c = $('#floor-clock'); if (c) c.textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); };
   tick(); const iv = setInterval(tick, 20000);
@@ -997,6 +1006,28 @@ async function renderFloor(app) {
     try { const rows = await api('/api/floor/timers'); timers = {}; (rows.timers || rows).forEach((r) => { timers[String(r.table_id)] = r; }); }
     catch (e) { /* keep last-known */ }
     drawGrid();
+  };
+
+  /* Open bar tabs strip: every open tab (channel bar_tab from the open
+     checks list) as a chip — guest name, owner, running total, age —
+     one tap reopens the tab to add another round. Tabs live outside
+     the zone grid: they hold no table. Hidden when no tab is open. */
+  const loadTabs = async () => {
+    const slot = $('#open-tabs-slot');
+    if (!slot) return;
+    try {
+      const rows = await api('/api/checks/open');
+      const tabRows = (rows || []).filter((c) => c.channel === 'bar_tab');
+      if (!tabRows.length) { slot.innerHTML = ''; return; }
+      slot.innerHTML = '<div class="open-tabs"><span class="open-tabs-title">Open tabs</span>' + tabRows.map((c) => {
+        const mins = Math.max(0, Math.round((Date.now() - new Date(c.opened_at).getTime()) / 60000));
+        const age = mins < 1 ? 'now' : (mins < 60 ? mins + 'm' : Math.floor(mins / 60) + 'h' + (mins % 60 ? ' ' + (mins % 60) + 'm' : ''));
+        return '<button class="tab-chip" data-tab="' + esc(String(c.id)) + '"><b>' + esc(c.tab_name || 'Tab') + '</b>' +
+          '<span class="muted small">' + esc(c.server_name || '') + ' · ' + fmt(c.total_cents) + ' · ' + age +
+          (c.item_count ? ' · ' + c.item_count + ' item' + (c.item_count === 1 ? '' : 's') : '') + '</span></button>';
+      }).join('') + '</div>';
+      $$('.tab-chip', slot).forEach((b) => { b.onclick = () => { location.hash = '#/order/' + b.dataset.tab; }; });
+    } catch (e) { /* keep last-known */ }
   };
   const drawGrid = () => {
     const z = zones.find((x) => String(x.id) === String(active));
@@ -1093,8 +1124,9 @@ async function renderFloor(app) {
     $('#floor-move').classList.add('btn-primary'); $('#floor-merge').classList.remove('btn-primary');
     drawBanner(); drawGrid();
   };
+  $('#floor-newtab').onclick = () => openTabSheet();
   drawTabs(); drawGrid();
-  loadTimers(); tmIv = setInterval(loadTimers, 30000);
+  loadTimers(); loadTabs(); tmIv = setInterval(() => { loadTimers(); loadTabs(); }, 30000);
 
   function openCheckSheet(t) {
     let guests = 2, tabName = '';
@@ -1134,6 +1166,52 @@ async function renderFloor(app) {
         }
       } catch (e) { handleApiError(e); }
     };
+  }
+
+  /* New bar tab: one field (the guest name), no table, no guest-count
+     stepper — a tab is one person; the count stays editable later from
+     the check header and settings like any check. Mirrors the table
+     sheet online/offline branches: online posts the tab form of
+     POST /api/checks (no table_id, tab_name set); offline stores a
+     draft and queues the same open_check payload shape (table_id
+     null), which both sync paths open as a tab on the brain. */
+  function openTabSheet() {
+    const bd = openModal(
+      '<h2>New bar tab</h2>' +
+      '<div class="field"><label for="tab-guest">Guest name</label><input type="text" id="tab-guest" placeholder="e.g. Silva" maxlength="40" autocomplete="off"></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="go">Open tab</button></div>');
+    const input = $('#tab-guest', bd);
+    if (input) setTimeout(() => { try { input.focus(); } catch (e) {} }, 60);
+    $('[data-x="cancel"]', bd).onclick = closeModal;
+    const go = async () => {
+      const name = input.value.trim();
+      if (!name) { toast('A tab needs the guest name', 'err'); return; }
+      closeModal();
+      const tempId = 'tmp-' + (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
+      try {
+        if (isOffline()) {
+          const draft = { id: tempId, table_id: null, table_label: null, channel: 'bar_tab', guest_count: 1, tab_name: name, items: [], payments: [], status: 'open', totals: { subtotal: 0, surcharge: 0, service_charge: 0, tax: 0, total: 0, paid: 0, balance: 0 } };
+          localStorage.setItem('expoline.draft:' + tempId, JSON.stringify(draft));
+          await Outbox.enqueue('open_check', { check_id: tempId, temp_id: tempId, table_id: null, guest_count: 1, tab_name: name });
+          toast('Tab opened offline — will sync', 'ok');
+          location.hash = '#/order/' + tempId;
+        } else {
+          const r = await api('/api/checks', 'POST', { tab_name: name, guest_count: 1 });
+          const id = r.id || (r.check && r.check.id);
+          if (!id) throw new Error('Server did not return a check id');
+          /* The server never merges same-name tabs; when this server
+             already holds one under the same name it says so on the
+             response — surface it instead of stacking look-alikes. */
+          if (Array.isArray(r.existing_tabs) && r.existing_tabs.length) {
+            toast('Heads up: an open tab named ' + name + ' already exists — this is a separate tab', 'err');
+          }
+          location.hash = '#/order/' + id;
+        }
+      } catch (e) { handleApiError(e); }
+    };
+    $('[data-x="go"]', bd).onclick = go;
+    if (input) input.onkeydown = (e) => { if (e.key === 'Enter') go(); };
   }
 }
 
@@ -1461,8 +1539,8 @@ async function renderOrder(app, checkId) {
   app.innerHTML =
     '<div class="order-top">' +
     '<a class="btn btn-ghost" href="#/floor" aria-label="Back to floor">‹</a>' +
-    '<span class="table-label">' + esc(check.table_label || check.table || ('Check ' + String(checkId).slice(-4))) + '</span>' +
-    (check.tab_name ? '<span class="muted">· ' + esc(check.tab_name) + '</span>' : '') +
+    '<span class="table-label">' + esc(locLabel(check) || ('Check ' + String(checkId).slice(-4))) + '</span>' +
+    (check.tab_name && check.channel !== 'bar_tab' && locLabel(check) !== check.tab_name ? '<span class="muted">· ' + esc(check.tab_name) + '</span>' : '') +
     '<span class="muted small" id="hdr-guests"><span id="hdr-guests-n">' + guests + '</span> guests</span>' +
     '<button class="icon-btn" id="check-settings" title="Check settings — guests, tab name, coursing, order note, void check" aria-label="Check settings">⚙</button>' +
     '<span class="spacer"></span>' +
@@ -3005,8 +3083,8 @@ async function renderPay(app, checkId) {
 
   app.innerHTML =
     '<div class="order-top"><a class="btn btn-ghost" href="#/order/' + encodeURIComponent(checkId) + '">‹ Order</a>' +
-    '<span class="table-label">' + esc(check.table_label || 'Check') + '</span>' +
-    (check.tab_name ? '<span class="muted">· ' + esc(check.tab_name) + '</span>' : '') +
+    '<span class="table-label">' + esc(locLabel(check) || 'Check') + '</span>' +
+    (check.tab_name && check.channel !== 'bar_tab' && locLabel(check) !== check.tab_name ? '<span class="muted">· ' + esc(check.tab_name) + '</span>' : '') +
     '<span class="spacer"></span><span class="muted small">' + guests + ' guests</span></div>' +
     (t.estimated ? '<p class="small muted">Totals estimated while offline.</p>' : '') +
     '<div class="card"><h2>Check summary</h2><table class="money-table">' +
@@ -3558,7 +3636,7 @@ function printReceipt(check, t, items, sc) {
     '.note{font-size:11px;color:#444;margin:8px 0}.ctr{text-align:center}.dim{color:#555}' +
     '@media print{body{padding:0}.noprint{display:none}}</style></head><body>' +
     '<h1>Bali Hai Restaurant</h1><h2>Guest receipt</h2>' +
-    '<p class="ctr dim" style="font-size:12px">' + esc(check.table_label || 'Check') +
+    '<p class="ctr dim" style="font-size:12px">' + esc(locLabel(check) || 'Check') +
     ' · ' + (check.guest_count || check.guests || 0) + ' guests · ' + esc(when) + '</p>' +
     '<table>' + rows +
     '<tr><td>Subtotal</td><td class="r">' + fmt(t.subtotal) + '</td></tr>' +

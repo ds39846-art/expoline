@@ -585,6 +585,10 @@ function register(app, ctx) {
     const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
     if (!check) return res.status(404).json({ error: 'Check not found' });
     if (check.status !== 'open') return res.status(400).json({ error: `Cannot move a ${check.status} check` });
+    /* A bar tab has no table to move FROM and must not silently become a
+     * table check (its channel is its identity) — close the tab and open
+     * a table check instead. */
+    if (check.channel === 'bar_tab') return res.status(400).json({ error: 'A bar tab cannot be moved to a table — close the tab and open a table check' });
     const tableId = b.table_id;
     if (!isInt(tableId)) return res.status(400).json({ error: 'table_id is required' });
     const dest = db.prepare('SELECT id, label FROM tables WHERE id = ? AND site_id = ?').get(tableId, SITE_ID);

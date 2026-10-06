@@ -981,6 +981,7 @@ function checkResponse(checkId) {
     server_id: c.server_id,
     server_name: server ? server.name : null,
     tab_name: c.tab_name,
+    channel: c.channel || 'dine_in',
     guest_count: c.guest_count,
     status: c.status,
     coursing: c.coursing || 'off',
@@ -1009,6 +1010,19 @@ function checkResponse(checkId) {
       balance: t.balance,
     },
   };
+}
+
+/* Location label for KDS tickets and location-aware surfaces: the table
+ * label for a table check; for a table-less check, its tab name — bar
+ * tabs get the prefixed form used on the floor and in check headers
+ * ("TAB · Silva"; prefixed labels are the house style — delivery tickets
+ * read "DLV · <source>") so the kitchen can tell a tab from a table at a
+ * glance. tableRow is the already-fetched tables row (or null). */
+function checkLocationLabel(tableRow, chk) {
+  if (tableRow) return tableRow.label;
+  if (!chk) return null;
+  if (chk.channel === 'bar_tab') return 'TAB · ' + (chk.tab_name || 'Tab');
+  return chk.tab_name || null;
 }
 
 // Canonical KDS station slugs; accepts display names too ("Expediter", "Garde Manger", ...)
@@ -1337,7 +1351,7 @@ const lanRuntime = (() => {
     db,
     siteSlug: SITE_SLUG,
     helpers: {
-      persistTotals, checkResponse, ticketView,
+      persistTotals, checkResponse, ticketView, checkLocationLabel,
       broadcastTicket, broadcastCheckUpdated, broadcastMenuUpdated,
       auditApproval, auditMenu,
       verifyManagerPin, verifyOfflineApproval, consumeOfflineApproval,
@@ -1946,9 +1960,47 @@ function claimWinnerOnTable(tableId) {
 
 app.post('/api/checks', serverPlus(), (req, res) => {
   const { table_id, guest_count, tab_name } = req.body || {};
-  const table = table_id != null
-    ? db.prepare('SELECT id FROM tables WHERE id = ? AND site_id = ?').get(table_id, SITE_ID)
-    : null;
+  /* Bar tab: a named check with NO table (channel 'bar_tab', the same
+   * table-less shape delivery checks already use). The discriminator is
+   * the absent table: with no table_id, a non-empty tab_name opens a
+   * tab; with no name either, the request is the same malformed one it
+   * always was and keeps the historic error. A request WITH a table_id
+   * follows the table rules below exactly — tab_name stays an optional
+   * label there. No card pre-authorization exists yet (Stripe-gated);
+   * a tab is a normal check for money: it is paid at the end like any
+   * other check. */
+  if (table_id == null) {
+    const cleanTab = typeof tab_name === 'string' ? tab_name.trim() : '';
+    if (!cleanTab) {
+      return res.status(400).json({
+        error: tab_name == null ? 'Valid table_id is required' : 'tab_name is required to open a bar tab',
+      });
+    }
+    if (cleanTab.length > 40) {
+      return res.status(400).json({ error: 'tab_name must be at most 40 characters' });
+    }
+    const guests = guest_count == null ? 1 : guest_count;
+    if (!isInt(guests) || guests < 1) {
+      return res.status(400).json({ error: 'guest_count must be a positive integer' });
+    }
+    const r = db.prepare(
+      "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, channel, status, opened_at) VALUES (?, ?, NULL, ?, ?, ?, 'bar_tab', 'open', ?)"
+    ).run(crypto.randomUUID(), SITE_ID, req.user.id, cleanTab, guests, nowIso());
+    const check = checkResponse(r.lastInsertRowid);
+    broadcastCheckUpdated(check.id);
+    /* Duplicate-name rule: tabs are NEVER merged — a second open tab
+     * under the same name is a distinct check (two guests can share a
+     * name, and silently folding one tab into another would mix their
+     * bills). When THIS server already has an open tab under the same
+     * name, the response names those tabs so the client can warn
+     * instead of quietly stacking look-alikes. */
+    const existing = db.prepare(
+      "SELECT id, opened_at FROM checks WHERE site_id = ? AND server_id = ? AND channel = 'bar_tab' AND status = 'open' AND LOWER(tab_name) = LOWER(?) AND id != ? ORDER BY id"
+    ).all(SITE_ID, req.user.id, cleanTab, check.id)
+      .map((t) => ({ id: t.id, opened_at: t.opened_at, total_cents: persistTotals(t.id).total }));
+    return res.status(201).json(existing.length ? { ...check, existing_tabs: existing } : check);
+  }
+  const table = db.prepare('SELECT id FROM tables WHERE id = ? AND site_id = ?').get(table_id, SITE_ID);
   if (!table) return res.status(400).json({ error: 'Valid table_id is required' });
   if (!isInt(guest_count) || guest_count < 1) {
     return res.status(400).json({ error: 'guest_count must be a positive integer' });
@@ -1981,7 +2033,7 @@ app.post('/api/checks', serverPlus(), (req, res) => {
 
 app.get('/api/checks/open', serverPlus(), (req, res) => {
   const rows = db.prepare(
-    `SELECT c.id, c.uuid, c.table_id, c.server_id, c.tab_name, c.guest_count, c.status, c.opened_at,
+    `SELECT c.id, c.uuid, c.table_id, c.server_id, c.tab_name, c.channel, c.guest_count, c.status, c.opened_at,
             t.label AS table_label, u.name AS server_name,
             (SELECT COUNT(*) FROM check_items ci WHERE ci.check_id = c.id AND ci.state IN ${BILLABLE_STATES}) AS item_count
      FROM checks c
@@ -1995,7 +2047,7 @@ app.get('/api/checks/open', serverPlus(), (req, res) => {
     return {
       id: c.id, uuid: c.uuid, table_id: c.table_id, table_label: c.table_label,
       server_id: c.server_id, server_name: c.server_name,
-      tab_name: c.tab_name, guest_count: c.guest_count, status: c.status,
+      tab_name: c.tab_name, channel: c.channel || 'dine_in', guest_count: c.guest_count, status: c.status,
       item_count: c.item_count, total_cents: t.total, opened_at: c.opened_at,
     };
   }));
@@ -2944,7 +2996,7 @@ function fireHeldItemsToKdsCore(check, held, actor) {
   for (const [station, items] of byStation) {
     const r = insTicket.run(
       crypto.randomUUID(), check.id, SITE_ID, station,
-      table ? table.label : null,
+      checkLocationLabel(table, check),
       serverUser ? serverUser.name : null,
       JSON.stringify(items), sentAt
     );
@@ -3136,7 +3188,7 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
     const created = [];
     for (const [station, tItems] of byStation) {
       const r = newTicket.run(crypto.randomUUID(), SITE_ID, check.id, station,
-        table ? table.label : null, serverUser ? serverUser.name : null,
+        checkLocationLabel(table, check), serverUser ? serverUser.name : null,
         JSON.stringify(tItems), sentAt);
       created.push(ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid)));
     }
@@ -3189,7 +3241,7 @@ app.post('/api/checks/:id/items/:itemId/refire', serverPlus(), (req, res) => {
     `INSERT INTO kds_tickets (uuid, check_id, site_id, station, table_label, server_name, items_json, refire, status, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'new', ?)`
   ).run(crypto.randomUUID(), check.id, SITE_ID, item.station || 'expediter',
-    table ? table.label : null, serverUser ? serverUser.name : null,
+    checkLocationLabel(table, check), serverUser ? serverUser.name : null,
     JSON.stringify([snap]), at);
   const ticket = ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid));
   auditApproval(req, 'refire', { check_id: check.id, item_id: item.id }, {
@@ -3313,7 +3365,7 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
       broadcastCheckUpdated(targetCheck.id);
     } else {
       const insCheck = db.prepare(
-        "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, split_from, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)"
+        "INSERT INTO checks (uuid, site_id, table_id, server_id, tab_name, guest_count, channel, split_from, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)"
       );
       groups.forEach((g, i) => {
         const seats = [...new Set(g.map((it) => it.seat))];
@@ -3322,7 +3374,9 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
         // distinct-seat count — a retained seat 2 stays valid when seat 1 moved.
         // Claim/overlap P0: split children carry split_from so the one-open-
         // claim-per-table index doesn't treat a split as a double-claim.
-        const r = insCheck.run(crypto.randomUUID(), SITE_ID, check.table_id, check.server_id, label, Math.max(...seats), check.id, now);
+        // Bar tabs: children inherit the parent channel (and its NULL
+        // table_id) so a split tab stays a tab.
+        const r = insCheck.run(crypto.randomUUID(), SITE_ID, check.table_id, check.server_id, label, Math.max(...seats), check.channel || 'dine_in', check.id, now);
         for (const it of g) {
           transferItem(it, r.lastInsertRowid, mode === 'move' && g.length === 1 ? req._moveQty : null);
         }
@@ -4356,11 +4410,11 @@ app.get('/api/manager/overview', managerOnly(), (req, res) => {
 
   const alerts = [];
   const staleOpen = db.prepare(
-    "SELECT id, table_id, opened_at FROM checks WHERE site_id = ? AND status = 'open' AND opened_at < ?"
+    "SELECT id, table_id, tab_name, channel, opened_at FROM checks WHERE site_id = ? AND status = 'open' AND opened_at < ?"
   ).all(SITE_ID, new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString());
   for (const c of staleOpen) {
     const table = c.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(c.table_id) : null;
-    alerts.push({ type: 'check_open_too_long', check_id: c.id, table_label: table ? table.label : null, opened_at: c.opened_at });
+    alerts.push({ type: 'check_open_too_long', check_id: c.id, table_label: table ? table.label : null, tab_name: c.tab_name || null, channel: c.channel || 'dine_in', opened_at: c.opened_at });
   }
   const staleTickets = db.prepare(
     "SELECT id, station, table_label, created_at FROM kds_tickets WHERE site_id = ? AND status = 'new' AND created_at < ?"
@@ -7235,7 +7289,7 @@ const API_DOCS = [
   { method: 'GET', path: '/api/config', auth: 'any staff', summary: 'Site config (tax, surcharge, service charge)', params: '—' },
   { method: 'GET', path: '/api/menu', auth: 'any staff', summary: 'Full menu with categories, items, modifiers', params: '—' },
   { method: 'GET', path: '/api/zones', auth: 'any staff', summary: 'Floor zones with tables', params: '—' },
-  { method: 'POST', path: '/api/checks', auth: 'server+', summary: 'Open a check on a table', params: 'table_id, guest_count, tab_name?' },
+  { method: 'POST', path: '/api/checks', auth: 'server+', summary: 'Open a check on a table — or a bar tab (channel bar_tab) when table_id is omitted and tab_name names the guest', params: 'table_id?, guest_count, tab_name?' },
   { method: 'GET', path: '/api/checks/open', auth: 'server+', summary: 'List open checks', params: '—' },
   { method: 'GET', path: '/api/checks/:id', auth: 'server+', summary: 'Check with items, totals, payments', params: '—' },
   { method: 'POST', path: '/api/checks/:id/items', auth: 'server+', summary: 'Add held item (server-side price lock)', params: 'menu_item_id, seat, qty, modifiers' },
@@ -7666,7 +7720,7 @@ function staleOpenChecks() {
   const hours = siteConfigInt('stale_check_hours', 24);
   const cutoffMs = Date.now() - hours * 3600_000;
   const opens = db.prepare(
-    "SELECT id, table_id, opened_at, total_cents FROM checks WHERE site_id = ? AND status = 'open' ORDER BY id"
+    "SELECT id, table_id, tab_name, channel, opened_at, total_cents FROM checks WHERE site_id = ? AND status = 'open' ORDER BY id"
   ).all(SITE_ID);
   const out = [];
   if (opens.length) {
@@ -7693,6 +7747,8 @@ function staleOpenChecks() {
         check_id: c.id,
         table_id: c.table_id,
         table_label: table ? table.label : null,
+        tab_name: c.tab_name || null,
+        channel: c.channel || 'dine_in',
         opened_at: c.opened_at,
         last_activity_at: lastRaw,
         age_hours: Math.round(((Date.now() - lastMs) / 3600_000) * 10) / 10,
