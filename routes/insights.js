@@ -436,14 +436,14 @@ function askQuestion(ctx, question) {
  * Registration
  * ------------------------------------------------------------------------- */
 function register(app, ctx) {
-  const { managerOnly } = ctx;
+  const { gateFinanceReports } = ctx;
 
-  app.get('/api/insights/digest', managerOnly(), (req, res) => {
+  app.get('/api/insights/digest', gateFinanceReports(), (req, res) => {
     try { res.json(buildDigest(ctx)); }
     catch (e) { res.status(500).json({ error: 'digest failed: ' + (e.message || e) }); }
   });
 
-  app.post('/api/insights/ask', managerOnly(), (req, res) => {
+  app.post('/api/insights/ask', gateFinanceReports(), (req, res) => {
     const b = req.body || {};
     if (typeof b.question !== 'string' || !b.question.trim() || b.question.length > 300) {
       return res.status(400).json({ error: 'question must be a non-empty string of at most 300 characters' });

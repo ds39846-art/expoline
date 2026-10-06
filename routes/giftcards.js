@@ -120,7 +120,7 @@ function cardView(c) {
 }
 
 function register(app, ctx) {
-  const { db, SITE_ID, managerOnly, serverPlus, nowIso, crypto,
+  const { db, SITE_ID, gateSiteAdmin, serverPlus, nowIso, crypto,
           persistTotals, checkResponse, paymentView, broadcastCheckUpdated,
           auditApproval, idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear,
           dayClosedToday } = ctx;
@@ -161,7 +161,7 @@ function register(app, ctx) {
   };
 
   /* ---------------- issue ---------------- */
-  app.post('/api/gift-cards/issue', managerOnly(), (req, res) => {
+  app.post('/api/gift-cards/issue', gateSiteAdmin(), (req, res) => {
     const { initial_cents } = req.body || {};
     // Phase 1B: idempotency replay FIRST — a retried issue returns the
     // already-issued card even though validation below would re-run.
@@ -214,7 +214,7 @@ function register(app, ctx) {
   });
 
   /* ---------------- reload ---------------- */
-  app.post('/api/gift-cards/reload', managerOnly(), (req, res) => {
+  app.post('/api/gift-cards/reload', gateSiteAdmin(), (req, res) => {
     const { code, amount_cents } = req.body || {};
     // Phase 1B: idempotency replay FIRST.
     const ikey0 = idemKeyFrom(req);
@@ -263,7 +263,7 @@ function register(app, ctx) {
   });
 
   /* ---------------- void (only if never used) ---------------- */
-  app.post('/api/gift-cards/void', managerOnly(), (req, res) => {
+  app.post('/api/gift-cards/void', gateSiteAdmin(), (req, res) => {
     const { code } = req.body || {};
     const card = findCard(code);
     if (!card) return res.status(404).json({ error: 'Gift card not found' });
@@ -300,7 +300,7 @@ function register(app, ctx) {
   });
 
   /* ---------------- list (manager view) ---------------- */
-  app.get('/api/gift-cards', managerOnly(), (req, res) => {
+  app.get('/api/gift-cards', gateSiteAdmin(), (req, res) => {
     const rows = db.prepare(
       'SELECT * FROM gift_cards WHERE site_id = ? ORDER BY id DESC LIMIT 200'
     ).all(SITE_ID);
@@ -425,7 +425,7 @@ function register(app, ctx) {
   });
 
   /* ---------------- transaction history for a card ---------------- */
-  app.get('/api/gift-cards/:code/txns', managerOnly(), (req, res) => {
+  app.get('/api/gift-cards/:code/txns', gateSiteAdmin(), (req, res) => {
     const card = findCard(req.params.code);
     if (!card) return res.status(404).json({ error: 'Gift card not found' });
     const rows = db.prepare(

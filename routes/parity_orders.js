@@ -222,7 +222,7 @@ function itemVisibleInWindow(itemDaypart, windowName, also) {
 }
 
 function register(app, ctx) {
-  const { db, SITE_ID, SITE_TZ, managerOnly, serverPlus, nowIso, crypto,
+  const { db, SITE_ID, SITE_TZ, gateAdminMenu, gateSiteAdmin, serverPlus, nowIso, crypto,
     persistTotals, checkResponse, itemView, ticketView, broadcastCheckUpdated,
     broadcastTicketUpdated, auditApproval, getConfig, parseJson, isInt,
     withTransaction, verifyManagerPin, cleanLabel, validateModifiers,
@@ -235,10 +235,10 @@ function register(app, ctx) {
     const cur = currentDaypart(schedule, nowMs, SITE_TZ);
     res.json({ tz: SITE_TZ, schedule, now: new Date(nowMs).toISOString(), current: cur ? cur.name : null });
   });
-  app.get('/api/admin/dayparts', managerOnly(), (req, res) => {
+  app.get('/api/admin/dayparts', gateSiteAdmin(), (req, res) => {
     res.json({ tz: SITE_TZ, schedule: getDayparts(db, SITE_ID) });
   });
-  app.put('/api/admin/dayparts', managerOnly(), (req, res) => {
+  app.put('/api/admin/dayparts', gateSiteAdmin(), (req, res) => {
     const schedule = (req.body || {}).schedule;
     if (!Array.isArray(schedule) || !schedule.length) {
       return res.status(400).json({ error: 'schedule must be a non-empty array of windows' });
@@ -304,10 +304,10 @@ function register(app, ctx) {
       }),
     });
   });
-  app.get('/api/admin/floor/config', managerOnly(), (req, res) => {
+  app.get('/api/admin/floor/config', gateSiteAdmin(), (req, res) => {
     res.json(getFloorConfig());
   });
-  app.put('/api/admin/floor/config', managerOnly(), (req, res) => {
+  app.put('/api/admin/floor/config', gateSiteAdmin(), (req, res) => {
     const target = (req.body || {}).turn_time_target_min;
     if (!isInt(target) || target < 15 || target > 480) {
       return res.status(400).json({ error: 'turn_time_target_min must be an integer between 15 and 480' });
@@ -366,14 +366,14 @@ function register(app, ctx) {
         is_default: !!o.is_default, active: !!o.active, sort_order: o.sort_order })),
     };
   }
-  app.get('/api/admin/menu/items/:id/modifier-groups', managerOnly(), (req, res) => {
+  app.get('/api/admin/menu/items/:id/modifier-groups', gateAdminMenu(), (req, res) => {
     const item = getMenuItem(req.params.id);
     if (!item) return res.status(404).json({ error: 'Menu item not found' });
     const groups = db.prepare('SELECT * FROM menu_modifier_groups WHERE site_id = ? AND menu_item_id = ? ORDER BY sort_order, id')
       .all(SITE_ID, item.id);
     res.json({ item_id: item.id, groups: groups.map(groupJson) });
   });
-  app.post('/api/admin/menu/items/:id/modifier-groups', managerOnly(), (req, res) => {
+  app.post('/api/admin/menu/items/:id/modifier-groups', gateAdminMenu(), (req, res) => {
     const item = getMenuItem(req.params.id);
     if (!item) return res.status(404).json({ error: 'Menu item not found' });
     const b = req.body || {};
@@ -401,7 +401,7 @@ function register(app, ctx) {
     const g = db.prepare('SELECT * FROM menu_modifier_groups WHERE id = ?').get(r.lastInsertRowid);
     res.status(201).json(groupJson(g));
   });
-  app.put('/api/admin/menu/modifier-groups/:groupId', managerOnly(), (req, res) => {
+  app.put('/api/admin/menu/modifier-groups/:groupId', gateAdminMenu(), (req, res) => {
     const g = db.prepare('SELECT * FROM menu_modifier_groups WHERE id = ? AND site_id = ?').get(req.params.groupId, SITE_ID);
     if (!g) return res.status(404).json({ error: 'Modifier group not found' });
     const b = req.body || {};
@@ -439,7 +439,7 @@ function register(app, ctx) {
     }
     res.json(groupJson(db.prepare('SELECT * FROM menu_modifier_groups WHERE id = ?').get(g.id)));
   });
-  app.delete('/api/admin/menu/modifier-groups/:groupId', managerOnly(), (req, res) => {
+  app.delete('/api/admin/menu/modifier-groups/:groupId', gateAdminMenu(), (req, res) => {
     const g = db.prepare('SELECT * FROM menu_modifier_groups WHERE id = ? AND site_id = ?').get(req.params.groupId, SITE_ID);
     if (!g) return res.status(404).json({ error: 'Modifier group not found' });
     withTransaction(() => {
@@ -450,7 +450,7 @@ function register(app, ctx) {
     });
     res.json({ deleted: g.id });
   });
-  app.post('/api/admin/menu/modifier-groups/:groupId/options', managerOnly(), (req, res) => {
+  app.post('/api/admin/menu/modifier-groups/:groupId/options', gateAdminMenu(), (req, res) => {
     const g = db.prepare('SELECT * FROM menu_modifier_groups WHERE id = ? AND site_id = ?').get(req.params.groupId, SITE_ID);
     if (!g) return res.status(404).json({ error: 'Modifier group not found' });
     const b = req.body || {};
@@ -466,7 +466,7 @@ function register(app, ctx) {
     res.status(201).json({ id: o.id, name: o.name, price_delta_cents: o.price_delta_cents,
       is_default: !!o.is_default, active: !!o.active, sort_order: o.sort_order });
   });
-  app.put('/api/admin/menu/modifier-options/:optionId', managerOnly(), (req, res) => {
+  app.put('/api/admin/menu/modifier-options/:optionId', gateAdminMenu(), (req, res) => {
     const o = db.prepare(`SELECT o.* FROM menu_modifier_options o
       JOIN menu_modifier_groups g ON g.id = o.group_id WHERE o.id = ? AND g.site_id = ?`).get(req.params.optionId, SITE_ID);
     if (!o) return res.status(404).json({ error: 'Modifier option not found' });
@@ -493,7 +493,7 @@ function register(app, ctx) {
     res.json({ id: u.id, name: u.name, price_delta_cents: u.price_delta_cents,
       is_default: !!u.is_default, active: !!u.active, sort_order: u.sort_order });
   });
-  app.delete('/api/admin/menu/modifier-options/:optionId', managerOnly(), (req, res) => {
+  app.delete('/api/admin/menu/modifier-options/:optionId', gateAdminMenu(), (req, res) => {
     const o = db.prepare(`SELECT o.* FROM menu_modifier_options o
       JOIN menu_modifier_groups g ON g.id = o.group_id WHERE o.id = ? AND g.site_id = ?`).get(req.params.optionId, SITE_ID);
     if (!o) return res.status(404).json({ error: 'Modifier option not found' });

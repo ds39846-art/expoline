@@ -1584,9 +1584,111 @@ function requireRole(...roles) {
   };
 }
 
-const serverPlus = () => requireRole('server', 'manager');   // checks / items / send / split / pay / close
-const kitchenPlus = () => requireRole('kitchen', 'manager'); // KDS read + bump
-const managerOnly = () => requireRole('manager');            // finance / refunds / overview
+/* ============================================================================
+ * CAPABILITY MATRIX (audit gap #10) — roles keep their names (server /
+ * kitchen / manager); what a role may DO is a set of named capabilities the
+ * site manager can tune in site_config `permissions_json`. Every route gate
+ * below consults the matrix per request (no caching — a grant or revoke
+ * applies to the very next request, even mid-session).
+ *
+ * HARD ANCHOR: with no stored matrix, DEFAULT_PERMISSIONS reproduces the
+ * pre-matrix role gates EXACTLY (serverPlus = server+manager, kitchenPlus =
+ * kitchen+manager, every managerOnly() domain = manager only, the floor-86
+ * gate = all three roles). test56 carries the explicit role x endpoint
+ * equivalence table against the pre-batch commit.
+ *
+ * TWO AXES, NEVER MERGED: capabilities gate ROLE access to a surface. The
+ * manager-PIN approvals (void / comp / tax-exempt / close-day / discount
+ * approval / tip-declaration amendments) are a separate per-action axis —
+ * holding a capability NEVER substitutes for a fresh manager PIN where a
+ * handler demands one (the comp idiom: PIN always, even for managers).
+ *
+ * LOCKOUT INVARIANT: the manager role always retains `permissions_admin`.
+ * A stored matrix may not remove it (the PUT refuses such a matrix), and
+ * effectivePermissions() re-adds it intrinsically as a backstop — a site
+ * can never lock itself out of permission administration.
+ *
+ * NOT migrated (deliberate, documented): drawerCloseGate() keeps pure role
+ * semantics (it is a site-config policy switch, drawer_close_role, that
+ * predates the matrix); inline handler role checks (clock-in/out of OTHER
+ * employees, tip-declaration target rules, market-price pricing, the
+ * split_allowed + PIN split permission, drawer blind-view shaping,
+ * waitlist no-show/cancel manager rules) are ownership/business logic, not
+ * route gates; the LAN brain transport gate (lan/http.js) and per-op
+ * manager checks (lan/store.js) are the offline surface's own enforcement.
+ * ========================================================================== */
+const CAPABILITY_DEFS = [
+  { key: 'floor_ops', label: 'Floor operations', desc: 'Checks, items, send, split, payments, close — the server floor (the old serverPlus gate).' },
+  { key: 'kitchen_ops', label: 'Kitchen display', desc: 'KDS tickets, bump/recall, online-order fulfillment (the old kitchenPlus gate).' },
+  { key: 'menu_86', label: '86 from the floor', desc: 'Mark items sold out / restore them mid-service from any terminal.' },
+  { key: 'admin_menu', label: 'Menu editing', desc: 'Menu items, categories, modifier groups, popularity, the manager 86 toggle and menu audit.' },
+  { key: 'admin_discounts', label: 'Discount library', desc: 'Create and edit the named discounts servers apply from the picker.' },
+  { key: 'admin_inventory', label: 'Inventory', desc: 'Ingredients, recipes, stock adjustments, waste / receive / count and variance.' },
+  { key: 'finance_reports', label: 'Finance reports', desc: 'Payouts, shift + sales + tax reports, product mix, tip-out report, manager overview, cash log, insights.' },
+  { key: 'finance_closeout', label: 'Day close-out (Z)', desc: 'Run and reopen the end-of-day close-out and read past close-outs. A fresh manager PIN is still required per close.' },
+  { key: 'refunds', label: 'Refunds & reopens', desc: 'Refund payments, reopen closed checks, reverse guest splits.' },
+  { key: 'clock_admin', label: 'Time clock & staff', desc: 'Clock shifts and adjustments, pay rates, employees, schedules.' },
+  { key: 'site_admin', label: 'Site administration', desc: 'Zones and tables, dayparts, service-charge / drawer / floor settings, house accounts, notes, gift-card admin, OpenTable admin, audit log, API docs.' },
+  { key: 'permissions_admin', label: 'Permissions', desc: 'Edit this capability matrix. The manager role always keeps it — a site cannot lock itself out.' },
+];
+const CAP_KEYS = CAPABILITY_DEFS.map((c) => c.key);
+const PERM_ROLES = ['server', 'kitchen', 'manager'];
+const DEFAULT_PERMISSIONS = {
+  server: ['floor_ops', 'menu_86'],
+  kitchen: ['kitchen_ops', 'menu_86'],
+  manager: CAP_KEYS.slice(),
+};
+
+/* The stored matrix (site_config permissions_json), or null when the site
+ * has never saved one. Read fresh on every gated request: no caching, so
+ * matrix edits apply to the next request on every live session. */
+function storedPermissions() {
+  const row = db.prepare("SELECT value FROM site_config WHERE site_id = ? AND key = 'permissions_json'").get(SITE_ID);
+  if (!row) return null;
+  try {
+    const p = JSON.parse(row.value);
+    return (p && typeof p === 'object' && !Array.isArray(p)) ? p : null;
+  } catch { return null; }
+}
+
+function effectivePermissions() {
+  const stored = storedPermissions();
+  const out = {};
+  for (const role of PERM_ROLES) {
+    const v = stored && Array.isArray(stored[role])
+      ? stored[role].filter((c) => CAP_KEYS.includes(c))
+      : DEFAULT_PERMISSIONS[role];
+    out[role] = [...new Set(v)];
+  }
+  if (!out.manager.includes('permissions_admin')) out.manager.push('permissions_admin');
+  return out;
+}
+
+function roleCapabilities(role) {
+  return effectivePermissions()[role] || [];
+}
+
+/* Capability gate — the matrix-era requireRole. Same contract: 403 JSON
+ * when the caller's role lacks the capability, next() otherwise. */
+function requireCap(cap) {
+  return (req, res, next) => {
+    if (!req.user || !roleCapabilities(req.user.role).includes(cap)) {
+      return res.status(403).json({ error: `Forbidden: requires capability ${cap}` });
+    }
+    next();
+  };
+}
+
+const serverPlus = () => requireCap('floor_ops');      // checks / items / send / split / pay / close
+const kitchenPlus = () => requireCap('kitchen_ops');   // KDS read + bump + online fulfillment
+const gateAdminMenu = () => requireCap('admin_menu');
+const gateAdminDiscounts = () => requireCap('admin_discounts');
+const gateAdminInventory = () => requireCap('admin_inventory');
+const gateFinanceReports = () => requireCap('finance_reports');
+const gateFinanceCloseout = () => requireCap('finance_closeout');
+const gateRefunds = () => requireCap('refunds');
+const gateClockAdmin = () => requireCap('clock_admin');
+const gateSiteAdmin = () => requireCap('site_admin');
 
 /**
  * Manager PIN verification for point-of-action approvals (voids, comps,
@@ -1769,7 +1871,7 @@ app.post('/api/auth/login', (req, res) => {
   if (!user) { recordLoginAttempt(req, ip, false); return res.status(401).json({ error: 'Invalid PIN' }); }
   recordLoginAttempt(req, ip, true);
   const token = issueToken(user);
-  res.json({ token, user: { id: user.id, name: user.name, role: user.role } });
+  res.json({ token, user: { id: user.id, name: user.name, role: user.role, capabilities: roleCapabilities(user.role) } });
 });
 
 /* POST /api/auth/logout — revoke the presented Bearer token immediately.
@@ -1990,7 +2092,7 @@ function labelTaken(label, excludeId) {
 function validSeats(v) { return isInt(v) && v >= 1 && v <= 20; }
 function validCoord(v) { return v == null || (typeof v === 'number' && Number.isFinite(v)); }
 
-app.get('/api/admin/zones', managerOnly(), (req, res) => {
+app.get('/api/admin/zones', gateSiteAdmin(), (req, res) => {
   const zones = db.prepare('SELECT id, name FROM zones WHERE site_id = ? ORDER BY sort, id').all(SITE_ID);
   const tblStmt = db.prepare('SELECT id, label, seats, x, y, shape FROM tables WHERE zone_id = ? ORDER BY id');
   res.json(zones.map((z) => ({
@@ -1999,7 +2101,7 @@ app.get('/api/admin/zones', managerOnly(), (req, res) => {
   })));
 });
 
-app.post('/api/admin/zones', managerOnly(), (req, res) => {
+app.post('/api/admin/zones', gateSiteAdmin(), (req, res) => {
   const name = cleanLabel(req.body && req.body.name);
   if (!name) return res.status(400).json({ error: 'Zone name is required' });
   if (db.prepare('SELECT id FROM zones WHERE site_id = ? AND LOWER(name) = LOWER(?)').get(SITE_ID, name)) {
@@ -2010,7 +2112,7 @@ app.post('/api/admin/zones', managerOnly(), (req, res) => {
   res.status(201).json({ id: r.lastInsertRowid, name, tables: [] });
 });
 
-app.put('/api/admin/zones/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/zones/:id', gateSiteAdmin(), (req, res) => {
   const z = zoneById(req.params.id);
   if (!z) return res.status(404).json({ error: 'Zone not found' });
   const name = cleanLabel(req.body && req.body.name);
@@ -2022,7 +2124,7 @@ app.put('/api/admin/zones/:id', managerOnly(), (req, res) => {
   res.json({ id: z.id, name });
 });
 
-app.delete('/api/admin/zones/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/zones/:id', gateSiteAdmin(), (req, res) => {
   const z = zoneById(req.params.id);
   if (!z) return res.status(404).json({ error: 'Zone not found' });
   const n = db.prepare('SELECT COUNT(*) AS n FROM tables WHERE zone_id = ?').get(z.id).n;
@@ -2031,7 +2133,7 @@ app.delete('/api/admin/zones/:id', managerOnly(), (req, res) => {
   res.json({ deleted: z.id });
 });
 
-app.post('/api/admin/tables', managerOnly(), (req, res) => {
+app.post('/api/admin/tables', gateSiteAdmin(), (req, res) => {
   const b = req.body || {};
   const z = zoneById(b.zone_id);
   if (!z) return res.status(400).json({ error: 'Valid zone_id is required' });
@@ -2046,7 +2148,7 @@ app.post('/api/admin/tables', managerOnly(), (req, res) => {
   res.status(201).json({ id: r.lastInsertRowid, zone_id: z.id, label, seats: b.seats, x: b.x ?? null, y: b.y ?? null, shape: b.shape || 'square' });
 });
 
-app.put('/api/admin/tables/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/tables/:id', gateSiteAdmin(), (req, res) => {
   const t = tableById(req.params.id);
   if (!t) return res.status(404).json({ error: 'Table not found' });
   const b = req.body || {};
@@ -2067,7 +2169,7 @@ app.put('/api/admin/tables/:id', managerOnly(), (req, res) => {
   res.json({ id: t.id, zone_id: zoneId, label, seats, x, y, shape });
 });
 
-app.delete('/api/admin/tables/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/tables/:id', gateSiteAdmin(), (req, res) => {
   const t = tableById(req.params.id);
   if (!t) return res.status(404).json({ error: 'Table not found' });
   const open = db.prepare("SELECT id FROM checks WHERE table_id = ? AND status = 'open' LIMIT 1").get(t.id);
@@ -2138,7 +2240,7 @@ function itemAdminView(it) {
 
 /* Full menu for the editor — includes 86'd (inactive) items the public
    /api/menu deliberately hides. */
-app.get('/api/admin/menu', managerOnly(), (req, res) => {
+app.get('/api/admin/menu', gateAdminMenu(), (req, res) => {
   const cats = db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id').all(SITE_ID);
   const itemStmt = db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, item_type, station, course, active, is_86, remaining, price_note, image_url, daypart FROM menu_items WHERE category_id = ? ORDER BY id');
   res.json(cats.map((c) => ({
@@ -2147,7 +2249,7 @@ app.get('/api/admin/menu', managerOnly(), (req, res) => {
   })));
 });
 
-app.post('/api/admin/menu/categories', managerOnly(), (req, res) => {
+app.post('/api/admin/menu/categories', gateAdminMenu(), (req, res) => {
   const b = req.body || {};
   const name = cleanLabel(b.name);
   if (!name) return res.status(400).json({ error: 'Category name is required' });
@@ -2164,7 +2266,7 @@ app.post('/api/admin/menu/categories', managerOnly(), (req, res) => {
   res.status(201).json({ id: r.lastInsertRowid, name, parent, sort, items: [] });
 });
 
-app.put('/api/admin/menu/categories/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/menu/categories/:id', gateAdminMenu(), (req, res) => {
   const c = menuCategoryById(req.params.id);
   if (!c) return res.status(404).json({ error: 'Category not found' });
   const b = req.body || {};
@@ -2182,7 +2284,7 @@ app.put('/api/admin/menu/categories/:id', managerOnly(), (req, res) => {
   res.json({ id: c.id, name, parent, sort });
 });
 
-app.delete('/api/admin/menu/categories/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/menu/categories/:id', gateAdminMenu(), (req, res) => {
   const c = menuCategoryById(req.params.id);
   if (!c) return res.status(404).json({ error: 'Category not found' });
   const n = db.prepare('SELECT COUNT(*) AS n FROM menu_items WHERE category_id = ?').get(c.id).n;
@@ -2193,7 +2295,7 @@ app.delete('/api/admin/menu/categories/:id', managerOnly(), (req, res) => {
   res.json({ deleted: c.id });
 });
 
-app.post('/api/admin/menu/items', managerOnly(), (req, res) => {
+app.post('/api/admin/menu/items', gateAdminMenu(), (req, res) => {
   const b = req.body || {};
   const cat = menuCategoryById(b.category_id);
   if (!cat) return res.status(400).json({ error: 'Valid category_id is required' });
@@ -2226,7 +2328,7 @@ app.post('/api/admin/menu/items', managerOnly(), (req, res) => {
   res.status(201).json(itemAdminView(menuItemById(id)));
 });
 
-app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/menu/items/:id', gateAdminMenu(), (req, res) => {
   const it = menuItemById(req.params.id);
   if (!it) return res.status(404).json({ error: 'Menu item not found' });
   const b = req.body || {};
@@ -2273,7 +2375,7 @@ app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
   res.json(itemAdminView(menuItemById(it.id)));
 });
 
-app.delete('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/menu/items/:id', gateAdminMenu(), (req, res) => {
   const it = menuItemById(req.params.id);
   if (!it) return res.status(404).json({ error: 'Menu item not found' });
   const refs = db.prepare('SELECT COUNT(*) AS n FROM check_items WHERE menu_item_id = ?').get(it.id).n;
@@ -2289,7 +2391,7 @@ app.delete('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
 
 /* One-tap 86: flips active 1↔0. Kept deliberately tiny — this is the button a
    manager hammers mid-rush, so it does one UPDATE, one audit row, one push. */
-app.post('/api/admin/menu/86/:id', managerOnly(), (req, res) => {
+app.post('/api/admin/menu/86/:id', gateAdminMenu(), (req, res) => {
   const it = menuItemById(req.params.id);
   if (!it) return res.status(404).json({ error: 'Menu item not found' });
   const active = it.active ? 0 : 1;
@@ -2312,7 +2414,7 @@ app.post('/api/admin/menu/86/:id', managerOnly(), (req, res) => {
    (noop: true, no audit row) — a double-tap on the floor is not two
    events. The state persists until a human restores it; EOD close-out
    deliberately does not clear it. */
-app.post('/api/menu/items/:id/86', requireRole('server', 'kitchen', 'manager'), (req, res) => {
+app.post('/api/menu/items/:id/86', requireCap('menu_86'), (req, res) => {
   const it = menuItemById(req.params.id);
   if (!it) return res.status(404).json({ error: 'Menu item not found' });
   const b = req.body || {};
@@ -2356,7 +2458,7 @@ app.post('/api/menu/items/:id/86', requireRole('server', 'kitchen', 'manager'), 
 /* Phase 3A (NG-D): popular / quick-pick flag — the order screen's quick-pick
  * row (SpotOn V3 1:05 "quick buttons for popular items"). Manager-only;
  * 86'd items never appear in the quick-pick row even when flagged. */
-app.put('/api/admin/menu/items/:id/popular', managerOnly(), (req, res) => {
+app.put('/api/admin/menu/items/:id/popular', gateAdminMenu(), (req, res) => {
   const it = menuItemById(req.params.id);
   if (!it) return res.status(404).json({ error: 'Menu item not found' });
   const popular = (req.body || {}).popular;
@@ -2367,7 +2469,7 @@ app.put('/api/admin/menu/items/:id/popular', managerOnly(), (req, res) => {
   res.json({ id: it.id, name: it.name, popular });
 });
 
-app.get('/api/admin/menu/audit', managerOnly(), (req, res) => {
+app.get('/api/admin/menu/audit', gateAdminMenu(), (req, res) => {
   const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '50', 10) || 50));
   const rows = db.prepare('SELECT id, actor, action, item_id, category_id, details, created_at FROM menu_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit);
   res.json(rows.map((r) => ({ id: r.id, actor: r.actor, action: r.action, item_id: r.item_id, category_id: r.category_id, details: parseJson(r.details, {}), created_at: r.created_at })));
@@ -2532,7 +2634,7 @@ app.get('/api/course-timing', serverPlus(), (req, res) => {
   const rows = db.prepare(`SELECT course, eat_minutes, prep_minutes FROM course_timing WHERE site_id = ?`).all(SITE_ID);
   res.json({ timing: rows });
 });
-app.put('/api/course-timing', serverPlus(), managerOnly(), (req, res) => {
+app.put('/api/course-timing', gateSiteAdmin(), (req, res) => {
   const { timing } = req.body || {};
   if (!Array.isArray(timing)) return res.status(400).json({ error: 'timing array required' });
   const up = db.prepare(`INSERT INTO course_timing (site_id, course, eat_minutes, prep_minutes, updated_at)
@@ -3637,11 +3739,11 @@ function validateDiscountDef(b, existing) {
   return { fields: { name, kind, percent, amount_cents, scope, requires_approval, active } };
 }
 
-app.get('/api/admin/discounts', managerOnly(), (req, res) => {
+app.get('/api/admin/discounts', gateAdminDiscounts(), (req, res) => {
   res.json(db.prepare('SELECT * FROM discounts WHERE site_id = ? ORDER BY active DESC, name').all(SITE_ID).map(discountDefView));
 });
 
-app.post('/api/admin/discounts', managerOnly(), (req, res) => {
+app.post('/api/admin/discounts', gateAdminDiscounts(), (req, res) => {
   const v = validateDiscountDef(req.body || {}, null);
   if (v.error) return res.status(400).json({ error: v.error });
   const f = v.fields;
@@ -3654,7 +3756,7 @@ app.post('/api/admin/discounts', managerOnly(), (req, res) => {
   res.status(201).json(discountDefView(row));
 });
 
-app.put('/api/admin/discounts/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/discounts/:id', gateAdminDiscounts(), (req, res) => {
   const cur = discountDefById(req.params.id);
   if (!cur) return res.status(404).json({ error: 'Discount not found' });
   const v = validateDiscountDef(req.body || {}, cur);
@@ -3670,7 +3772,7 @@ app.put('/api/admin/discounts/:id', managerOnly(), (req, res) => {
 /* Deleting a definition that checks have used would strand its
  * applications pointing at nothing — the menu-item rule: refuse and
  * point at deactivation, which keeps history readable forever. */
-app.delete('/api/admin/discounts/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/discounts/:id', gateAdminDiscounts(), (req, res) => {
   const cur = discountDefById(req.params.id);
   if (!cur) return res.status(404).json({ error: 'Discount not found' });
   const used = db.prepare('SELECT COUNT(*) AS n FROM check_discounts WHERE discount_id = ?').get(cur.id).n;
@@ -4667,7 +4769,7 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
   }
 });
 
-app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
+app.post('/api/payments/:id/refund', gateRefunds(), (req, res) => {
   // Phase 1B money audit: idempotency replay FIRST — a retried double-POST
   // replays the stored refund even though the payment now reads 'refunded'.
   const ikey0 = idemKeyFrom(req);
@@ -4859,7 +4961,7 @@ app.patch('/api/payments/:id/tip', serverPlus(), (req, res) => {
    The same re-seat guard as the refund auto-reopen applies: if the table now
    has an open staff claim, the reopen is refused (409) to protect the
    one-open-staff-claim-per-table index (claim/overlap P0). */
-app.post('/api/checks/:id/reopen', managerOnly(), (req, res) => {
+app.post('/api/checks/:id/reopen', gateRefunds(), (req, res) => {
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'paid') {
@@ -4974,7 +5076,7 @@ function demoFeeCents(netAmountCents) {
   return Math.round(netAmountCents * cfg.stripe_demo_rate) + cfg.stripe_demo_fixed_cents;
 }
 
-app.get('/api/finance/payouts', managerOnly(), (req, res) => {
+app.get('/api/finance/payouts', gateFinanceReports(), (req, res) => {
   const date = req.query.date || todaySite();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
   const cfg = getConfig();
@@ -5079,7 +5181,7 @@ function shiftDayFigures(date, serverId) {
   };
 }
 
-app.get('/api/finance/shift', managerOnly(), (req, res) => {
+app.get('/api/finance/shift', gateFinanceReports(), (req, res) => {
   const date = req.query.date || todaySite();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
   const serverId = req.query.server_id != null ? Number(req.query.server_id) : null;
@@ -5921,7 +6023,7 @@ async function buildDocx(title, periodLabel, def, data) {
 }
 
 /** GET /api/finance/reports/:report?format=&period=&date=&from=&to= */
-app.get('/api/finance/reports/:report', managerOnly(), async (req, res) => {
+app.get('/api/finance/reports/:report', gateFinanceReports(), async (req, res) => {
   try {
     const def = REPORT_DEFS[req.params.report];
     if (!def) return res.status(400).json({ error: 'Unknown report. Choose: ' + Object.keys(REPORT_DEFS).join(', ') });
@@ -6144,7 +6246,7 @@ const DATE_FMT_RE = /^\d{4}-\d{2}-\d{2}$/;
 /** Day status for the Finance view: is this date closed out, and what
  *  does the system expect in the drawer for it (live for an open day,
  *  the stored figure once closed). */
-app.get('/api/finance/close-day', managerOnly(), (req, res) => {
+app.get('/api/finance/close-day', gateFinanceCloseout(), (req, res) => {
   const date = req.query.date || todaySite();
   if (!DATE_FMT_RE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
   const row = closedDayRow(date);
@@ -6154,7 +6256,7 @@ app.get('/api/finance/close-day', managerOnly(), (req, res) => {
 
 /** Close the business day (Z): fresh manager PIN always (the money-lock
  *  idiom), a REQUIRED typed cash count, snapshot + lock in one write. */
-app.post('/api/finance/close-day', managerOnly(), (req, res) => {
+app.post('/api/finance/close-day', gateFinanceCloseout(), (req, res) => {
   const b = req.body || {};
   const mgr = verifyManagerPin(b.manager_pin);
   if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Closing the day needs a manager PIN — enter it fresh every time', need_manager_pin: true }); }
@@ -6195,7 +6297,7 @@ app.post('/api/finance/close-day', managerOnly(), (req, res) => {
 /** Reopen a closed day: fresh manager PIN + a reason, always. The
  *  close-out row is voided, never deleted; the day unfreezes and a
  *  later re-close writes a fresh row with a fresh snapshot. */
-app.post('/api/finance/close-day/reopen', managerOnly(), (req, res) => {
+app.post('/api/finance/close-day/reopen', gateFinanceCloseout(), (req, res) => {
   const b = req.body || {};
   const mgr = verifyManagerPin(b.manager_pin);
   if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Reopening a closed day needs a manager PIN — enter it fresh every time', need_manager_pin: true }); }
@@ -6218,19 +6320,19 @@ app.post('/api/finance/close-day/reopen', managerOnly(), (req, res) => {
   return res.json(closeoutView(db.prepare('SELECT * FROM closeouts WHERE id = ?').get(row.id), true));
 });
 
-app.get('/api/finance/closeouts', managerOnly(), (req, res) => {
+app.get('/api/finance/closeouts', gateFinanceCloseout(), (req, res) => {
   const rows = db.prepare('SELECT * FROM closeouts WHERE site_id = ? ORDER BY business_date DESC, id DESC').all(SITE_ID);
   return res.json({ closeouts: rows.map((r) => closeoutView(r)) });
 });
 
-app.get('/api/finance/closeouts/:id', managerOnly(), (req, res) => {
+app.get('/api/finance/closeouts/:id', gateFinanceCloseout(), (req, res) => {
   const row = db.prepare('SELECT * FROM closeouts WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!row) return res.status(404).json({ error: 'Close-out not found' });
   return res.json(closeoutView(row, true));
 });
 
 /* --------------------------------- manager --------------------------------- */
-app.get('/api/manager/overview', managerOnly(), (req, res) => {
+app.get('/api/manager/overview', gateFinanceReports(), (req, res) => {
   const today = todaySite();
   const openChecks = db.prepare("SELECT COUNT(*) AS n FROM checks WHERE site_id = ? AND status = 'open'").get(SITE_ID).n;
   const closedToday = db.prepare(
@@ -6788,7 +6890,7 @@ function dayLabor(dateStr) {
 
 /** GET /api/admin/clock/shifts?date=YYYY-MM-DD — manager: all shifts, breaks,
     compliance, premiums, OT, and the day labor rollup. */
-app.get('/api/admin/clock/shifts', managerOnly(), (req, res) => {
+app.get('/api/admin/clock/shifts', gateClockAdmin(), (req, res) => {
   const date = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || '') ? req.query.date : todaySite();
   const { views, adjustments, summary, weekly, seventh_day } = dayLabor(date);
   const onShift = db.prepare("SELECT id, employee_name, role, clock_in FROM clock_shifts WHERE site_id = ? AND clock_out IS NULL").all(SITE_ID);
@@ -6803,7 +6905,7 @@ app.get('/api/admin/clock/shifts', managerOnly(), (req, res) => {
  *  adjustment — the manager physically enters their PIN at the device and
  *  there is no adjustment path without it. The correction lands in the
  *  approval_audit table (same as voids/comps) with before/after + approver. */
-app.post('/api/admin/clock/adjust', managerOnly(), (req, res) => {
+app.post('/api/admin/clock/adjust', gateClockAdmin(), (req, res) => {
   const b = req.body || {};
   // Point-of-action approval FIRST: a valid session alone is NOT enough — the
   // manager must enter their PIN at the device for every adjustment. Checked
@@ -6871,7 +6973,7 @@ app.post('/api/admin/clock/adjust', managerOnly(), (req, res) => {
 });
 
 /** GET /api/admin/clock/config — resolved CA-rule config (defaults + overrides). */
-app.get('/api/admin/clock/config', managerOnly(), (req, res) => {
+app.get('/api/admin/clock/config', gateClockAdmin(), (req, res) => {
   const overrides = {};
   for (const r of db.prepare("SELECT key, value FROM site_config WHERE site_id = ? AND key LIKE 'clock_%'").all(SITE_ID)) {
     overrides[r.key.slice(6)] = r.value;
@@ -6880,7 +6982,7 @@ app.get('/api/admin/clock/config', managerOnly(), (req, res) => {
 });
 
 /** PUT /api/admin/clock/config {key, value} — tune a threshold (audit-logged). */
-app.put('/api/admin/clock/config', managerOnly(), (req, res) => {
+app.put('/api/admin/clock/config', gateClockAdmin(), (req, res) => {
   const { key, value } = req.body || {};
   if (!(key in CLOCK_CA_DEFAULTS)) return res.status(400).json({ error: 'Unknown clock config key' });
   const n = parseFloat(value);
@@ -6892,12 +6994,12 @@ app.put('/api/admin/clock/config', managerOnly(), (req, res) => {
 });
 
 /** GET /api/admin/clock/users — team list with hourly rates (for the manager UI). */
-app.get('/api/admin/clock/users', managerOnly(), (req, res) => {
+app.get('/api/admin/clock/users', gateClockAdmin(), (req, res) => {
   res.json(db.prepare('SELECT id, name, role, hourly_rate_cents FROM users WHERE site_id = ? ORDER BY role, name').all(SITE_ID));
 });
 
 /** PUT /api/admin/clock/users/:id/rate {hourly_rate_cents} — set pay rate (audit-logged). */
-app.put('/api/admin/clock/users/:id/rate', managerOnly(), (req, res) => {
+app.put('/api/admin/clock/users/:id/rate', gateClockAdmin(), (req, res) => {
   const u = db.prepare('SELECT id, name, role, hourly_rate_cents FROM users WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!u) return res.status(400).json({ error: 'Unknown user' });
   const v = req.body && req.body.hourly_rate_cents;
@@ -6908,7 +7010,7 @@ app.put('/api/admin/clock/users/:id/rate', managerOnly(), (req, res) => {
 });
 
 /** GET /api/admin/clock/audit?limit= — who changed what, when. */
-app.get('/api/admin/clock/audit', managerOnly(), (req, res) => {
+app.get('/api/admin/clock/audit', gateClockAdmin(), (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit || '100', 10) || 100, 1), 500);
   res.json(db.prepare('SELECT id, actor, action, shift_id, details, created_at FROM clock_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
 });
@@ -6937,7 +7039,7 @@ function svcChargeCurrent() {
 }
 
 /** GET /api/admin/service-charge/config — current charge config + defaults. */
-app.get('/api/admin/service-charge/config', managerOnly(), (req, res) => {
+app.get('/api/admin/service-charge/config', gateSiteAdmin(), (req, res) => {
   const current = svcChargeCurrent();
   res.json({
     defaults: SVC_CHARGE_DEFAULTS,
@@ -6948,7 +7050,7 @@ app.get('/api/admin/service-charge/config', managerOnly(), (req, res) => {
 });
 
 /** GET /api/admin/service-charge/audit?limit= — who changed the config, when. */
-app.get('/api/admin/service-charge/audit', managerOnly(), (req, res) => {
+app.get('/api/admin/service-charge/audit', gateSiteAdmin(), (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit || '100', 10) || 100, 1), 500);
   res.json(db.prepare('SELECT id, actor, action, before_json, after_json, details, created_at FROM service_charge_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
 });
@@ -6957,7 +7059,7 @@ app.get('/api/admin/service-charge/audit', managerOnly(), (req, res) => {
  *  Change the charge percentage or guest threshold. Requires a manager
  *  session AND a live manager PIN (point-of-action approval, like comps).
  *  Every change is audit-logged with before/after values. */
-app.put('/api/admin/service-charge/config', managerOnly(), (req, res) => {
+app.put('/api/admin/service-charge/config', gateSiteAdmin(), (req, res) => {
   const b = req.body || {};
   const { key, value } = b;
   if (!['service_charge_pct', 'service_charge_min_guests'].includes(key)) {
@@ -6990,14 +7092,14 @@ app.put('/api/admin/service-charge/config', managerOnly(), (req, res) => {
 /** GET /api/admin/drawer/config — who may perform a blind drawer close.
  *  Manager-only by default (Daniel's policy); a manager can relax it to
  *  'server' (servers and managers) with a live manager PIN. */
-app.get('/api/admin/drawer/config', managerOnly(), (req, res) => {
+app.get('/api/admin/drawer/config', gateSiteAdmin(), (req, res) => {
   res.json({ drawer_close_role: getConfig().drawer_close_role });
 });
 
 /** PUT /api/admin/drawer/config {value, manager_pin} — value is
  *  'manager' or 'server'. Requires a manager session AND a live manager PIN
  *  (point-of-action approval, like comps). Audit-logged with before/after. */
-app.put('/api/admin/drawer/config', managerOnly(), (req, res) => {
+app.put('/api/admin/drawer/config', gateSiteAdmin(), (req, res) => {
   const b = req.body || {};
   if (!['manager', 'server'].includes(b.value)) {
     return res.status(400).json({ error: "value must be 'manager' or 'server'" });
@@ -7033,7 +7135,7 @@ function employeeById(id) {
   return db.prepare('SELECT * FROM employees WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 
-app.get('/api/admin/employees', managerOnly(), (req, res) => {
+app.get('/api/admin/employees', gateClockAdmin(), (req, res) => {
   let sql = 'SELECT * FROM employees WHERE site_id = ?';
   const params = [SITE_ID];
   if (req.query.active === '1') { sql += ' AND active = 1'; }
@@ -7042,11 +7144,11 @@ app.get('/api/admin/employees', managerOnly(), (req, res) => {
   res.json(db.prepare(sql).all(...params).map(employeeView));
 });
 
-app.get('/api/admin/employees/next-number', managerOnly(), (req, res) => {
+app.get('/api/admin/employees/next-number', gateClockAdmin(), (req, res) => {
   res.json({ employee_number: nextEmployeeNumber() });
 });
 
-app.post('/api/admin/employees', managerOnly(), (req, res) => {
+app.post('/api/admin/employees', gateClockAdmin(), (req, res) => {
   const b = req.body || {};
   const name = cleanLabel(b.name);
   if (!name) return res.status(400).json({ error: 'name is required' });
@@ -7081,7 +7183,7 @@ app.post('/api/admin/employees', managerOnly(), (req, res) => {
   }
 });
 
-app.put('/api/admin/employees/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/employees/:id', gateClockAdmin(), (req, res) => {
   const emp = employeeById(req.params.id);
   if (!emp) return res.status(404).json({ error: 'Employee not found' });
   const b = req.body || {};
@@ -7147,7 +7249,7 @@ app.put('/api/admin/employees/:id', managerOnly(), (req, res) => {
 });
 
 /** DELETE deactivates (never hard-deletes — payroll history must survive). */
-app.delete('/api/admin/employees/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/employees/:id', gateClockAdmin(), (req, res) => {
   const emp = employeeById(req.params.id);
   if (!emp) return res.status(404).json({ error: 'Employee not found' });
   if (emp.role === 'manager') {
@@ -7162,7 +7264,7 @@ app.delete('/api/admin/employees/:id', managerOnly(), (req, res) => {
 });
 
 /** GET /api/admin/approvals/audit?limit= — every manager approval, who/when/what. */
-app.get('/api/admin/approvals/audit', managerOnly(), (req, res) => {
+app.get('/api/admin/approvals/audit', gateSiteAdmin(), (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit || '100', 10) || 100, 1), 500);
   res.json(db.prepare('SELECT id, actor, approver, action, check_id, item_id, shift_id, before_json, after_json, details, created_at FROM approval_audit WHERE site_id = ? ORDER BY id DESC LIMIT ?').all(SITE_ID, limit));
 });
@@ -7179,7 +7281,7 @@ app.get('/api/admin/house-accounts', serverPlus(), (req, res) => {
 });
 
 /** POST /api/admin/house-accounts {name} — manager-only creation. */
-app.post('/api/admin/house-accounts', managerOnly(), (req, res) => {
+app.post('/api/admin/house-accounts', gateSiteAdmin(), (req, res) => {
   const name = String((req.body && req.body.name) || '').trim();
   if (!name) return res.status(400).json({ error: 'name is required' });
   if (name.length > 80) return res.status(400).json({ error: 'name must be 80 characters or fewer' });
@@ -7197,7 +7299,7 @@ app.post('/api/admin/house-accounts', managerOnly(), (req, res) => {
 });
 
 /** PATCH /api/admin/house-accounts/:id {active} — manager-only deactivate/reactivate. */
-app.patch('/api/admin/house-accounts/:id', managerOnly(), (req, res) => {
+app.patch('/api/admin/house-accounts/:id', gateSiteAdmin(), (req, res) => {
   const row = db.prepare('SELECT id, name, active FROM house_accounts WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!row) return res.status(404).json({ error: 'House account not found' });
   const active = req.body && req.body.active !== undefined ? (req.body.active ? 1 : 0) : 1;
@@ -7448,7 +7550,7 @@ app.patch('/api/reservations/:id', serverPlus(), (req, res) => {
 });
 
 /** DELETE cancels a reservation (manager-only, audited). */
-app.delete('/api/reservations/:id', managerOnly(), (req, res) => {
+app.delete('/api/reservations/:id', gateSiteAdmin(), (req, res) => {
   const r = resvById(req.params.id);
   if (!r) return res.status(404).json({ error: 'Reservation not found' });
   if (['cancelled', 'no_show', 'completed'].includes(r.status))
@@ -7609,7 +7711,7 @@ function siteLocalParts(utcMs) {
 
 /* ---- admin: link / status / unlink ---- */
 
-app.post('/api/admin/opentable/link', managerOnly(), (req, res) => {
+app.post('/api/admin/opentable/link', gateSiteAdmin(), (req, res) => {
   const b = req.body || {};
   const rid = cleanLabel(b.opentable_rid || b.rid);
   if (!rid) return res.status(400).json({ error: 'opentable_rid is required' });
@@ -7649,13 +7751,13 @@ app.get('/api/admin/opentable/status', serverPlus(), (req, res) => {
   });
 });
 
-app.delete('/api/admin/opentable/link', managerOnly(), (req, res) => {
+app.delete('/api/admin/opentable/link', gateSiteAdmin(), (req, res) => {
   db.prepare('DELETE FROM ot_links WHERE site_id = ?').run(SITE_ID);
   res.json({ linked: false });
 });
 
 /** Recent outbound sync messages (durable queue view for ops / QA). */
-app.get('/api/admin/opentable/outbound', managerOnly(), (req, res) => {
+app.get('/api/admin/opentable/outbound', gateSiteAdmin(), (req, res) => {
   const rows = db.prepare(
     `SELECT id, opentable_rid, action, confirmation_number, payload_json, request_id, delivered, response_json, created_at
      FROM ot_outbound WHERE site_id = ? ORDER BY id DESC LIMIT 200`
@@ -7904,7 +8006,7 @@ app.get('/api/opentable/recovery', otCallbackAuth, (req, res) => {
     pulls by modified_at once the partner pull endpoint is provisioned) supplies
     the OT-side booking list. Never auto-creates — mismatches are reported for
     a manager to resolve. */
-app.post('/api/admin/opentable/reconcile', managerOnly(), (req, res) => {
+app.post('/api/admin/opentable/reconcile', gateSiteAdmin(), (req, res) => {
   const b = req.body || {};
   const otBookings = Array.isArray(b.ot_bookings) ? b.ot_bookings : [];
   const link = otLink();
@@ -7931,7 +8033,7 @@ app.post('/api/admin/opentable/reconcile', managerOnly(), (req, res) => {
 /** AVAILABILITY PUBLISH: derive OT 15-min slot buckets from live floor-plan
     availability (the floor plan is the single arbiter) and publish. Sandbox:
     captured to ot_outbound. */
-app.post('/api/admin/opentable/publish-availability', managerOnly(), (req, res) => {
+app.post('/api/admin/opentable/publish-availability', gateSiteAdmin(), (req, res) => {
   const date = cleanLabel((req.body || {}).date) || siteTodayStr();
   const bounds = siteDayBounds(date);
   if (!bounds) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
@@ -8218,7 +8320,7 @@ app.patch('/api/waitlist/:id', serverPlus(), (req, res) => {
   res.json(wlView(wlById(w.id)));
 });
 
-app.delete('/api/waitlist/:id', managerOnly(), (req, res) => {
+app.delete('/api/waitlist/:id', gateSiteAdmin(), (req, res) => {
   const w = wlById(req.params.id);
   if (!w) return res.status(404).json({ error: 'Waitlist entry not found' });
   db.prepare('DELETE FROM waitlist WHERE id = ?').run(w.id);
@@ -8345,7 +8447,7 @@ function logDrawerEvent(drawerId, kind, amountCents, note, actor) {
   ).run(drawerId, SITE_ID, kind, amountCents || 0, note || null, actor || null, nowIso());
 }
 
-app.post('/api/cash/drawer/open', managerOnly(), (req, res) => {
+app.post('/api/cash/drawer/open', gateSiteAdmin(), (req, res) => {
   if (currentDrawer()) return res.status(409).json({ error: 'A drawer is already open' });
   const b = req.body || {};
   if (!isInt(b.opening_float_cents) || b.opening_float_cents < 0)
@@ -8388,8 +8490,13 @@ app.post('/api/cash/drawer/event', serverPlus(), (req, res) => {
 
 /** Blind-count closeout: the manager enters the counted cash; the server —
  *  not the counter — computes expected and the variance. */
+/* Deliberately NOT capability-migrated (audit gap #10): this gate is a
+ * site-config POLICY switch (drawer_close_role: manager-only by default,
+ * servers too when the site opts in) that predates the matrix. It keeps
+ * pure role semantics via requireRole so its behavior is exactly the
+ * pre-matrix behavior under every matrix. */
 const drawerCloseGate = () => (req, res, next) =>
-  (getConfig().drawer_close_role === 'server' ? serverPlus() : managerOnly())(req, res, next);
+  (getConfig().drawer_close_role === 'server' ? requireRole('server', 'manager') : requireRole('manager'))(req, res, next);
 app.post('/api/cash/drawer/close', drawerCloseGate(), (req, res) => {
   const d = currentDrawer();
   if (!d) return res.status(409).json({ error: 'No drawer is open' });
@@ -8407,7 +8514,7 @@ app.post('/api/cash/drawer/close', drawerCloseGate(), (req, res) => {
   res.json({ drawer: drawerView(db.prepare('SELECT * FROM cash_drawers WHERE id = ?').get(d.id), true) });
 });
 
-app.get('/api/cash/log', managerOnly(), (req, res) => {
+app.get('/api/cash/log', gateFinanceReports(), (req, res) => {
   const drawers = db.prepare('SELECT * FROM cash_drawers WHERE site_id = ? ORDER BY opened_at DESC LIMIT 30').all(SITE_ID);
   res.json(drawers.map((d) => drawerView(d, true)));
 });
@@ -8419,7 +8526,7 @@ app.get('/api/cash/log', managerOnly(), (req, res) => {
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 function validMinutes(v) { return isInt(v) && v >= 0 && v <= 1440; }
 
-app.get('/api/admin/schedule', managerOnly(), (req, res) => {
+app.get('/api/admin/schedule', gateClockAdmin(), (req, res) => {
   const week = req.query.week;
   if (week != null && !DATE_RE.test(week)) return res.status(400).json({ error: 'week must be YYYY-MM-DD' });
   const start = week || weekStartSite(todaySite() + 'T12:00:00Z');
@@ -8430,7 +8537,7 @@ app.get('/api/admin/schedule', managerOnly(), (req, res) => {
   res.json({ week_start: start, week_end: end, shifts: rows });
 });
 
-app.post('/api/admin/schedule', managerOnly(), (req, res) => {
+app.post('/api/admin/schedule', gateClockAdmin(), (req, res) => {
   const b = req.body || {};
   if (!DATE_RE.test(b.work_date || '')) return res.status(400).json({ error: 'work_date must be YYYY-MM-DD' });
   if (!validMinutes(b.start_min) || !validMinutes(b.end_min) || b.end_min <= b.start_min)
@@ -8449,7 +8556,7 @@ app.post('/api/admin/schedule', managerOnly(), (req, res) => {
   res.status(201).json(db.prepare('SELECT * FROM schedule_shifts WHERE id = ?').get(r.lastInsertRowid));
 });
 
-app.put('/api/admin/schedule/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/schedule/:id', gateClockAdmin(), (req, res) => {
   const s = db.prepare('SELECT * FROM schedule_shifts WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!s) return res.status(404).json({ error: 'Scheduled shift not found' });
   const b = req.body || {};
@@ -8472,7 +8579,7 @@ app.put('/api/admin/schedule/:id', managerOnly(), (req, res) => {
   res.json(db.prepare('SELECT * FROM schedule_shifts WHERE id = ?').get(s.id));
 });
 
-app.delete('/api/admin/schedule/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/schedule/:id', gateClockAdmin(), (req, res) => {
   const s = db.prepare('SELECT * FROM schedule_shifts WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!s) return res.status(404).json({ error: 'Scheduled shift not found' });
   db.prepare('DELETE FROM schedule_shifts WHERE id = ?').run(s.id);
@@ -8483,7 +8590,7 @@ app.delete('/api/admin/schedule/:id', managerOnly(), (req, res) => {
 /** Projected labor cost next to sales projections, per day of the week.
  *  Projected sales = mean of that weekday's closed-check net sales over the
  *  trailing 8 weeks. Labor = Σ scheduled hours × rate. */
-app.get('/api/admin/schedule/projection', managerOnly(), (req, res) => {
+app.get('/api/admin/schedule/projection', gateClockAdmin(), (req, res) => {
   const week = req.query.week;
   if (week != null && !DATE_RE.test(week)) return res.status(400).json({ error: 'week must be YYYY-MM-DD' });
   const start = week || weekStartSite(todaySite() + 'T12:00:00Z');
@@ -8531,7 +8638,7 @@ app.get('/api/admin/schedule/projection', managerOnly(), (req, res) => {
    Best/worst sellers from the same honest sales data — no separate analytics
    SKU. Attribution: items on checks closed in the range (billable states).
    Voids are counted separately so a popular-but-voided item can't hide. */
-app.get('/api/finance/product-mix', managerOnly(), (req, res) => {
+app.get('/api/finance/product-mix', gateFinanceReports(), (req, res) => {
   let from = req.query.from, to = req.query.to;
   const today = todaySite();
   if (!from && !to) { to = today; from = addDays(today, -6); }
@@ -8585,7 +8692,7 @@ app.get('/api/finance/product-mix', managerOnly(), (req, res) => {
    86s, specials (notes), and today's reservations surface at login — no
    pre-shift meeting required. Notes are manager-authored with an active
    window; the login summary merges them with live operational state. */
-app.post('/api/admin/notes', managerOnly(), (req, res) => {
+app.post('/api/admin/notes', gateSiteAdmin(), (req, res) => {
   const b = req.body || {};
   const title = cleanLabel(b.title);
   if (!title) return res.status(400).json({ error: 'title is required' });
@@ -8604,11 +8711,11 @@ app.post('/api/admin/notes', managerOnly(), (req, res) => {
   res.status(201).json(db.prepare('SELECT * FROM staff_notes WHERE id = ?').get(r.lastInsertRowid));
 });
 
-app.get('/api/admin/notes', managerOnly(), (req, res) => {
+app.get('/api/admin/notes', gateSiteAdmin(), (req, res) => {
   res.json(db.prepare('SELECT * FROM staff_notes WHERE site_id = ? ORDER BY created_at DESC LIMIT 100').all(SITE_ID));
 });
 
-app.put('/api/admin/notes/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/notes/:id', gateSiteAdmin(), (req, res) => {
   const n = db.prepare('SELECT * FROM staff_notes WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!n) return res.status(404).json({ error: 'Note not found' });
   const b = req.body || {};
@@ -8628,7 +8735,7 @@ app.put('/api/admin/notes/:id', managerOnly(), (req, res) => {
   res.json(db.prepare('SELECT * FROM staff_notes WHERE id = ?').get(n.id));
 });
 
-app.delete('/api/admin/notes/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/notes/:id', gateSiteAdmin(), (req, res) => {
   const n = db.prepare('SELECT * FROM staff_notes WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!n) return res.status(404).json({ error: 'Note not found' });
   db.prepare('DELETE FROM staff_notes WHERE id = ?').run(n.id);
@@ -8695,7 +8802,7 @@ app.post('/api/reviews', serverPlus(), (req, res) => {
   }
 });
 
-app.get('/api/reviews', managerOnly(), (req, res) => {
+app.get('/api/reviews', gateSiteAdmin(), (req, res) => {
   const rows = db.prepare('SELECT * FROM guest_reviews WHERE site_id = ? ORDER BY created_at DESC LIMIT 200').all(SITE_ID);
   const dist = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
   let sum = 0;
@@ -8727,7 +8834,70 @@ function kdsAgeMinutes(key) {
   const n = row ? parseInt(row.value, 10) : NaN;
   return Number.isFinite(n) && n >= 1 && n <= 240 ? n : KDS_AGE_DEFAULTS[key];
 }
-app.put('/api/admin/settings', managerOnly(), (req, res) => {
+/* --------------------- permissions matrix (audit gap #10) ---------------------
+ * GET: any authenticated staff member may read the EFFECTIVE matrix — the
+ * client needs it to render honestly (hide what the server would refuse).
+ * It is configuration, not a secret. PUT: gated by the permissions_admin
+ * capability; strict validation (unknown role or capability -> 400); the
+ * manager-lockout invariant is enforced on the RESULTING stored matrix;
+ * every change is audit-logged with before/after via auditApproval.
+ * PUT semantics: { matrix: { <role>: [caps...] } } replaces the listed
+ * roles and leaves unlisted roles as stored (or default); { reset: true }
+ * clears the stored matrix back to DEFAULT_PERMISSIONS. */
+app.get('/api/admin/permissions', (req, res) => {
+  res.json({
+    capabilities: CAPABILITY_DEFS,
+    roles: PERM_ROLES,
+    matrix: effectivePermissions(),
+    defaults: DEFAULT_PERMISSIONS,
+    stored: storedPermissions() !== null,
+    yours: roleCapabilities(req.user.role),
+  });
+});
+
+app.put('/api/admin/permissions', requireCap('permissions_admin'), (req, res) => {
+  const b = req.body || {};
+  const before = effectivePermissions();
+  if (b.reset === true) {
+    db.prepare("DELETE FROM site_config WHERE site_id = ? AND key = 'permissions_json'").run(SITE_ID);
+    const after = effectivePermissions();
+    auditApproval(req, 'permissions_update', {}, { reset: true, before, after });
+    return res.json({ ok: true, reset: true, matrix: after, defaults: DEFAULT_PERMISSIONS, stored: false });
+  }
+  const m = b.matrix;
+  if (!m || typeof m !== 'object' || Array.isArray(m)) {
+    return res.status(400).json({ error: 'matrix must be an object keyed by role: { server: [...], kitchen: [...], manager: [...] }' });
+  }
+  const next = { ...(storedPermissions() || {}) };
+  for (const [role, caps] of Object.entries(m)) {
+    if (!PERM_ROLES.includes(role)) {
+      return res.status(400).json({ error: `Unknown role "${role}" — roles are: ${PERM_ROLES.join(', ')}` });
+    }
+    if (!Array.isArray(caps)) {
+      return res.status(400).json({ error: `matrix.${role} must be an array of capability names` });
+    }
+    for (const c of caps) {
+      if (!CAP_KEYS.includes(c)) {
+        return res.status(400).json({ error: `Unknown capability "${c}" for role ${role}` });
+      }
+    }
+    next[role] = [...new Set(caps)];
+  }
+  /* Lockout invariant: the RESULTING stored matrix must keep the manager
+   * role able to edit the matrix. (effectivePermissions also re-adds it
+   * intrinsically as a backstop, but a stored lockout is refused, not
+   * papered over.) */
+  if (Array.isArray(next.manager) && !next.manager.includes('permissions_admin')) {
+    return res.status(400).json({ error: 'Refused: the manager role must keep the Permissions capability — a site cannot lock itself out of permission administration' });
+  }
+  db.prepare("INSERT INTO site_config (site_id, key, value) VALUES (?, 'permissions_json', ?) ON CONFLICT(site_id, key) DO UPDATE SET value = excluded.value")
+    .run(SITE_ID, JSON.stringify(next));
+  const after = effectivePermissions();
+  auditApproval(req, 'permissions_update', {}, { before, after });
+  res.json({ ok: true, matrix: after, defaults: DEFAULT_PERMISSIONS, stored: true });
+});
+
+app.put('/api/admin/settings', gateSiteAdmin(), (req, res) => {
   const b = req.body || {};
   if (!ADMIN_SETTINGS.has(b.key)) return res.status(400).json({ error: 'key must be one of: ' + [...ADMIN_SETTINGS].join(', ') });
   // review_prompt is boolean-ish: accept true/false, 1/0, and the strings
@@ -8819,7 +8989,7 @@ function multisiteSiteSummary(file) {
     try { rdb.close(); } catch { /* ignore */ }
   }
 }
-app.get('/api/admin/multisite/overview', managerOnly(), (req, res) => {
+app.get('/api/admin/multisite/overview', gateSiteAdmin(), (req, res) => {
   const sites = [];
   for (const f of multisiteFiles()) {
     try {
@@ -8842,11 +9012,11 @@ app.get('/api/admin/multisite/overview', managerOnly(), (req, res) => {
 function ingredientById(id) {
   return db.prepare('SELECT * FROM ingredients WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
-app.get('/api/admin/inventory/ingredients', managerOnly(), (req, res) => {
+app.get('/api/admin/inventory/ingredients', gateAdminInventory(), (req, res) => {
   const rows = db.prepare('SELECT * FROM ingredients WHERE site_id = ? AND active = 1 ORDER BY name').all(SITE_ID);
   res.json(rows.map((r) => ({ ...r, low: r.on_hand <= r.par })));
 });
-app.post('/api/admin/inventory/ingredients', managerOnly(), (req, res) => {
+app.post('/api/admin/inventory/ingredients', gateAdminInventory(), (req, res) => {
   const b = req.body || {};
   const name = cleanLabel(b.name);
   if (!name) return res.status(400).json({ error: 'name is required' });
@@ -8864,7 +9034,7 @@ app.post('/api/admin/inventory/ingredients', managerOnly(), (req, res) => {
   auditApproval(req, 'ingredient_create', {}, { ingredient_id: r.lastInsertRowid, name });
   res.status(201).json(ingredientById(r.lastInsertRowid));
 });
-app.put('/api/admin/inventory/ingredients/:id', managerOnly(), (req, res) => {
+app.put('/api/admin/inventory/ingredients/:id', gateAdminInventory(), (req, res) => {
   const ing = ingredientById(req.params.id);
   if (!ing) return res.status(404).json({ error: 'Ingredient not found' });
   const b = req.body || {};
@@ -8883,7 +9053,7 @@ app.put('/api/admin/inventory/ingredients/:id', managerOnly(), (req, res) => {
   auditApproval(req, 'ingredient_update', {}, { ingredient_id: ing.id, name });
   res.json(ingredientById(ing.id));
 });
-app.delete('/api/admin/inventory/ingredients/:id', managerOnly(), (req, res) => {
+app.delete('/api/admin/inventory/ingredients/:id', gateAdminInventory(), (req, res) => {
   const ing = ingredientById(req.params.id);
   if (!ing) return res.status(404).json({ error: 'Ingredient not found' });
   db.prepare('UPDATE ingredients SET active = 0 WHERE id = ?').run(ing.id); // deactivate, keep history
@@ -8891,7 +9061,7 @@ app.delete('/api/admin/inventory/ingredients/:id', managerOnly(), (req, res) => 
   res.json({ deactivated: ing.id });
 });
 /** Replace the recipe (ingredient lines) for one menu item. */
-app.post('/api/admin/inventory/recipes', managerOnly(), (req, res) => {
+app.post('/api/admin/inventory/recipes', gateAdminInventory(), (req, res) => {
   const b = req.body || {};
   const item = b.menu_item_id != null
     ? db.prepare('SELECT id, name FROM menu_items WHERE id = ? AND site_id = ?').get(b.menu_item_id, SITE_ID)
@@ -8916,7 +9086,7 @@ app.post('/api/admin/inventory/recipes', managerOnly(), (req, res) => {
   auditApproval(req, 'recipe_set', {}, { menu_item_id: item.id, lines: lines.length });
   res.json({ menu_item_id: item.id, lines: lines.length });
 });
-app.get('/api/admin/inventory/recipes', managerOnly(), (req, res) => {
+app.get('/api/admin/inventory/recipes', gateAdminInventory(), (req, res) => {
   const q = req.query.menu_item_id;
   let rows;
   if (q != null) {
@@ -8933,7 +9103,7 @@ app.get('/api/admin/inventory/recipes', managerOnly(), (req, res) => {
   }
   res.json(rows);
 });
-app.post('/api/admin/inventory/adjust', managerOnly(), (req, res) => {
+app.post('/api/admin/inventory/adjust', gateAdminInventory(), (req, res) => {
   const b = req.body || {};
   const ing = b.ingredient_id != null ? ingredientById(b.ingredient_id) : null;
   if (!ing || !ing.active) return res.status(400).json({ error: 'Valid active ingredient_id is required' });
@@ -8986,7 +9156,7 @@ function writeAdjustment(ingredientId, delta, reason, kind, actor) {
     .run(SITE_ID, ingredientId, delta, reason, kind, actor, nowIso());
 }
 
-app.post('/api/admin/inventory/waste', managerOnly(), (req, res) => {
+app.post('/api/admin/inventory/waste', gateAdminInventory(), (req, res) => {
   const ing = inventoryTarget(req, res); if (!ing) return;
   const b = req.body || {};
   if (!isPositiveQty(b.qty)) return res.status(400).json({ error: 'qty must be a positive number' });
@@ -9004,7 +9174,7 @@ app.post('/api/admin/inventory/waste', managerOnly(), (req, res) => {
   res.json({ ingredient: ingredientById(ing.id), wasted_qty: b.qty, waste_cost_cents: wasteCost });
 });
 
-app.post('/api/admin/inventory/receive', managerOnly(), (req, res) => {
+app.post('/api/admin/inventory/receive', gateAdminInventory(), (req, res) => {
   const ing = inventoryTarget(req, res); if (!ing) return;
   const b = req.body || {};
   if (!isPositiveQty(b.qty)) return res.status(400).json({ error: 'qty must be a positive number' });
@@ -9028,7 +9198,7 @@ app.post('/api/admin/inventory/receive', managerOnly(), (req, res) => {
   res.json({ ingredient: ingredientById(ing.id), received_qty: b.qty });
 });
 
-app.post('/api/admin/inventory/count', managerOnly(), (req, res) => {
+app.post('/api/admin/inventory/count', gateAdminInventory(), (req, res) => {
   const ing = inventoryTarget(req, res); if (!ing) return;
   const b = req.body || {};
   if (typeof b.counted_qty !== 'number' || !isFinite(b.counted_qty) || b.counted_qty < 0)
@@ -9050,7 +9220,7 @@ app.post('/api/admin/inventory/count', managerOnly(), (req, res) => {
   res.json({ ingredient: ingredientById(ing.id), expected, counted: b.counted_qty, variance });
 });
 
-app.get('/api/admin/inventory/variance', managerOnly(), (req, res) => {
+app.get('/api/admin/inventory/variance', gateAdminInventory(), (req, res) => {
   const nowMs = Date.now();
   const parseWin = (v, fallback, endOfDay) => {
     if (v == null || v === '') return fallback;
@@ -9100,7 +9270,7 @@ app.get('/api/admin/inventory/variance', managerOnly(), (req, res) => {
   res.json({ from, to, ingredients, totals });
 });
 
-app.get('/api/inventory/status', managerOnly(), (req, res) => {
+app.get('/api/inventory/status', gateAdminInventory(), (req, res) => {
   const ings = db.prepare('SELECT * FROM ingredients WHERE site_id = ? AND active = 1 ORDER BY name').all(SITE_ID);
   const recent = db.prepare(
     `SELECT a.*, i.name AS ingredient_name FROM inventory_adjustments a
@@ -9232,6 +9402,8 @@ const API_DOCS = [
   { method: 'POST', path: '/api/reviews', auth: 'server+', summary: 'Post-payment 1–5★ review, once per check (NEW 3C)', params: 'check_id, rating, comment?, marketing_opt_in?' },
   { method: 'GET', path: '/api/reviews', auth: 'manager', summary: 'Review summary + list (NEW 3C)', params: '—' },
   { method: 'PUT', path: '/api/admin/settings', auth: 'manager', summary: 'Whitelisted site settings (review_prompt, kds_archive_retention_days, stale_check_hours, kds_age_warn_minutes, kds_age_critical_minutes)', params: 'key, value' },
+  { method: 'GET', path: '/api/admin/permissions', auth: 'any staff', summary: 'Effective capability matrix (roles x capabilities), the defaults, and the caller capabilities', params: '' },
+  { method: 'PUT', path: '/api/admin/permissions', auth: 'permissions_admin capability', summary: 'Replace per-role capability sets (unknown role/capability -> 400; a matrix removing Permissions from manager is refused) or {reset:true} to restore defaults; audit-logged', params: 'matrix | reset' },
   { method: 'GET', path: '/api/admin/multisite/overview', auth: 'manager', summary: 'Cross-site dashboard; one site failure never touches another (NEW 3C)', params: '—' },
   { method: 'GET', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Ingredient records with low-stock flags (NEW 3C)', params: '—' },
   { method: 'POST', path: '/api/admin/inventory/ingredients', auth: 'manager', summary: 'Create ingredient (NEW 3C)', params: 'name, unit?, on_hand?, par?, cost_per_unit_cents?' },
@@ -9248,7 +9420,7 @@ const API_DOCS = [
   { method: 'GET', path: '/api/openapi.json', auth: 'manager', summary: 'Machine-readable endpoint registry (NEW 3C)', params: '—' },
   { method: 'GET', path: '/api/docs', auth: 'manager', summary: 'Human-readable API documentation (NEW 3C)', params: '—' },
 ];
-app.get('/api/openapi.json', managerOnly(), (req, res) => {
+app.get('/api/openapi.json', gateSiteAdmin(), (req, res) => {
   res.json({
     name: 'expoline', version: '0.1.0', base_url: '/api',
     auth: 'Bearer <token> from POST /api/auth/login (staff PIN). Roles: server, kitchen, manager. server+ = server or manager; kitchen+ = kitchen or manager.',
@@ -9257,7 +9429,7 @@ app.get('/api/openapi.json', managerOnly(), (req, res) => {
     endpoints: API_DOCS,
   });
 });
-app.get('/api/docs', managerOnly(), (req, res) => {
+app.get('/api/docs', gateSiteAdmin(), (req, res) => {
   const escH = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const rows = API_DOCS.map((e) =>
     `<tr><td><span class="m">${escH(e.method)}</span></td><td><code>${escH(e.path)}</code></td>` +
@@ -9279,7 +9451,7 @@ app.get('/api/docs', managerOnly(), (req, res) => {
 /* Feature modules (authenticated — staff token required). Registered after all
    core routes, before the /api 404 catch-all. */
 require('./routes/giftcards').register(app, {
-  db, SITE_ID, managerOnly, serverPlus, nowIso, crypto,
+  db, SITE_ID, gateSiteAdmin, serverPlus, nowIso, crypto,
   persistTotals, checkResponse, paymentView, broadcastCheckUpdated, auditApproval,
   idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear,
   dayClosedToday,
@@ -9290,7 +9462,7 @@ require('./routes/loyalty').register(app, {
   idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear,
 });
 require('./routes/online').register(app, {
-  db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
+  db, SITE_ID, serverPlus, kitchenPlus, nowIso, crypto,
   persistTotals, checkResponse, broadcastCheckUpdated,
 });
 
@@ -9298,20 +9470,20 @@ require('./routes/online').register(app, {
    Same honest sales data as finance; server performance, movers, labor watch,
    anomaly alerts, and deterministic NL Q&A — no separate analytics SKU. */
 require('./routes/insights').register(app, {
-  db, SITE_ID, managerOnly, nowIso, tzDate, todaySite, addDays, dayLabor, SITE_TZ,
+  db, SITE_ID, gateFinanceReports, nowIso, tzDate, todaySite, addDays, dayLabor, SITE_TZ,
 });
 
 /* Phase 3B staff routes: KDS aging settings/alerts, tip-out rules + report,
    delivery aggregation, cash-collect requests, guest-split reverse, table QR. */
 parityKdsPay.registerStaff(app, {
-  db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
+  db, SITE_ID, gateSiteAdmin, gateFinanceReports, gateRefunds, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
   persistTotals, checkResponse, broadcastCheckUpdated, broadcastMenuUpdated, broadcastTicket, ticketView,
   effectivePriceCents, taxSnapshotOf, dayClosedToday, isDayClosed,
 });
 /* Phase 3A competitor parity: order & check flow (dayparts, timers, guest
    names, fired-item edits, merge, move). */
 parityOrders.register(app, {
-  db, SITE_ID, SITE_TZ, managerOnly, serverPlus, nowIso, crypto,
+  db, SITE_ID, SITE_TZ, gateAdminMenu, gateSiteAdmin, serverPlus, nowIso, crypto,
   persistTotals, checkResponse, itemView, ticketView, broadcastCheckUpdated,
   broadcastTicketUpdated, auditApproval, getConfig, parseJson, isInt,
   withTransaction, verifyManagerPin, cleanLabel, validateModifiers,

@@ -636,6 +636,37 @@ function showSyncedBanner(n) {
 }
 const updateOfflineBannerSoon = debounce(updateOfflineBanner, 300);
 
+/* ---------------- capabilities (audit gap #10) ----------------
+   The server enforces the capability matrix on every request; these
+   helpers only decide what the client SHOWS. Sessions saved before the
+   matrix existed carry no capabilities array — fall back to the same
+   defaults the server ships, so an old session renders exactly as it
+   did pre-matrix. */
+const CLIENT_CAP_DEFAULTS = {
+  server: ['floor_ops', 'menu_86'],
+  kitchen: ['kitchen_ops', 'menu_86'],
+  manager: ['floor_ops', 'kitchen_ops', 'menu_86', 'admin_menu', 'admin_discounts', 'admin_inventory', 'finance_reports', 'finance_closeout', 'refunds', 'clock_admin', 'site_admin', 'permissions_admin'],
+};
+const MANAGER_AREA_CAPS = ['admin_menu', 'admin_discounts', 'admin_inventory', 'finance_reports', 'finance_closeout', 'refunds', 'clock_admin', 'site_admin', 'permissions_admin'];
+function userCaps(user) {
+  if (!user) return [];
+  if (Array.isArray(user.capabilities)) return user.capabilities;
+  return CLIENT_CAP_DEFAULTS[user.role] || [];
+}
+function roleHasCap(user, cap) { return userCaps(user).includes(cap); }
+function hasAnyCap(user, caps) { return caps.some((c) => roleHasCap(user, c)); }
+/* Permissions-editor grid -> PUT payload. grid: { role: { capKey: bool } }.
+   Only roles present in the grid are sent (the server leaves unlisted
+   roles as stored); checked capabilities keep the canonical cap order
+   so payloads are stable. */
+function buildPermissionsPayload(grid, capKeys) {
+  const matrix = {};
+  for (const role of Object.keys(grid || {})) {
+    matrix[role] = (capKeys || []).filter((k) => grid[role] && grid[role][k]);
+  }
+  return { matrix };
+}
+
 /* ---------------- header / nav ---------------- */
 function renderHeader() {
   const h = $('#app-header');
@@ -643,13 +674,13 @@ function renderHeader() {
   h.classList.remove('hidden');
   const role = state.user.role;
   const links = [];
-  if (role === 'server' || role === 'manager') links.push(['#/floor', 'Floor']);
-  if (role === 'server' || role === 'manager') links.push(['#/reservations', 'Reservations']);
-  if (role === 'server' || role === 'manager') links.push(['#/waitlist', 'Waitlist']);
-  if (role === 'server' || role === 'manager') links.push(['#/giftcards', 'Gift Cards']);
-  if (role === 'server' || role === 'manager') links.push(['#/loyalty', 'Loyalty']);
-  if (role === 'kitchen' || role === 'manager') links.push(['#/kds', 'KDS']);
-  if (role === 'manager') links.push(['#/manager', 'Manager']);
+  if (roleHasCap(state.user, 'floor_ops')) links.push(['#/floor', 'Floor']);
+  if (roleHasCap(state.user, 'floor_ops')) links.push(['#/reservations', 'Reservations']);
+  if (roleHasCap(state.user, 'floor_ops')) links.push(['#/waitlist', 'Waitlist']);
+  if (roleHasCap(state.user, 'floor_ops')) links.push(['#/giftcards', 'Gift Cards']);
+  if (roleHasCap(state.user, 'floor_ops')) links.push(['#/loyalty', 'Loyalty']);
+  if (roleHasCap(state.user, 'kitchen_ops')) links.push(['#/kds', 'KDS']);
+  if (role === 'manager' || hasAnyCap(state.user, MANAGER_AREA_CAPS)) links.push(['#/manager', 'Manager']);
   links.push(['#/clock', 'Clock']);
   const cur = location.hash.split('?')[0];
   $('#main-nav').innerHTML = links.map(([href, label]) =>
@@ -914,7 +945,7 @@ async function renderRoute(soft) {
     if (r.view === 'clock') return renderClock(app);
     if (r.view === 'pay') return renderPay(app, r.param);
     if (r.view === 'manager') {
-      if (state.user.role !== 'manager') { app.innerHTML = notAuthorized('Manager area — please log in as a manager.'); return; }
+      if (state.user.role !== 'manager' && !hasAnyCap(state.user, MANAGER_AREA_CAPS)) { app.innerHTML = notAuthorized('Manager area — please log in as a manager.'); return; }
       const sub = (location.hash.match(/^#\/manager\/([a-z]+)/) || [])[1];
       if (sub === 'finance') return renderFinance(app);
       if (sub === 'shift') return renderShift(app);
@@ -923,6 +954,7 @@ async function renderRoute(soft) {
       if (sub === 'timeclock') return renderTimeClock(app);
       if (sub === 'employees') return renderEmployees(app);
       if (sub === 'settings') return renderSvcChargeSettings(app);
+      if (sub === 'permissions') return renderPermissions(app);
       if (sub === 'cash') return renderCashDrawer(app, api);
       if (sub === 'schedule') return renderSchedule(app, api);
       if (sub === 'analytics') return renderProductMix(app, api);
@@ -994,7 +1026,7 @@ function renderLogin(app) {
       const r = await rawApi('/api/auth/login', 'POST', { pin });
       const user = r.user || r;
       if (!user || !user.role) throw new Error('Login returned no user');
-      saveSession(r.token, { id: user.id, name: user.name || role, role: user.role });
+      saveSession(r.token, { id: user.id, name: user.name || role, role: user.role, capabilities: Array.isArray(user.capabilities) ? user.capabilities : undefined });
       const dest = user.role === 'kitchen' ? '#/kds' : user.role === 'manager' ? '#/manager' : '#/floor';
       location.hash = dest;
       // flush anything queued while we were logged out
@@ -4323,6 +4355,7 @@ function mgrNav(active) {
      ['#/manager/analytics', 'Product mix', active === 'analytics'], ['#/manager/insights', 'Insights', active === 'insights'], ['#/manager/notes', 'Staff notes', active === 'notes'],
      ['#/manager/reviews', 'Reviews', active === 'reviews'], ['#/manager/inventory', 'Inventory', active === 'inventory'],
      ['#/manager/multisite', 'Locations', active === 'multisite'], ['#/manager/apidocs', 'API docs', active === 'apidocs'],
+     ['#/manager/permissions', 'Permissions', active === 'permissions'],
      ['#/manager/settings', 'Settings', active === 'settings']]
       .map(([h, l, a]) => '<a class="tab' + (a ? ' active' : '') + '" href="' + h + '">' + l + '</a>').join('') + '</div>';
 }
@@ -4354,6 +4387,73 @@ async function renderManager(app) {
     if (!Number.isInteger(v) || v < 15 || v > 240) { toast('Enter 15–240 minutes', 'err'); return; }
     try { await api('/api/admin/floor/config', 'PUT', { turn_time_target_min: v }); toast('Turn target saved', 'ok'); }
     catch (e) { handleApiError(e); }
+  };
+}
+
+/* ============================================================
+   VIEW: PERMISSIONS — capability matrix editor (audit gap #10)
+   Roles stay server / kitchen / manager; this grid tunes what each
+   role may do. The server enforces the matrix on every request and
+   stays the source of truth — this screen is presentation + editing.
+   Capabilities gate role access only: manager-PIN approvals (voids,
+   comps, close-out, tax-exempt) are a separate axis and are NEVER
+   replaced by holding a capability. The manager role always keeps
+   Permissions — the server refuses a matrix that would remove it,
+   so a site cannot lock itself out of this screen.
+   ============================================================ */
+async function renderPermissions(app) {
+  if (!roleHasCap(state.user, 'permissions_admin')) { app.innerHTML = notAuthorized('Permissions are edited by a manager (Permissions capability required).'); return; }
+  let data;
+  try { data = await api('/api/admin/permissions'); }
+  catch (e) { handleApiError(e); return; }
+  const caps = data.capabilities || [];
+  const roles = data.roles || ['server', 'kitchen', 'manager'];
+  const matrix = data.matrix || {};
+  const rowHtml = caps.map((c) => {
+    const cells = roles.map((role) => {
+      const on = (matrix[role] || []).includes(c.key);
+      const locked = role === 'manager' && c.key === 'permissions_admin';
+      return '<td style="text-align:center"><input type="checkbox" data-perm-role="' + esc(role) + '" data-perm-cap="' + esc(c.key) + '"' +
+        (on ? ' checked' : '') + (locked ? ' disabled title="Always on for managers — a site cannot lock itself out of Permissions"' : '') + '></td>';
+    }).join('');
+    return '<tr><td><b>' + esc(c.label) + '</b><div class="muted" style="font-size:12px">' + esc(c.desc) + '</div></td>' + cells + '</tr>';
+  }).join('');
+  app.innerHTML = mgrNav('permissions') +
+    '<div class="card" style="max-width:860px"><h3>Permissions — what each role may do</h3>' +
+    '<p class="muted">Check a box to grant a capability to a role; uncheck to revoke. Changes apply to the <b>next request</b> on every terminal — nobody needs to log out and back in. Roles stay server, kitchen and manager; this grid tunes their powers, it does not create new roles.</p>' +
+    '<p class="muted">Capabilities are not PIN approvals: voids, comps, tax-exempt and the day close-out still require a fresh manager PIN at the moment of action, exactly as before.</p>' +
+    '<table class="tbl"><thead><tr><th>Capability</th>' + roles.map((r) => '<th style="text-align:center">' + esc(r) + '</th>').join('') + '</tr></thead><tbody>' + rowHtml + '</tbody></table>' +
+    '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap"><button class="btn primary" id="perm-save">Save permissions</button>' +
+    '<button class="btn" id="perm-reset">Reset to defaults</button>' +
+    (data.stored ? '' : '<span class="muted" style="align-self:center">Currently running the built-in defaults (nothing saved yet).</span>') + '</div>' +
+    '<div id="perm-msg" class="muted" style="margin-top:8px"></div></div>';
+  $('#perm-save').onclick = async () => {
+    const grid = {};
+    app.querySelectorAll('input[data-perm-role]').forEach((el) => {
+      const role = el.getAttribute('data-perm-role');
+      const cap = el.getAttribute('data-perm-cap');
+      grid[role] = grid[role] || {};
+      grid[role][cap] = !!el.checked;
+    });
+    const payload = buildPermissionsPayload(grid, caps.map((c) => c.key));
+    try {
+      await api('/api/admin/permissions', 'PUT', payload);
+      toast('Permissions saved — they apply on the next request', 'ok');
+      renderPermissions(app);
+    } catch (e) { handleApiError(e); }
+  };
+  const resetBtn = $('#perm-reset');
+  resetBtn.onclick = async () => {
+    if (resetBtn.dataset.armed !== '1') {
+      resetBtn.dataset.armed = '1';
+      resetBtn.textContent = 'Click again to confirm reset';
+      return;
+    }
+    try {
+      await api('/api/admin/permissions', 'PUT', { reset: true });
+      toast('Permissions reset to the built-in defaults', 'ok');
+      renderPermissions(app);
+    } catch (e) { handleApiError(e); }
   };
 }
 

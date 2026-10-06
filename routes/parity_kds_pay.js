@@ -699,7 +699,7 @@ function tipoutReport(db, SITE_ID, date, siteDateOf) {
 
 /* ============================ STAFF (behind auth wall) ============================ */
 function registerStaff(app, ctx) {
-  const { db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
+  const { db, SITE_ID, gateSiteAdmin, gateFinanceReports, gateRefunds, serverPlus, kitchenPlus, nowIso, crypto,
     persistTotals, broadcastCheckUpdated, broadcastTicket, ticketView, tzDate, effectivePriceCents, dayClosedToday, isDayClosed } = ctx;
   // EOD freeze helpers injected by the host (audit gap #5); absent them,
   // behavior is exactly as before.
@@ -719,7 +719,7 @@ function registerStaff(app, ctx) {
     res.json({ thresholds: kdsThresholds(db, SITE_ID) });
   });
 
-  app.post('/api/kds/settings', managerOnly(), (req, res) => {
+  app.post('/api/kds/settings', gateSiteAdmin(), (req, res) => {
     const b = req.body || {};
     const set = {};
     for (const k of ['warn_secs', 'late_secs', 'alert_lead_secs']) {
@@ -781,14 +781,14 @@ function registerStaff(app, ctx) {
   /* ---- Tip-out rules (pooling rules as data) ---- */
   const ruleView = tipoutRuleView;
 
-  app.get('/api/tipout/rules', managerOnly(), (req, res) => {
+  app.get('/api/tipout/rules', gateSiteAdmin(), (req, res) => {
     const rows = db.prepare(
       'SELECT * FROM tipout_rules WHERE site_id = ? AND active = 1 ORDER BY id'
     ).all(SITE_ID);
     res.json({ rules: rows.map(ruleView) });
   });
 
-  app.post('/api/tipout/rules', managerOnly(), (req, res) => {
+  app.post('/api/tipout/rules', gateSiteAdmin(), (req, res) => {
     const b = req.body || {};
     const name = cleanLabel(b.name);
     const role = cleanLabel(b.role);
@@ -806,7 +806,7 @@ function registerStaff(app, ctx) {
     res.status(201).json({ rule: ruleView(db.prepare('SELECT * FROM tipout_rules WHERE id = ?').get(r.lastInsertRowid)) });
   });
 
-  app.put('/api/tipout/rules/:id', managerOnly(), (req, res) => {
+  app.put('/api/tipout/rules/:id', gateSiteAdmin(), (req, res) => {
     const rule = db.prepare('SELECT * FROM tipout_rules WHERE id = ? AND site_id = ? AND active = 1').get(req.params.id, SITE_ID);
     if (!rule) return res.status(404).json({ error: 'Tip-out rule not found' });
     const b = req.body || {};
@@ -823,7 +823,7 @@ function registerStaff(app, ctx) {
     res.json({ rule: ruleView(db.prepare('SELECT * FROM tipout_rules WHERE id = ?').get(rule.id)) });
   });
 
-  app.delete('/api/tipout/rules/:id', managerOnly(), (req, res) => {
+  app.delete('/api/tipout/rules/:id', gateSiteAdmin(), (req, res) => {
     const rule = db.prepare('SELECT * FROM tipout_rules WHERE id = ? AND site_id = ? AND active = 1').get(req.params.id, SITE_ID);
     if (!rule) return res.status(404).json({ error: 'Tip-out rule not found' });
     db.prepare('UPDATE tipout_rules SET active = 0 WHERE id = ?').run(rule.id);
@@ -835,7 +835,7 @@ function registerStaff(app, ctx) {
      integer cents (basis × pct_bps / 10000, rounded). The computation is
      the module-scope tipoutReport() above — the host shift review reads
      the same figures from it (audit gap #6). */
-  app.get('/api/tipout/report', managerOnly(), (req, res) => {
+  app.get('/api/tipout/report', gateFinanceReports(), (req, res) => {
     const date = req.query.date;
     if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
@@ -958,7 +958,7 @@ function registerStaff(app, ctx) {
   });
 
   /* ---- Guest split reverse — staff keep override (manager) ---- */
-  app.post('/api/guest/split/reverse', managerOnly(), (req, res) => {
+  app.post('/api/guest/split/reverse', gateRefunds(), (req, res) => {
     const group = cleanLabel((req.body || {}).split_group);
     if (!group) return res.status(400).json({ error: 'split_group is required' });
     const members = db.prepare('SELECT * FROM checks WHERE site_id = ? AND split_group = ?').all(SITE_ID, group);
@@ -1005,7 +1005,7 @@ function registerStaff(app, ctx) {
     res.json({ table_id: t.id, label: t.label, token: t.qr_token, url: `${origin}/g/${t.qr_token}` });
   });
 
-  app.post('/api/tables/:id/qr/rotate', managerOnly(), (req, res) => {
+  app.post('/api/tables/:id/qr/rotate', gateSiteAdmin(), (req, res) => {
     const t = db.prepare('SELECT id, label FROM tables WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
     if (!t) return res.status(404).json({ error: 'Table not found' });
     const token = crypto.randomUUID();
@@ -1015,7 +1015,7 @@ function registerStaff(app, ctx) {
   });
 
   /* ---- Guest feedback inbox (manager) ---- */
-  app.get('/api/guest/feedback', managerOnly(), (req, res) => {
+  app.get('/api/guest/feedback', gateSiteAdmin(), (req, res) => {
     const rows = db.prepare(
       `SELECT f.*, c.tab_name FROM guest_feedback f JOIN checks c ON c.id = f.check_id
        WHERE f.site_id = ? ORDER BY f.created_at DESC LIMIT 100`
