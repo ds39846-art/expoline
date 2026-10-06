@@ -446,10 +446,22 @@ async function flushOutboxLegacy(ops) {
           const cid = idmap[p.check_id] || p.check_id;
           if (o.op === 'add_items') {
             for (const it of (p.items || [])) {
+              const postBody = { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers || [] };
+              /* Per-line idempotency: the key derives from the line
+                 temp_id, which is persisted inside the queue entry
+                 itself, so the key is identical on every retry and
+                 across app restarts. The server stores the first
+                 response under the key and replays it on a retry
+                 instead of inserting the line a second time — the old
+                 shape re-posted the whole op after a mid-op failure
+                 (its id mappings were only saved at the end), which
+                 duplicated every line that had already landed. Lines
+                 queued before keys existed carry no temp_id and post
+                 exactly as before. */
+              if (it.temp_id) postBody.idempotency_key = 'outbox-item-' + it.temp_id;
               let r;
               try {
-                r = await rawApi('/api/checks/' + cid + '/items', 'POST',
-                  { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers || [] });
+                r = await rawApi('/api/checks/' + cid + '/items', 'POST', postBody);
               } catch (ie) {
                 /* Name the queued line the server rejected before the
                    flush stops on it — the old shape stopped silently, so
@@ -522,7 +534,14 @@ function toast(msg, kind) {
   el.className = 'toast' + (kind ? ' ' + kind : '');
   el.textContent = msg;
   root.appendChild(el);
-  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .4s'; setTimeout(() => el.remove(), 450); }, 3400);
+  /* Errors carry the one fact the server must act on (which line, what
+     is wrong), so they stay up long enough to actually read: scaled by
+     message length, floored at 6s and capped at 12s. Success and info
+     toasts keep the standard beat. */
+  const holdMs = kind === 'err'
+    ? Math.max(6000, Math.min(12000, 3400 + String(msg).length * 45))
+    : 3400;
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .4s'; setTimeout(() => el.remove(), 450); }, holdMs);
 }
 
 function openModal(html) {

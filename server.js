@@ -2196,6 +2196,19 @@ app.patch('/api/checks/:id', serverPlus(), (req, res) => {
 });
 
 app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
+  /* Phase 1B idempotency (offline outbox): a queued line carries a
+     per-line idempotency_key (see flushOutboxLegacy in app.js) so a
+     retried flush replays the stored response instead of duplicating
+     the line on the check. Replay comes FIRST, before any
+     state-dependent validation: the line already landed, and the
+     retry only needs its original response back (its item id feeds
+     the client id map). Requests without a key — the online HOLD
+     path, older queued payloads — are byte-identical to before. */
+  const ikey = idemKeyFrom(req);
+  if (ikey) {
+    const rp = idemReplay('check_items', ikey);
+    if (rp) return res.status(rp.status).json(rp.body);
+  }
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot add items to a ${check.status} check` });
@@ -2262,6 +2275,20 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
     return res.status(400).json({ error: 'unit_price_cents must be a non-negative integer' });
   }
 
+  /* Reserve the idempotency key only AFTER validation passes: a
+     rejected line must not burn its key, or the corrected retry
+     could never land. A 'processing' verdict means the first attempt
+     is in flight (or died mid-flight inside the stale window) —
+     answer 409 like the money endpoints and let the retry replay
+     the stored response once it completes. */
+  let idem = null;
+  if (ikey) {
+    const rsv = idemReserve('check_items', ikey);
+    if (rsv.state === 'replay') return res.status(rsv.status).json(rsv.body);
+    if (rsv.state === 'processing') return res.status(409).json({ error: 'Duplicate request in progress — retry shortly' });
+    idem = ikey;
+  }
+
   // Phase 1B money audit (concurrency): re-check the 86 flag INSIDE a write
   // transaction. The menu editor can 86 an item between our earlier
   // active=1 read and this INSERT; BEGIN IMMEDIATE serializes us against
@@ -2273,6 +2300,7 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
       .get(menuItem.id, SITE_ID);
     if (!fresh || fresh.active !== 1) {
       db.exec('ROLLBACK');
+      if (idem) idemClear('check_items', idem);
       return res.status(400).json({ error: 'That item was just 86\'d — please reorder' });
     }
     const r = db.prepare(
@@ -2285,10 +2313,13 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
     db.exec('COMMIT');
   } catch (e) {
     try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+    if (idem) idemClear('check_items', idem);
     throw e;
   }
+  const out = itemView(item);
+  if (idem) idemStore('check_items', idem, 201, out);
   broadcastCheckUpdated(check.id);
-  res.status(201).json(itemView(item));
+  res.status(201).json(out);
 });
 
 /** DELETE /api/checks/:id/items/:item_id — legacy held-item void path.
@@ -2990,8 +3021,17 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
     return res.status(400).json({ error: 'items must be a non-empty array of order lines' });
   }
   if (items.length > 50) return res.status(400).json({ error: 'At most 50 lines per send-now' });
-  // Validate and insert each item (same rules as POST /items)
-  const insertedIds = [];
+  /* Validate EVERY line before inserting anything (same rules as
+     POST /items). The old loop validated and inserted line by line, so
+     a rejection on line N left lines 1..N-1 on the check as orphan
+     'held' rows the client never saw; fixing the bad line and
+     re-sending then duplicated them (double-fire / double-charge).
+     Every rule below is pure (menu row, seat/qty bounds, modifiers,
+     price, course — none depends on an earlier insert), so phase 1
+     collects the exact rows phase 2 inserts: the first failure
+     returns with the same status and body as before, and the check
+     is left exactly as it was. */
+  const prepared = [];
   for (let li = 0; li < items.length; li++) {
     const line = items[li];
     const { menu_item_id, seat, qty = 1, modifiers = [], unit_price_cents, note, allergy, allergy_detail } = line || {};
@@ -3038,16 +3078,13 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
       }
       lineCourse = line.course;
     }
-    const r = db.prepare(
-      `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
-         note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
-    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(rmod.modifiers), lineCourse, nowIso(), ln, alg, algD);
-    insertedIds.push(r.lastInsertRowid);
+    prepared.push({
+      menuItem, seat, qty, unitPrice,
+      modifiersJson: JSON.stringify(rmod.modifiers),
+      course: lineCourse, note: ln, allergy: alg, allergyDetail: algD,
+    });
   }
-  // Now fire them via the standard send logic
-  const held = db.prepare(
-    "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id IN (" + insertedIds.map(() => '?').join(',') + ") ORDER BY ci.id"
-  ).all(...insertedIds);
+  // Insert the validated lines and fire them via the standard send logic
   const sentAt = nowIso();
   const table = check.table_id ? db.prepare('SELECT label FROM tables WHERE id = ?').get(check.table_id) : null;
   const serverUser = check.server_id ? db.prepare('SELECT name FROM users WHERE id = ?').get(check.server_id) : null;
@@ -3058,18 +3095,32 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
       seatNames[r.seat] = r.guest_name;
     }
   } catch { /* parity_orders migrate owns this table */ }
+  const insertLine = db.prepare(
+    `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
+       note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
+  );
   const newTicket = db.prepare(
     `INSERT INTO kds_tickets (uuid, site_id, check_id, station, table_label, server_name, items_json, status, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)`
   );
-  /* Fire atomically, mirroring /send's fireHeldItemsToKds: mark sent,
-     deplete inventory (+ aggregated 'sale depletion' ledger), and insert
-     the KDS tickets in ONE transaction — a mid-fire failure rolls all of
-     it back, so depletion can never commit without its tickets. (This
-     inline fire path previously never called depleteInventoryForItems at
-     all: send-now sales silently left ingredient on_hand untouched.)
+  /* Insert + fire in ONE transaction, mirroring /send's
+     fireHeldItemsToKds: the new rows, their sent marks, the inventory
+     depletion (+ aggregated 'sale depletion' ledger), and the KDS
+     tickets commit or roll back as a single unit — a send-now can
+     never half-land, so a retry can never duplicate a line. (This
+     inline fire path previously never called depleteInventoryForItems
+     at all: send-now sales silently left ingredient on_hand untouched.)
      Ticket broadcasts go out after commit, like /send. */
-  const tickets = withTransaction(() => {
+  const fired = withTransaction(() => {
+    const insertedIds = [];
+    for (const p of prepared) {
+      const r = insertLine.run(crypto.randomUUID(), check.id, p.menuItem.id, p.seat, p.qty, p.unitPrice,
+        p.modifiersJson, p.course, nowIso(), p.note, p.allergy, p.allergyDetail);
+      insertedIds.push(r.lastInsertRowid);
+    }
+    const held = db.prepare(
+      "SELECT ci.*, mi.name, mi.station FROM check_items ci JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id IN (" + insertedIds.map(() => '?').join(',') + ") ORDER BY ci.id"
+    ).all(...insertedIds);
     const byStation = new Map();
     for (const it of held) {
       markSent.run(sentAt, it.id);
@@ -3083,19 +3134,19 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
     }
     depleteInventoryForItems(held, (req.user && req.user.name) || (serverUser ? serverUser.name : null));
     const created = [];
-    for (const [station, items] of byStation) {
+    for (const [station, tItems] of byStation) {
       const r = newTicket.run(crypto.randomUUID(), SITE_ID, check.id, station,
         table ? table.label : null, serverUser ? serverUser.name : null,
-        JSON.stringify(items), sentAt);
+        JSON.stringify(tItems), sentAt);
       created.push(ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid)));
     }
-    return created;
+    return { insertedIds, tickets: created, sentCount: held.length };
   });
-  for (const ticket of tickets) broadcastTicket(ticket);
+  for (const ticket of fired.tickets) broadcastTicket(ticket);
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
-  const outItems = insertedIds.map((id) => itemView(db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(id)));
-  res.status(201).json({ sent: held.length, tickets, items: outItems });
+  const outItems = fired.insertedIds.map((id) => itemView(db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(id)));
+  res.status(201).json({ sent: fired.sentCount, tickets: fired.tickets, items: outItems });
 });
 
 /* Item re-fire / reprint kitchen ticket (Toast overflow parity:
