@@ -3295,6 +3295,27 @@ function parseTipInput(str) {
   return { cents: Math.round(v * 100) };
 }
 
+/* EOD close-out helpers (audit gap #5): the counted-cash parser for the
+   Z panel — typed dollars to integer cents, or an honest error, never
+   NaN cents downstream (the parseTipInput idiom). The over/short
+   preview is counted minus expected, in cents — the exact figure the
+   server stores when the day closes, so the panel never promises a
+   number the close will not produce. */
+function parseCountedCash(str) {
+  const raw = String(str == null ? '' : str).trim();
+  if (!raw) return { error: 'Enter the counted cash' };
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return { error: 'Enter the count as dollars, e.g. 412.50' };
+  if (v < 0) return { error: 'A cash count cannot be negative' };
+  return { cents: Math.round(v * 100) };
+}
+
+function overShortPreview(countedStr, expectedCents) {
+  const p = parseCountedCash(countedStr);
+  if (p.error) return { error: p.error };
+  return { counted_cents: p.cents, over_short_cents: p.cents - (expectedCents || 0) };
+}
+
 /* Discount library (audit gap #4): three small helpers carry the
    client logic for the floor picker and the settings editor. The
    value label renders a definition the way staff say it. The savings
@@ -4740,13 +4761,122 @@ async function renderFinance(app) {
     body.innerHTML = '<p class="muted">Loading reconciliation…</p>';
     try {
       const r = await api('/api/finance/payouts?date=' + encodeURIComponent(d));
-      body.innerHTML = financeHtml(r, d) + '<div id="pm-section"></div>';
+      body.innerHTML = financeHtml(r, d) + '<div id="pm-section"></div>' + '<div id="z-section"></div>';
       wireReportExports(d);
       wireProductMix(d);
+      wireCloseout(d);
     } catch (e) { if (handleApiError(e) !== 'bounced') body.innerHTML = '<div class="empty">Could not load payouts.</div>'; }
   };
   $('#fin-date').addEventListener('change', load);
   await load();
+}
+
+/* EOD close-out panel (audit gap #5): lives under the Finance
+   reconciliation for the selected date. An open day shows the system
+   expected cash and a typed count with a live over/short preview; the
+   Close day button detours through a fresh-PIN modal (the server
+   refuses without one). A closed day shows the frozen snapshot
+   figures, who closed it and when, and a Reopen control (PIN +
+   reason). Previous close-outs list below, voided rows marked. */
+async function wireCloseout(date) {
+  const host = $('#z-section');
+  if (!host) return;
+  let st;
+  try { st = await api('/api/finance/close-day?date=' + encodeURIComponent(date)); }
+  catch (e) { host.innerHTML = ''; return; }
+  let listHtml = '';
+  try {
+    const l = await api('/api/finance/closeouts');
+    const rows = (l.closeouts || []).filter((c) => c.business_date !== date);
+    if (rows.length) {
+      listHtml = '<h3 style="margin-top:16px">Close-out history</h3><table class="fin-table">' +
+        rows.map((c) => '<tr' + (c.status === 'voided' ? ' style="opacity:.55"' : '') + '><td>' + esc(c.business_date) +
+          (c.status === 'voided' ? ' <span class="lbl-note">reopened — superseded</span>' : '') + '</td>' +
+          '<td class="num">' + (c.net_sales_cents != null ? fmt(c.net_sales_cents) : '—') + ' net</td>' +
+          '<td class="num ' + (c.over_short_cents > 0 ? 'pos' : (c.over_short_cents < 0 ? 'neg' : '')) + '">' +
+          (c.over_short_cents > 0 ? '+' : '') + fmt(c.over_short_cents || 0) + '</td>' +
+          '<td class="lbl-note">' + esc(c.closed_by || '') + '</td></tr>').join('') + '</table>';
+    }
+  } catch (e) { /* history is best-effort; the panel itself is the ritual */ }
+
+  if (st.closed && st.closeout) {
+    const c = st.closeout, s = c.snapshot || {};
+    const tipsTotal = s.tips && s.tips.totals ? s.tips.totals.total_tips_cents : 0;
+    host.innerHTML = '<div class="card"><h2>Close day (Z) — ' + esc(date) + '</h2>' +
+      '<p><b>Closed out</b> by ' + esc(c.closed_by || '') + ' · ' + esc(String(c.closed_at || '').replace('T', ' ').slice(0, 16)) + '</p>' +
+      '<table class="fin-table">' +
+      '<tr><td>Checks closed</td><td class="num">' + (s.sales ? s.sales.checks : 0) + '</td></tr>' +
+      '<tr><td>Net sales</td><td class="num">' + fmt(s.sales ? s.sales.net_cents : 0) + '</td></tr>' +
+      '<tr><td>Tax collected</td><td class="num">' + fmt(s.tax ? s.tax.tax_cents : 0) + '</td></tr>' +
+      '<tr><td>Tips</td><td class="num">' + fmt(tipsTotal || 0) + '</td></tr>' +
+      '<tr><td>Expected cash</td><td class="num">' + fmt(c.expected_cash_cents || 0) + '</td></tr>' +
+      '<tr><td>Counted cash</td><td class="num">' + fmt(c.counted_cash_cents || 0) + '</td></tr>' +
+      '<tr class="result"><td>Over / short</td><td class="num ' + (c.over_short_cents > 0 ? 'pos' : (c.over_short_cents < 0 ? 'neg' : '')) + '">' + (c.over_short_cents > 0 ? '+' : '') + fmt(c.over_short_cents || 0) + '</td></tr>' +
+      '</table>' +
+      '<p class="muted small">Open checks carried over at close: ' + (s.open_checks_carried ? s.open_checks_carried.count : 0) +
+      '. This day is locked — refunds, tip changes and new payments dated to it are refused until it is reopened.</p>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" id="z-reopen">Reopen day</button></div>' + listHtml + '</div>';
+    $('#z-reopen').onclick = () => {
+      const bd = openModal('<h2>Reopen ' + esc(date) + '</h2>' +
+        '<p>Reopening unlocks this day so its money can be corrected. The close-out stays on record (marked superseded); closing again writes a fresh snapshot.</p>' +
+        '<div class="field"><label for="z-rpin">Manager PIN</label><input type="password" id="z-rpin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' +
+        '<div class="field"><label for="z-rreason">Reason</label><input type="text" id="z-rreason" maxlength="120" placeholder="Why is this day being reopened?"></div>' +
+        '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Reopen day</button></div>');
+      $('[data-x="c"]', bd).onclick = () => closeModal();
+      $('[data-x="go"]', bd).onclick = async () => {
+        const pin = ($('#z-rpin', bd).value || '').trim();
+        const reason = ($('#z-rreason', bd).value || '').trim();
+        if (!pin) { toast('Enter the manager PIN', 'err'); return; }
+        if (!reason) { toast('A reason is required', 'err'); return; }
+        try {
+          await api('/api/finance/close-day/reopen', 'POST', { date, manager_pin: pin, reason });
+          closeModal();
+          toast('Day reopened — ' + date, 'ok');
+          wireCloseout(date);
+        } catch (e) { if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e); }
+      };
+    };
+    return;
+  }
+
+  const expected = st.expected_cash_cents || 0;
+  host.innerHTML = '<div class="card"><h2>Close day (Z) — ' + esc(date) + '</h2>' +
+    '<table class="fin-table"><tr><td>Expected cash</td><td class="num">' + fmt(expected) + '</td></tr>' +
+    '<tr><td>Counted cash</td><td><input type="text" id="z-counted" inputmode="decimal" placeholder="0.00" style="max-width:140px"></td></tr>' +
+    '<tr class="result"><td>Over / short</td><td class="num" id="z-prev">—</td></tr></table>' +
+    '<p class="muted small">Expected cash counts cash payments taken on this date, minus cash refunds on this date. It does not include the drawer opening float or paid-ins / paid-outs — the drawer close covers those. Cash tips are kept by the server and are not in the count.</p>' +
+    '<div class="field"><label for="z-note">Note (optional)</label><input type="text" id="z-note" maxlength="120" placeholder="Anything about this close"></div>' +
+    '<div class="modal-actions"><button class="btn btn-primary" id="z-close">Close day</button></div>' + listHtml + '</div>';
+  const countedEl = $('#z-counted'), prevEl = $('#z-prev');
+  const paintPrev = () => {
+    const p = overShortPreview(countedEl.value, expected);
+    if (p.error) { prevEl.textContent = countedEl.value.trim() ? p.error : '—'; prevEl.className = 'num'; return; }
+    prevEl.textContent = p.over_short_cents === 0 ? 'Exact' : (p.over_short_cents > 0 ? 'Over ' : 'Short ') + fmt(Math.abs(p.over_short_cents));
+    prevEl.className = 'num ' + (p.over_short_cents > 0 ? 'pos' : (p.over_short_cents < 0 ? 'neg' : ''));
+  };
+  countedEl.addEventListener('input', paintPrev);
+  $('#z-close').onclick = () => {
+    const p = overShortPreview(countedEl.value, expected);
+    if (p.error) { toast(p.error, 'err'); return; }
+    const bd = openModal('<h2>Close ' + esc(date) + '</h2>' +
+      '<p>Counted <b>' + fmt(p.counted_cents) + '</b> against expected <b>' + fmt(expected) + '</b> — ' +
+      (p.over_short_cents === 0 ? 'exact.' : (p.over_short_cents > 0 ? 'over by ' : 'short by ') + fmt(Math.abs(p.over_short_cents)) + '.') +
+      ' Closing snapshots the day figures and locks the date: refunds, tip changes and new payments dated to it are refused until a manager reopens it.</p>' +
+      '<div class="field"><label for="z-pin">Manager PIN</label><input type="password" id="z-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button><button class="btn btn-primary" data-x="go">Close the day</button></div>');
+    $('[data-x="c"]', bd).onclick = () => closeModal();
+    $('[data-x="go"]', bd).onclick = async () => {
+      const pin = ($('#z-pin', bd).value || '').trim();
+      if (!pin) { toast('Enter the manager PIN', 'err'); return; }
+      try {
+        const note = ($('#z-note', host).value || '').trim();
+        const r = await api('/api/finance/close-day', 'POST', { date, counted_cash_cents: p.counted_cents, manager_pin: pin, note: note || undefined });
+        closeModal();
+        toast('Day closed — ' + date + ' · over/short ' + (r.over_short_cents > 0 ? '+' : '') + fmt(r.over_short_cents || 0), 'ok');
+        wireCloseout(date);
+      } catch (e) { if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e); }
+    };
+  };
 }
 
 function financeHtml(r, date) {

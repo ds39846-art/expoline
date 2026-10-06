@@ -365,6 +365,12 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       if (dup) {
         return { ok: true, payment_id: dup.id, payment_uuid: payUuid, already: true };
       }
+      // EOD freeze (audit gap #5): the brain dates an applied payment
+      // at apply time — a closed-out day takes no new money. Already-
+      // applied uuids replayed above, before this guard, as they must.
+      if (typeof h.dayClosedToday === 'function' && h.dayClosedToday()) {
+        return { ok: false, error: 'day_closed', check_id: checkId };
+      }
       if (!['cash', 'card_demo'].includes(p.method)) return { ok: false, error: 'invalid_method' };
       if (!Number.isInteger(p.amount_cents) || p.amount_cents <= 0) return { ok: false, error: 'invalid_amount' };
       if (!Number.isInteger(p.tip_cents || 0) || (p.tip_cents || 0) < 0) return { ok: false, error: 'invalid_tip' };

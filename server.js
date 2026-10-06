@@ -186,6 +186,35 @@ db.exec('PRAGMA busy_timeout=5000;');
   db.exec('CREATE INDEX IF NOT EXISTS idx_check_discounts_check ON check_discounts(check_id, status)');
 })();
 
+/* EOD close-out (audit gap #5): one row per close-out event for a
+   business date. A status of closed is the live day lock; reopening
+   flips the row to voided (kept forever — the day history shows the
+   close, the reopen, and any later re-close as separate rows) and a
+   re-close writes a NEW row. snapshot_json is the frozen Z record:
+   it is written once at close time and never recomputed into. */
+(() => {
+  db.exec(`CREATE TABLE IF NOT EXISTS closeouts (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT UNIQUE,
+    site_id TEXT,
+    business_date TEXT,
+    status TEXT CHECK(status IN ('closed','voided')) DEFAULT 'closed',
+    snapshot_json TEXT,
+    expected_cash_cents INTEGER,
+    counted_cash_cents INTEGER,
+    over_short_cents INTEGER,
+    note TEXT,
+    closed_by TEXT,
+    closed_by_id INTEGER,
+    closed_at TEXT,
+    reopened_by TEXT,
+    reopened_at TEXT,
+    reopen_reason TEXT,
+    created_at TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_closeouts_site_date ON closeouts(site_id, business_date, status)');
+})();
+
 /* Time clock + CA break-compliance migration (phase 2). Runs on every boot;
    guards via PRAGMA / CREATE TABLE IF NOT EXISTS. Demo wage defaults are
    applied once (only where no rate is set); the manager sets real rates in
@@ -1419,6 +1448,7 @@ app.use((req, res, next) => {
 require('./routes/parity_kds_pay').registerPublic(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse,
   broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents,
+  dayClosedToday,
 });
 
 app.use('/api', authMiddleware);
@@ -1435,7 +1465,7 @@ const lanRuntime = (() => {
     helpers: {
       persistTotals, checkResponse, ticketView, checkLocationLabel,
       broadcastTicket, broadcastCheckUpdated, broadcastMenuUpdated,
-      auditApproval, auditMenu, effectivePriceCents,
+      auditApproval, auditMenu, effectivePriceCents, dayClosedToday,
       verifyManagerPin, verifyOfflineApproval, consumeOfflineApproval,
       parseJson, crypto,
     },
@@ -3872,6 +3902,9 @@ app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!check) return res.status(404).json({ error: 'Check not found' });
   if (check.status !== 'open') return res.status(400).json({ error: `Cannot take payment on a ${check.status} check` });
+  /* EOD freeze: a new payment is dated today — once today is closed
+   * out, no new money may be dated into it (reopen the day first). */
+  if (!assertDayOpen(res, todaySite())) return;
 
   const { method, amount_cents, tip_cents = 0, tendered_cents, brand, last4, memo } = req.body || {};
   const TENDER_METHODS = ['cash', 'card_demo', 'house_account'];
@@ -3981,6 +4014,12 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
   }
   const payment = db.prepare('SELECT * FROM payments WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!payment) return res.status(404).json({ error: 'Payment not found' });
+  /* EOD freeze: a refund moves money that belongs to the payment date
+   * (payouts bucketing) and to its check business date once closed —
+   * both must be open days. (Idempotent replays returned above, before
+   * this point, as they change nothing.) */
+  const refundCheck = db.prepare('SELECT id, status, closed_at FROM checks WHERE id = ?').get(payment.check_id);
+  if (!assertPaymentDayOpen(res, payment, refundCheck)) return;
   if (payment.status === 'refunded') return res.status(400).json({ error: 'Payment already fully refunded' });
 
   const remaining = payment.amount_cents - (payment.refunded_cents || 0);
@@ -4057,9 +4096,10 @@ app.post('/api/payments/:id/refund', managerOnly(), (req, res) => {
  * report, finance payouts / shift, exports, insights) reads the payments
  * rows live, so the correction flows through everywhere automatically.
  * Timing: allowed while the parent check is open, paid, or closed —
- * Expoline has no batch / EOD settlement marker to gate on yet (EOD
- * close-out is a later batch); the tip freezes once any refund has been
- * taken against the payment. */
+ * the tip freezes once any refund has been taken against the payment,
+ * and once the payment business day has been closed out (EOD close-out,
+ * audit gap #5: assertPaymentDayOpen below is the gate that batch left
+ * as a hook here). */
 app.patch('/api/payments/:id/tip', serverPlus(), (req, res) => {
   const payment = db.prepare('SELECT * FROM payments WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
   if (!payment) return res.status(404).json({ error: 'Payment not found' });
@@ -4112,6 +4152,12 @@ app.patch('/api/payments/:id/tip', serverPlus(), (req, res) => {
   if ((payment.refunded_cents || 0) > 0) {
     return res.status(400).json({ error: 'Payment has a refund — its tip is final once any refund is taken' });
   }
+
+  /* EOD freeze: once the payment date — or its check business date —
+   * is closed out, the tip is settled history exactly as if a refund
+   * had frozen it, until a manager reopens that day. */
+  const tipCheck = db.prepare('SELECT id, status, closed_at FROM checks WHERE id = ?').get(payment.check_id);
+  if (!assertPaymentDayOpen(res, payment, tipCheck)) return;
 
   const oldTip = payment.tip_cents || 0;
   const newTip = b.tip_cents;
@@ -4167,6 +4213,11 @@ app.post('/api/checks/:id/reopen', managerOnly(), (req, res) => {
   if (!mgr) {
     return res.status(403).json({ error: 'Reopening a paid check needs a manager PIN — enter it fresh every time', need_manager_pin: true });
   }
+  /* EOD freeze: reopening resurrects money whose payments belong to
+   * their creation dates — if any of those days is closed out, the
+   * check stays settled history until that day is reopened. */
+  const payDates = db.prepare('SELECT created_at FROM payments WHERE check_id = ?').all(check.id);
+  for (const p of payDates) { if (!assertDayOpen(res, tzDate(p.created_at))) return; }
   const occupant = db.prepare(
     `SELECT id FROM checks WHERE table_id = ? AND status = 'open'
      AND split_from IS NULL AND server_id IS NOT NULL LIMIT 1`
@@ -4949,6 +5000,280 @@ app.get('/api/finance/reports/:report', managerOnly(), async (req, res) => {
     console.error('report export failed:', e);
     res.status(500).json({ error: 'Report generation failed' });
   }
+});
+
+/* --------------------------- EOD close-out (Z) ----------------------------
+ * Audit gap #5 (Toast/SpotOn parity): the day ends with a Z close-out.
+ * The manager counts the cash drawer against what the system expects,
+ * the day figures are SNAPSHOTTED from the very report builders Finance
+ * shows (sales / tax / payouts / tips — never re-derived a second way),
+ * and the business date LOCKS: money mutations belonging to it are
+ * refused until a manager reopens the day (fresh PIN + reason,
+ * audit-logged). Reopening keeps the voided close-out row forever; a
+ * re-close writes a NEW row with a fresh snapshot.
+ *
+ * Business-date definition (ONE, used everywhere in this batch — the
+ * same bucketing the snapshotted reports use):
+ *   - a check belongs to the site-local date of its closed_at
+ *     (tzDate(closed_at)) once closed_at is set — exactly how the sales
+ *     and tax reports bucket it. An OPEN check has no business date
+ *     yet: it is carried over (the close-out lists it, so this is
+ *     disclosed, never silent) and lands on whatever date it eventually
+ *     closes.
+ *   - a payment also carries the site-local date of its created_at —
+ *     exactly how payouts and the tips report bucket it. A payment is
+ *     frozen when EITHER its own date OR its check business date is
+ *     closed out (assertPaymentDayOpen).
+ * Every other money mutation in the codebase either targets an open
+ * check (items, comps, discounts, splits, loyalty — the status guard
+ * refuses them on paid/closed checks, and an open check has no closed
+ * business date to violate) or creates a payment dated NOW (staff
+ * payments above; guest card pay, cash-collect, gift-card redeem and
+ * LAN payment ops via the injected dayClosedToday guard). Whole-check
+ * void also targets open checks only; check close ASSIGNS the business
+ * date rather than editing money, so it is not frozen.
+ *
+ * Expected cash is the payments-derived figure alone: cash payments
+ * taken on the date, net of cash refunds — the per-payment rule
+ * drawerExpected uses, bucketed by payment date like payouts. It
+ * deliberately excludes the drawer opening float and paid-ins /
+ * paid-outs (those belong to the per-session drawer ritual,
+ * POST /api/cash/drawer/close, whose window is a shift, not a date)
+ * and cash tips (kept by the server — see the Tips report note). The
+ * close-out copy says exactly this; no bank is invented. */
+function closedDayRow(date) {
+  if (!date) return null;
+  return db.prepare("SELECT * FROM closeouts WHERE site_id = ? AND business_date = ? AND status = 'closed'")
+    .get(SITE_ID, date) || null;
+}
+function isDayClosed(date) { return !!closedDayRow(date); }
+/** The one freeze primitive: writes a 409 day_closed refusal, returns false. */
+function assertDayOpen(res, date) {
+  if (!isDayClosed(date)) return true;
+  res.status(409).json({
+    error: `Business day ${date} is closed out — reopen it (Finance → Close day) before changing its money`,
+    day_closed: true, business_date: date,
+  });
+  return false;
+}
+/** Site-local business date of a check, or null while it is still open. */
+function checkBusinessDate(check) {
+  if (!check || !check.closed_at) return null;
+  return tzDate(check.closed_at);
+}
+/** Freeze gate for mutations on an existing payment (refund, tip adjust). */
+function assertPaymentDayOpen(res, payment, check) {
+  if (!assertDayOpen(res, tzDate(payment.created_at))) return false;
+  const bd = checkBusinessDate(check);
+  if (bd && !assertDayOpen(res, bd)) return false;
+  return true;
+}
+/** For module paths that create a payment dated NOW (guest card pay,
+ *  cash-collect, gift-card redeem, LAN payment ops): the new money would
+ *  belong to today, so a closed-out today refuses it. Injected into the
+ *  route-module ctx objects — server.js owns the closeouts table. */
+function dayClosedToday() { return isDayClosed(todaySite()); }
+
+function expectedCashForDate(date) {
+  let cash = 0;
+  const pays = db.prepare('SELECT method, amount_cents, refunded_cents, status, created_at FROM payments WHERE site_id = ?').all(SITE_ID);
+  for (const p of pays) {
+    if (p.method !== 'cash') continue;
+    if (tzDate(p.created_at) !== date) continue;
+    if (p.status === 'completed' || p.status === 'partial_refund') cash += p.amount_cents - (p.refunded_cents || 0);
+  }
+  return cash;
+}
+
+/** Payments-by-method detail + refund roll-up for one date. Named
+ *  source: the payments rows bucketed by their site-local created date
+ *  (the payouts bucketing), per-payment net = amount_cents −
+ *  refunded_cents (the net the sales and payouts reports both use).
+ *  No REPORT_DEFS builder exposes per-method counts, so this is the one
+ *  Z-native aggregation; every other Z figure comes from a builder. */
+function dayPaymentsAgg(date) {
+  const byMethod = new Map();
+  let refundsCount = 0, refundsAmount = 0;
+  for (const p of db.prepare('SELECT * FROM payments WHERE site_id = ?').all(SITE_ID)) {
+    if (tzDate(p.created_at) !== date) continue;
+    let m = byMethod.get(p.method);
+    if (!m) { m = { method: p.method, count: 0, amount_cents: 0, refunded_cents: 0, net_cents: 0, tips_cents: 0 }; byMethod.set(p.method, m); }
+    m.count++; m.amount_cents += p.amount_cents || 0;
+    m.refunded_cents += p.refunded_cents || 0;
+    m.net_cents += (p.amount_cents || 0) - (p.refunded_cents || 0);
+    m.tips_cents += p.tip_cents || 0;
+    if ((p.refunded_cents || 0) > 0) { refundsCount++; refundsAmount += p.refunded_cents; }
+  }
+  return {
+    by_method: [...byMethod.values()].sort((a, b) => (a.method < b.method ? -1 : 1)),
+    refunds: { count: refundsCount, amount_cents: refundsAmount },
+  };
+}
+
+/** Voids for one date. Named source: checks whose status is void and
+ *  whose closed_at — the void stamps it — falls on the date; the amount
+ *  is the gross of the lines the void cancelled (lineGross, exactly as
+ *  calcTotals computes a line gross). Voided checks are excluded from
+ *  every report, so no builder figure exists to reuse. */
+function voidsForDate(date) {
+  let count = 0, amount = 0;
+  const voided = db.prepare("SELECT id, closed_at FROM checks WHERE site_id = ? AND status = 'void' AND closed_at IS NOT NULL").all(SITE_ID);
+  for (const c of voided) {
+    if (tzDate(c.closed_at) !== date) continue;
+    count++;
+    const lines = db.prepare("SELECT * FROM check_items WHERE check_id = ? AND state = 'cancelled'").all(c.id);
+    amount += lines.reduce((s, it) => s + lineGross(it), 0);
+  }
+  return { count, amount_cents: amount };
+}
+
+function closeoutView(r, full) {
+  const v = {
+    id: r.id, uuid: r.uuid, business_date: r.business_date, status: r.status,
+    expected_cash_cents: r.expected_cash_cents, counted_cash_cents: r.counted_cash_cents,
+    over_short_cents: r.over_short_cents, note: r.note,
+    closed_by: r.closed_by, closed_at: r.closed_at,
+    reopened_by: r.reopened_by, reopened_at: r.reopened_at, reopen_reason: r.reopen_reason,
+  };
+  const snap = r.snapshot_json ? parseJson(r.snapshot_json, null) : null;
+  if (snap && snap.sales) { v.checks = snap.sales.checks; v.net_sales_cents = snap.sales.net_cents; }
+  if (full) v.snapshot = snap;
+  return v;
+}
+
+/** The Z snapshot: report-builder outputs verbatim for the date, plus
+ *  the named-source extras (payments by method, refunds, voids, item
+ *  discounts) and the cash count. cash = {expected, counted} computed by
+ *  the caller so the stored row and the snapshot can never disagree. */
+function buildZSnapshot(date, cash) {
+  const salesRow = REPORT_DEFS.sales.build(date, date).rows[0];
+  const taxRow = REPORT_DEFS.tax.build(date, date).rows[0];
+  const payoutsRow = payoutDay(date);
+  const tipsData = REPORT_DEFS.tips.build(date, date);
+  const tipsTotalsRaw = reportTotals(REPORT_DEFS.tips, tipsData.rows);
+  // Item discounts + the true gross: the sales report has no item-
+  // discount column (its gross_cents is the NET subtotal), so sum the
+  // same per-check item_discount_cents the check payload carries, over
+  // the exact check set the sales report used.
+  let itemDiscounts = 0;
+  for (const c of db.prepare("SELECT id, closed_at FROM checks WHERE site_id = ? AND status IN ('paid','closed') AND closed_at IS NOT NULL").all(SITE_ID)) {
+    if (tzDate(c.closed_at) === date) itemDiscounts += persistTotals(c.id).item_discount_cents || 0;
+  }
+  const carried = db.prepare("SELECT id FROM checks WHERE site_id = ? AND status = 'open' ORDER BY id").all(SITE_ID);
+  const agg = dayPaymentsAgg(date);
+  return {
+    business_date: date,
+    sales: salesRow,
+    tax: taxRow,
+    payouts: payoutsRow,
+    tips: {
+      rows: tipsData.rows,
+      totals: {
+        cash_tips_cents: tipsTotalsRaw.cash_tips_cents || 0,
+        card_tips_cents: tipsTotalsRaw.card_tips_cents || 0,
+        total_tips_cents: tipsTotalsRaw.total_tips_cents || 0,
+      },
+    },
+    payments_by_method: agg.by_method,
+    refunds: agg.refunds,
+    voids: voidsForDate(date),
+    item_discounts_cents: itemDiscounts,
+    gross_sales_cents: (salesRow.gross_cents || 0) + itemDiscounts,
+    expected_cash_cents: cash.expected,
+    counted_cash_cents: cash.counted,
+    over_short_cents: cash.counted - cash.expected,
+    open_checks_carried: { count: carried.length, check_ids: carried.map((c) => c.id) },
+  };
+}
+
+const DATE_FMT_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Day status for the Finance view: is this date closed out, and what
+ *  does the system expect in the drawer for it (live for an open day,
+ *  the stored figure once closed). */
+app.get('/api/finance/close-day', managerOnly(), (req, res) => {
+  const date = req.query.date || todaySite();
+  if (!DATE_FMT_RE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  const row = closedDayRow(date);
+  if (row) return res.json({ date, closed: true, closeout: closeoutView(row, true), expected_cash_cents: row.expected_cash_cents });
+  return res.json({ date, closed: false, closeout: null, expected_cash_cents: expectedCashForDate(date) });
+});
+
+/** Close the business day (Z): fresh manager PIN always (the money-lock
+ *  idiom), a REQUIRED typed cash count, snapshot + lock in one write. */
+app.post('/api/finance/close-day', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Closing the day needs a manager PIN — enter it fresh every time', need_manager_pin: true }); }
+  recordManagerPinAttempt(req, true);
+  const date = b.date || todaySite();
+  if (!DATE_FMT_RE.test(date || '')) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  if (date > todaySite()) return res.status(400).json({ error: 'Cannot close a future business day' });
+  if (!isInt(b.counted_cash_cents) || b.counted_cash_cents < 0) {
+    return res.status(400).json({ error: 'counted_cash_cents must be a non-negative integer — count the drawer and enter what is actually there' });
+  }
+  const note = cleanLabel(b.note);
+  if (note && note.length > 120) return res.status(400).json({ error: 'note must be at most 120 characters' });
+  if (closedDayRow(date)) {
+    return res.status(409).json({ error: `Business day ${date} is already closed out`, day_closed: true, business_date: date });
+  }
+  const expected = expectedCashForDate(date);
+  const cash = { expected, counted: b.counted_cash_cents };
+  const snapshot = buildZSnapshot(date, cash);
+  const at = nowIso();
+  const r = db.prepare(
+    `INSERT INTO closeouts (uuid, site_id, business_date, status, snapshot_json,
+       expected_cash_cents, counted_cash_cents, over_short_cents, note,
+       closed_by, closed_by_id, closed_at, created_at)
+     VALUES (?, ?, ?, 'closed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(crypto.randomUUID(), SITE_ID, date, JSON.stringify(snapshot),
+    expected, cash.counted, cash.counted - expected, note || null,
+    req.user.name, req.user.id, at, at);
+  const row = db.prepare('SELECT * FROM closeouts WHERE id = ?').get(r.lastInsertRowid);
+  auditApproval(req, 'close_day', {}, {
+    business_date: date, closeout_id: row.id, approver: mgr.name, approver_id: mgr.id,
+    expected_cash_cents: expected, counted_cash_cents: cash.counted,
+    over_short_cents: cash.counted - expected,
+    checks_closed: snapshot.sales.checks, open_checks_carried: snapshot.open_checks_carried.count,
+  });
+  return res.status(201).json(closeoutView(row, true));
+});
+
+/** Reopen a closed day: fresh manager PIN + a reason, always. The
+ *  close-out row is voided, never deleted; the day unfreezes and a
+ *  later re-close writes a fresh row with a fresh snapshot. */
+app.post('/api/finance/close-day/reopen', managerOnly(), (req, res) => {
+  const b = req.body || {};
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Reopening a closed day needs a manager PIN — enter it fresh every time', need_manager_pin: true }); }
+  recordManagerPinAttempt(req, true);
+  const reason = cleanLabel(b.reason);
+  if (!reason) return res.status(400).json({ error: 'A reason is required to reopen a closed day' });
+  if (reason.length > 120) return res.status(400).json({ error: 'reason must be at most 120 characters' });
+  let row = null;
+  if (b.closeout_id != null) row = db.prepare('SELECT * FROM closeouts WHERE id = ? AND site_id = ?').get(b.closeout_id, SITE_ID) || null;
+  else if (b.date) row = closedDayRow(b.date);
+  if (!row) return res.status(404).json({ error: 'No close-out found to reopen' });
+  if (row.status !== 'closed') return res.status(400).json({ error: 'That close-out has already been reopened (voided)' });
+  const at = nowIso();
+  db.prepare("UPDATE closeouts SET status = 'voided', reopened_by = ?, reopened_at = ?, reopen_reason = ? WHERE id = ?")
+    .run(req.user.name, at, reason, row.id);
+  auditApproval(req, 'reopen_day', {}, {
+    business_date: row.business_date, closeout_id: row.id, reason,
+    approver: mgr.name, approver_id: mgr.id,
+  });
+  return res.json(closeoutView(db.prepare('SELECT * FROM closeouts WHERE id = ?').get(row.id), true));
+});
+
+app.get('/api/finance/closeouts', managerOnly(), (req, res) => {
+  const rows = db.prepare('SELECT * FROM closeouts WHERE site_id = ? ORDER BY business_date DESC, id DESC').all(SITE_ID);
+  return res.json({ closeouts: rows.map((r) => closeoutView(r)) });
+});
+
+app.get('/api/finance/closeouts/:id', managerOnly(), (req, res) => {
+  const row = db.prepare('SELECT * FROM closeouts WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!row) return res.status(404).json({ error: 'Close-out not found' });
+  return res.json(closeoutView(row, true));
 });
 
 /* --------------------------------- manager --------------------------------- */
@@ -7877,6 +8202,11 @@ const API_DOCS = [
   { method: 'GET', path: '/api/finance/payouts', auth: 'manager', summary: 'Honest payout reconciliation', params: 'date?' },
   { method: 'GET', path: '/api/finance/shift', auth: 'manager', summary: 'Shift report: sales, tips, cash owed', params: 'date?, server_id?' },
   { method: 'GET', path: '/api/finance/reports/:report', auth: 'manager', summary: 'sales|payouts|tax|labor|tips export', params: 'period|from&to, format=xlsx|csv|pdf|docx|json' },
+  { method: 'GET', path: '/api/finance/close-day', auth: 'manager', summary: 'EOD day status: closed out?, the close-out if so, expected cash for the date', params: 'date?' },
+  { method: 'POST', path: '/api/finance/close-day', auth: 'manager (+fresh manager PIN)', summary: 'Z close-out: snapshot the day from the report builders, count cash vs expected, lock the business date', params: 'date?, counted_cash_cents, manager_pin, note?' },
+  { method: 'POST', path: '/api/finance/close-day/reopen', auth: 'manager (+fresh manager PIN)', summary: 'Reopen a closed day (row voided, never deleted) so its money can be corrected; re-close writes a fresh snapshot', params: 'date|closeout_id, manager_pin, reason' },
+  { method: 'GET', path: '/api/finance/closeouts', auth: 'manager', summary: 'Close-out history, newest first (voided rows kept and marked)', params: '—' },
+  { method: 'GET', path: '/api/finance/closeouts/:id', auth: 'manager', summary: 'One close-out with its full frozen Z snapshot', params: '—' },
   { method: 'GET', path: '/api/finance/product-mix', auth: 'manager', summary: 'Best/worst sellers, void rates (NEW 3C)', params: 'from?, to?' },
   { method: 'GET', path: '/api/manager/overview', auth: 'manager', summary: 'Today sales, open checks, covers', params: '—' },
   { method: 'POST', path: '/api/clock/in', auth: 'any staff', summary: 'Clock in (own PIN)', params: 'pin' },
@@ -7969,6 +8299,7 @@ require('./routes/giftcards').register(app, {
   db, SITE_ID, managerOnly, serverPlus, nowIso, crypto,
   persistTotals, checkResponse, paymentView, broadcastCheckUpdated, auditApproval,
   idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear,
+  dayClosedToday,
 });
 require('./routes/loyalty').register(app, {
   db, SITE_ID, serverPlus, nowIso, crypto, persistTotals,
@@ -7992,7 +8323,7 @@ require('./routes/insights').register(app, {
 require('./routes/parity_kds_pay').registerStaff(app, {
   db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
   persistTotals, checkResponse, broadcastCheckUpdated, broadcastTicket, ticketView,
-  effectivePriceCents,
+  effectivePriceCents, dayClosedToday, isDayClosed,
 });
 /* Phase 3A competitor parity: order & check flow (dayparts, timers, guest
    names, fired-item edits, merge, move). */

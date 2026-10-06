@@ -122,7 +122,12 @@ function cardView(c) {
 function register(app, ctx) {
   const { db, SITE_ID, managerOnly, serverPlus, nowIso, crypto,
           persistTotals, checkResponse, paymentView, broadcastCheckUpdated,
-          auditApproval, idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear } = ctx;
+          auditApproval, idemKeyFrom, idemReplay, idemReserve, idemStore, idemClear,
+          dayClosedToday } = ctx;
+  // EOD freeze (audit gap #5): a redemption writes a payment dated
+  // today; the host owns the close-out lock. Absent the helper (older
+  // hosts), behavior is unchanged.
+  const todayClosed = typeof dayClosedToday === 'function' ? dayClosedToday : () => false;
 
   const findCard = (rawCode) => {
     const norm = normalizeCode(rawCode);
@@ -316,6 +321,11 @@ function register(app, ctx) {
     if (!check) return res.status(404).json({ error: 'Check not found' });
     if (check.status !== 'open') {
       return res.status(400).json({ error: `Cannot take payment on a ${check.status} check` });
+    }
+    // EOD freeze: the redemption payment would be dated today — a
+    // closed-out day takes no new money (reopen it from Finance).
+    if (todayClosed()) {
+      return res.status(409).json({ error: 'Business day is closed out — reopen it (Finance → Close day) before taking new payments', day_closed: true });
     }
     const card = findCard(gift_card_code);
     if (!card) return res.status(404).json({ error: 'Gift card not found' });

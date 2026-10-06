@@ -186,6 +186,32 @@ CREATE TABLE check_discounts (
 
 CREATE INDEX idx_check_discounts_check ON check_discounts(check_id, status);
 
+/* EOD close-out (audit gap #5): one row per close-out event for a
+   business date. status closed is the live day lock; reopening flips
+   the row to voided (kept forever) and a re-close writes a NEW row.
+   snapshot_json is the frozen Z record, written once at close time. */
+CREATE TABLE closeouts (
+  id INTEGER PRIMARY KEY,
+  uuid TEXT UNIQUE,
+  site_id TEXT,
+  business_date TEXT,
+  status TEXT CHECK(status IN ('closed','voided')) DEFAULT 'closed',
+  snapshot_json TEXT,
+  expected_cash_cents INTEGER,
+  counted_cash_cents INTEGER,
+  over_short_cents INTEGER,
+  note TEXT,
+  closed_by TEXT,
+  closed_by_id INTEGER,
+  closed_at TEXT,
+  reopened_by TEXT,
+  reopened_at TEXT,
+  reopen_reason TEXT,
+  created_at TEXT
+);
+
+CREATE INDEX idx_closeouts_site_date ON closeouts(site_id, business_date, status);
+
 /* House accounts (LOCKED POLICY 2026-09-27: manager-created only).
    A house_account tender must name an existing ACTIVE account; servers
    cannot invent accounts at payment time. */

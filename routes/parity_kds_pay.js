@@ -247,10 +247,14 @@ function moneyInt(v) { return isInt(v) && v >= 0; }
 
 /* ============================ PUBLIC: guest QR ============================ */
 function registerPublic(app, ctx) {
-  const { db, SITE_ID, nowIso, crypto, persistTotals, broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents } = ctx;
+  const { db, SITE_ID, nowIso, crypto, persistTotals, broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents, dayClosedToday } = ctx;
   // Happy-hour resolver injected by the host; without it lines price at
   // the regular menu price, exactly as before.
   const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
+  // EOD freeze (audit gap #5): the host owns the close-out lock; a
+  // payment created here would be dated today, so a closed-out today
+  // refuses it. Absent the helper (older hosts), behavior is unchanged.
+  const todayClosed = typeof dayClosedToday === 'function' ? dayClosedToday : () => false;
 
   const tableByToken = (token) =>
     db.prepare('SELECT * FROM tables WHERE qr_token = ? AND site_id = ?').get(String(token || ''), SITE_ID);
@@ -461,6 +465,13 @@ function registerPublic(app, ctx) {
       });
     }
 
+    // EOD freeze: this payment would be dated today — a closed-out day
+    // takes no new money. (The cash path above creates no payment row;
+    // the staff collect step enforces the same lock when money moves.)
+    if (todayClosed()) {
+      return res.status(409).json({ error: 'This business day has been closed out — please see a staff member to finish paying', day_closed: true });
+    }
+
     // card_demo: settle now (demo tender — no real charge).
     const at = nowIso();
     const pr = db.prepare(
@@ -579,7 +590,11 @@ function registerPublic(app, ctx) {
 /* ============================ STAFF (behind auth wall) ============================ */
 function registerStaff(app, ctx) {
   const { db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
-    persistTotals, broadcastCheckUpdated, broadcastTicket, ticketView, tzDate, effectivePriceCents } = ctx;
+    persistTotals, broadcastCheckUpdated, broadcastTicket, ticketView, tzDate, effectivePriceCents, dayClosedToday, isDayClosed } = ctx;
+  // EOD freeze helpers injected by the host (audit gap #5); absent them,
+  // behavior is exactly as before.
+  const todayClosed = typeof dayClosedToday === 'function' ? dayClosedToday : () => false;
+  const dayIsClosed = typeof isDayClosed === 'function' ? isDayClosed : () => false;
   const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
   /* Business-date bucketing matches Finance payouts: the SITE-LOCAL date of
    * a timestamp (server.js tzDate), never the raw UTC date inside the stored
@@ -866,6 +881,11 @@ function registerStaff(app, ctx) {
     if (r.status !== 'requested') return res.status(400).json({ error: `Request is ${r.status}` });
     const check = db.prepare('SELECT * FROM checks WHERE id = ?').get(r.check_id);
     if (!check || check.status !== 'open') return res.status(400).json({ error: 'Check is no longer open' });
+    // EOD freeze: collecting creates a payment dated today — a
+    // closed-out day takes no new money (reopen it from Finance).
+    if (todayClosed()) {
+      return res.status(409).json({ error: 'Business day is closed out — reopen it (Finance → Close day) before collecting new payments', day_closed: true });
+    }
     const totals = persistTotals(check.id);
     if (r.amount_cents > totals.balance) {
       return res.status(400).json({ error: `Request of ${r.amount_cents}¢ exceeds the ${totals.balance}¢ balance` });
@@ -903,6 +923,12 @@ function registerStaff(app, ctx) {
       if (n > 0) return res.status(400).json({ error: `Split check ${c.id} already has payments — cannot reverse` });
     }
     const parent = members.find((c) => c.status === 'closed') || members[0];
+    // EOD freeze: reversing moves lines back into the parent check —
+    // if the parent already belongs to a closed-out business day, that
+    // day money is settled history until the day is reopened.
+    if (parent && parent.closed_at && dayIsClosed(siteDateOf(parent.closed_at))) {
+      return res.status(409).json({ error: 'That split belongs to a closed-out business day — reopen it (Finance → Close day) before reversing', day_closed: true, business_date: siteDateOf(parent.closed_at) });
+    }
     const children = members.filter((c) => c.id !== parent.id && c.status === 'open');
     const at = nowIso();
     const moveStmt = db.prepare('UPDATE check_items SET check_id = ? WHERE check_id = ?');
