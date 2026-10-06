@@ -52,6 +52,15 @@ Sections:
      checkout wired to the real math, no "calc. at confirmation").
   F  client math: oloTaxCalc extracted and run in node — fixtures
      match hand computation AND a server-placed order's tax figures.
+  G  click path: harness60_client.js drives the REAL view in node
+     behind a minimal DOM stub (no jsdom in this repo) — render, add,
+     Checkout click, slot click, Back. Pins the 2026-10-06 live find:
+     viewCheckout() assigned `h._slots = slots` onto a primitive
+     string in a 'use strict' file, throwing inside paint() before
+     innerHTML was set, so Checkout had been frozen since 154b396
+     (2026-09-25) while every API suite stayed green. With the stray
+     line restored in a scratch copy the harness fails 9/11 with that
+     exact TypeError; at HEAD it passes 11/11.
   Z  discriminating control at 686bfc4: inclusive item taxed ON TOP
      (2155), custom-rate item taxed at the site rate, no
      tax_included_cents key, no line snapshot fields, no label.
@@ -409,6 +418,29 @@ console.log(JSON.stringify(cases.map(oloTaxCalc)));
            s == 201 and money(o) == (6734, 540, 7130)
            and o.get("tax_included_cents") == cres[1]["tax_included_cents"] == 144
            and o.get("tax_cents") == cres[1]["tax_cents"], (s, o, cres))
+
+        print("--- G: click path — the real view driven end-to-end ---")
+        ok("G1 source pin: no property assignment onto the string accumulator; "
+           "the function-object slot stash remains",
+           "h._slots" not in vsrc and "viewCheckout._slots = slots;" in vsrc)
+        hout = subprocess.run(["node", str(ROOT / "qa" / "harness60_client.js")],
+                              capture_output=True, text=True)
+        hres = {}
+        for line in hout.stdout.splitlines():
+            if line.startswith("@@RESULT@@"):
+                try:
+                    hres = json.loads(line[len("@@RESULT@@"):])
+                except Exception:
+                    hres = {}
+        ok("G2 harness60 process: exit 0 with a RESULT line",
+           hout.returncode == 0 and bool(hres),
+           (hout.returncode, hout.stdout[-400:], hout.stderr[-400:]))
+        for gname in ["menu_renders_both_items", "checkout_button_appears_after_adds",
+                      "checkout_replaces_menu", "subtotal_figure_3234",
+                      "tax_figure_240", "includes_row_144", "due_figure_3330",
+                      "slot_click_uses_stash", "back_returns_to_menu_cart_kept",
+                      "no_unexpected_api_calls", "drive_completed_without_throw"]:
+            ok(f"G3 click-path: {gname}", hres.get(gname) is True, hres.get(gname))
 
         print("--- Z: discriminating control at 686bfc4 ---")
         s, o = place([{"menu_item_id": cids["incl"], "qty": 1}], "5556009001", base=CBASE)

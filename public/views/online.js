@@ -243,7 +243,6 @@ async function renderOnlineOrder(container, api) {
       <button class="olo-btn big" id="olo-place-btn" ${st.placing ? 'disabled' : ''}>${st.placing ? 'Placing…' : 'Place order'}</button>
       <div class="olo-row" style="margin-top:8px"><button class="olo-btn ghost big" id="olo-back-btn">← Back to menu</button></div>
       <p class="olo-note">No payment now — pay at pickup. No fees, ever.</p>`;
-    h._slots = slots;
     viewCheckout._slots = slots;
     return h;
   }
