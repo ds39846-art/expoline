@@ -945,7 +945,7 @@ async function renderRoute(soft) {
     if (r.view === 'clock') return renderClock(app);
     if (r.view === 'pay') return renderPay(app, r.param);
     if (r.view === 'manager') {
-      if (state.user.role !== 'manager' && !hasAnyCap(state.user, MANAGER_AREA_CAPS)) { app.innerHTML = notAuthorized('Manager area — please log in as a manager.'); return; }
+      if (!hasAnyCap(state.user, MANAGER_AREA_CAPS)) { app.innerHTML = notAuthorized('Manager area — please log in as a manager.'); return; }
       const sub = (location.hash.match(/^#\/manager\/([a-z]+)/) || [])[1];
       if (sub === 'finance') return renderFinance(app);
       if (sub === 'shift') return renderShift(app);
@@ -1045,7 +1045,7 @@ function renderLogin(app) {
    ============================================================ */
 async function renderFloor(app) {
   const role = state.user.role;
-  if (role !== 'server' && role !== 'manager') { app.innerHTML = notAuthorized(); return; }
+  if (!roleHasCap(state.user, 'floor_ops')) { app.innerHTML = notAuthorized(); return; }
   app.innerHTML = '<div class="view-head"><h1>Floor</h1><span class="spacer"></span>' +
     '<button class="btn btn-ghost btn-sm" id="floor-newtab" title="Open a bar tab — a named check with no table">New Tab</button> ' +
     '<button class="btn btn-ghost btn-sm" id="floor-merge" title="One-tap merge: fold one party into another">Merge</button> ' +
@@ -1294,7 +1294,7 @@ const STATUS_CHIP = { booked: '', seated: 'active', cancelled: 'bad', no_show: '
 
 async function renderReservations(app) {
   const role = state.user.role;
-  if (role !== 'server' && role !== 'manager') { app.innerHTML = notAuthorized(); return; }
+  if (!roleHasCap(state.user, 'floor_ops')) { app.innerHTML = notAuthorized(); return; }
   const isMgr = role === 'manager';
   let date = siteTodayLocal();
 
@@ -1549,7 +1549,7 @@ function saveStaged(checkId, staged) {
 }
 
 async function renderOrder(app, checkId) {
-  if (state.user.role !== 'server' && state.user.role !== 'manager') { app.innerHTML = notAuthorized(); return; }
+  if (!roleHasCap(state.user, 'floor_ops')) { app.innerHTML = notAuthorized(); return; }
   if (!checkId) { location.hash = '#/floor'; return; }
 
   let view;
@@ -3818,7 +3818,7 @@ function discountsForScope(list, scope) {
    VIEW: PAY (server) — line-by-line math, splits, payments, close.
    ============================================================ */
 async function renderPay(app, checkId) {
-  if (state.user.role !== 'server' && state.user.role !== 'manager') { app.innerHTML = notAuthorized(); return; }
+  if (!roleHasCap(state.user, 'floor_ops')) { app.innerHTML = notAuthorized(); return; }
   if (!checkId) { location.hash = '#/floor'; return; }
 
   let view;
@@ -4467,8 +4467,17 @@ function printReceipt(check, t, items, sc) {
 /* ============================================================
    VIEW: MANAGER (manager only)
    ============================================================ */
-function mgrGuard(app) {
-  if (!state.user || state.user.role !== 'manager') { app.innerHTML = notAuthorized('Manager area — please log in as a manager.'); return false; }
+/* Manager-area entry guard, capability-shaped like every other
+   surface since the roles batch: each subview passes the ONE
+   capability that governs its domain server-side (the same
+   requireCap factory gates its APIs), or an array when the view
+   hosts two domains (Settings = site_admin sections + the
+   admin_discounts library). With the default matrix this admits
+   exactly the manager role, as the old role test did; a matrix
+   grant/strip now moves the view exactly as it moves the API. */
+function mgrGuard(app, cap) {
+  const caps = Array.isArray(cap) ? cap : [cap];
+  if (!state.user || !hasAnyCap(state.user, caps)) { app.innerHTML = notAuthorized('Manager area — please log in as a manager.'); return false; }
   return true;
 }
 function mgrNav(active) {
@@ -4487,7 +4496,7 @@ function mgrNav(active) {
 }
 
 async function renderManager(app) {
-  if (!mgrGuard(app)) return;
+  if (!mgrGuard(app, 'finance_reports')) return;
   let o = {};
   try { o = await api('/api/manager/overview'); } catch (e) { if (handleApiError(e) === 'bounced') return; }
   const t = o.today || {};
@@ -4593,7 +4602,7 @@ async function renderPermissions(app) {
    advice — confirm with your accountant.
    ============================================================ */
 async function renderSvcChargeSettings(app) {
-  if (!mgrGuard(app)) return;
+  if (!mgrGuard(app, ['site_admin', 'admin_discounts'])) return;
   app.innerHTML = '<div class="view-head"><h1>Settings</h1></div>' + mgrNav('settings') +
     '<div class="card"><h2>Large-party service charge</h2>' +
     '<p class="muted small">A mandatory service charge is <b>restaurant revenue, not a tip</b> — it is never auto-distributed as tips and never appears in tip lines or the Tips report. In California it is part of the taxable sale (CDTFA Publication 22, Jan 2025; Annotation 550.0740). This screen is not tax or legal advice — <b>confirm with your accountant</b>.</p>' +
@@ -4784,7 +4793,7 @@ async function renderSvcChargeSettings(app) {
    clock-in. Every change lands in the approval audit below.
    ============================================================ */
 async function renderEmployees(app) {
-  if (!mgrGuard(app)) return;
+  if (!mgrGuard(app, 'clock_admin')) return;
   app.innerHTML = '<div class="view-head"><h1>Employees</h1><span class="spacer"></span>' +
     '<button class="btn btn-primary" id="emp-add">+ Add employee</button></div>' + mgrNav('employees') +
     '<div class="card"><div class="t-scroll"><table class="t-table" id="emp-table">' +
@@ -4896,7 +4905,7 @@ const FP_SNAP = 20;
 const FP_TINTS = ['fpz0', 'fpz1', 'fpz2', 'fpz3', 'fpz4', 'fpz5'];
 
 async function renderFloorPlan(app) {
-  if (!mgrGuard(app)) return;
+  if (!mgrGuard(app, 'site_admin')) return;
   const fp = { zones: [], activeZone: null, sel: null, undo: [], saved: '', nextNeg: -1 };
 
   app.innerHTML =
@@ -5295,7 +5304,7 @@ async function renderFloorPlan(app) {
    = expected payout. Tips shown separately ("tips are not taxed").
    Sales date and payout date are distinct columns. */
 async function renderFinance(app) {
-  if (!mgrGuard(app)) return;
+  if (!mgrGuard(app, 'finance_reports')) return;
   const date = await siteDate();
   app.innerHTML = '<div class="view-head"><h1>Finance &amp; Payouts</h1><span class="spacer"></span>' +
     '<input type="date" id="fin-date" value="' + date + '" aria-label="Sales date" style="min-height:44px;background:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--text)"></div>' +
@@ -5667,7 +5676,7 @@ function wireReportExports(anchorDate) {
 }
 
 async function renderShift(app) {
-  if (!mgrGuard(app)) return;
+  if (!mgrGuard(app, 'finance_reports')) return;
   const date = await siteDate();
   app.innerHTML = '<div class="view-head"><h1>Shift report</h1><span class="spacer"></span>' +
     '<input type="date" id="sh-date" value="' + date + '" aria-label="Shift date" style="min-height:44px;background:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--text)"></div>' +
@@ -5794,7 +5803,7 @@ function meActionLabel(a) {
 }
 
 async function renderMenuViewer(app) {
-  if (!mgrGuard(app)) return;
+  if (!mgrGuard(app, 'admin_menu')) return;
   const me = { cats: [], activeCat: null, showAudit: false };
 
   app.innerHTML =
@@ -6469,7 +6478,7 @@ function ckMealChip(v, seq, okFlag) {
 }
 
 async function renderTimeClock(app) {
-  if (!mgrGuard(app)) return;
+  if (!mgrGuard(app, 'clock_admin')) return;
   const defDate = await siteDate();
   app.innerHTML = '<div class="view-head"><h1>Time clock</h1><span class="spacer"></span>' +
     '<label class="muted small">Date <input type="date" id="tc-date" class="date-in" value="' + esc(defDate) + '"></label></div>' +
