@@ -71,6 +71,10 @@ const addItemFlowSrc = extractFrom(src, 'function addItemFlow(');
  * const (test40, WS-A) — extracted flows need it in scope, exactly like
  * the real module provides. */
 const meCoursesSrc = (src.match(/const ME_COURSES = \[[^\]]*\];/) || [''])[0];
+/* test54 (86 from the floor): addItemFlow consults the module-level
+ * itemIs86 tile helper at its head — extracted alongside, same as
+ * ME_COURSES above. */
+const itemIs86Src = (src.match(/const itemIs86 = \(item\) => [^;]+;/) || [''])[0];
 let holdSrc = extractFrom(src, "$('#btn-hold').onclick");
 const apiErrorSrc = (src.match(/^class ApiError .*$/m) || [])[0];
 if (!apiErrorSrc) throw new Error('ApiError class line not found');
@@ -242,6 +246,7 @@ async function main() {
     ctx.paintGuests = () => {};
     vm.runInContext('var seat = 1; var guests = 4;', ctx);
     if (meCoursesSrc) vm.runInContext(meCoursesSrc, ctx);
+    if (itemIs86Src) vm.runInContext(itemIs86Src, ctx);
     vm.runInContext(addItemFlowSrc + '\nglobalThis.__addItemFlow = addItemFlow;', ctx);
     ctx.__addItemFlow(item, catName);
     ok(prefix + '1', `addItemFlow(${item.name}): modifier modal opens (no instant stage)`,

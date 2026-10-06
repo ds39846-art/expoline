@@ -284,6 +284,9 @@ section('F. addItemFlow — course picker, seat stepper, Modify preset plumbing'
   vm.runInContext('var seat = 1; var guests = 4; var staged = []; var checkId = 4242;' +
     'function setSeat(s){ seat = s; __seatCalls.push(s); }', ctx);
   vm.runInContext(extractLine(appSrc, /const ME_COURSES = \[[^\]]*\];/, 'ME_COURSES'), ctx);
+  /* test54 (86 from the floor): addItemFlow consults the real itemIs86
+     tile helper at its head — extract the REAL line too. */
+  vm.runInContext(extractLine(appSrc, /const itemIs86 = \(item\) => [^;]+;/, 'itemIs86'), ctx);
   vm.runInContext(extractFn(appSrc, 'stageItem'), ctx);
   vm.runInContext(extractFn(appSrc, 'addItemFlow'), ctx);
   const getMenuCtx = { api: async () => payload, console };

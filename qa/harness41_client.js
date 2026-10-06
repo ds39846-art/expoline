@@ -294,6 +294,10 @@ section('K. addItemFlow — "Add to order" on add, "Save" on Modify');
   vm.runInContext('var seat = 1; var guests = 4; var staged = []; var checkId = 4242;' +
     'function setSeat(s){ seat = s; }', ctx);
   vm.runInContext(extractLine(appSrc, /const ME_COURSES = \[[^\]]*\];/, 'ME_COURSES'), ctx);
+  /* test54 (86 from the floor): addItemFlow now consults the real
+     itemIs86 tile helper at its head — extract the REAL line too, the
+     same treatment ME_COURSES gets above. */
+  vm.runInContext(extractLine(appSrc, /const itemIs86 = \(item\) => [^;]+;/, 'itemIs86'), ctx);
   vm.runInContext(extractFn(appSrc, 'stageItem'), ctx);
   vm.runInContext(extractFn(appSrc, 'addItemFlow'), ctx);
   const getMenuCtx = { api: async () => payload, console };
