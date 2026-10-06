@@ -2992,33 +2992,41 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
   if (items.length > 50) return res.status(400).json({ error: 'At most 50 lines per send-now' });
   // Validate and insert each item (same rules as POST /items)
   const insertedIds = [];
-  for (const line of items) {
+  for (let li = 0; li < items.length; li++) {
+    const line = items[li];
     const { menu_item_id, seat, qty = 1, modifiers = [], unit_price_cents, note, allergy, allergy_detail } = line || {};
     const menuItem = menu_item_id != null
       ? db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ? AND active = 1').get(menu_item_id, SITE_ID)
       : null;
-    if (!menuItem) return res.status(400).json({ error: 'Valid active menu_item_id is required' });
+    /* Per-line failures carry their line index + item name so the client
+       can name the exact staged line instead of showing a bare reason
+       the server cannot act on ("Flavor: please choose at least one" —
+       on WHICH line?). The error string itself is unchanged. */
+    const lineErr = (status, error) => res.status(status).json({
+      error, line_index: li, item_name: menuItem ? menuItem.name : null,
+    });
+    if (!menuItem) return lineErr(400, 'Valid active menu_item_id is required');
     if (!isInt(seat) || seat < 1 || seat > check.guest_count) {
-      return res.status(400).json({ error: `seat must be an integer between 1 and ${check.guest_count}` });
+      return lineErr(400, `seat must be an integer between 1 and ${check.guest_count}`);
     }
-    if (!isInt(qty) || qty < 1) return res.status(400).json({ error: 'qty must be a positive integer' });
+    if (!isInt(qty) || qty < 1) return lineErr(400, 'qty must be a positive integer');
     const rmod = resolveModifiers(menuItem.id, modifiers);
-    if (rmod.error) return res.status(400).json({ error: rmod.error });
+    if (rmod.error) return lineErr(400, rmod.error);
     let unitPrice = menuItem.price_cents;
     if (menuItem.price_cents === 0) {
-      if (req.user.role !== 'manager') return res.status(403).json({ error: 'Market-price items must be priced by a manager' });
-      if (unit_price_cents == null) return res.status(400).json({ error: 'Market-price item requires unit_price_cents' });
+      if (req.user.role !== 'manager') return lineErr(403, 'Market-price items must be priced by a manager');
+      if (unit_price_cents == null) return lineErr(400, 'Market-price item requires unit_price_cents');
       unitPrice = unit_price_cents;
     }
     let ln = null;
     if (note !== undefined && note !== null) {
-      if (typeof note !== 'string' || note.length > 140) return res.status(400).json({ error: 'note must be ≤140 chars' });
+      if (typeof note !== 'string' || note.length > 140) return lineErr(400, 'note must be ≤140 chars');
       ln = note.trim() || null;
     }
     const alg = allergy ? 1 : 0;
     let algD = null;
     if (allergy_detail !== undefined && allergy_detail !== null) {
-      if (typeof allergy_detail !== 'string' || allergy_detail.length > 140) return res.status(400).json({ error: 'allergy_detail must be ≤140 chars' });
+      if (typeof allergy_detail !== 'string' || allergy_detail.length > 140) return lineErr(400, 'allergy_detail must be ≤140 chars');
       algD = allergy_detail.trim() || null;
     }
     /* Ring-time course, same contract as POST /items: absent → the menu
@@ -3026,7 +3034,7 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
     let lineCourse = menuItem.course;
     if (line && line.course !== undefined) {
       if (line.course !== null && !COURSES.has(line.course)) {
-        return res.status(400).json({ error: 'course must be one of drink|appetizer|entree|dessert' });
+        return lineErr(400, 'course must be one of drink|appetizer|entree|dessert');
       }
       lineCourse = line.course;
     }

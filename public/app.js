@@ -446,8 +446,20 @@ async function flushOutboxLegacy(ops) {
           const cid = idmap[p.check_id] || p.check_id;
           if (o.op === 'add_items') {
             for (const it of (p.items || [])) {
-              const r = await rawApi('/api/checks/' + cid + '/items', 'POST',
-                { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers || [] });
+              let r;
+              try {
+                r = await rawApi('/api/checks/' + cid + '/items', 'POST',
+                  { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers || [] });
+              } catch (ie) {
+                /* Name the queued line the server rejected before the
+                   flush stops on it — the old shape stopped silently, so
+                   the failure surfaced nowhere and the server never
+                   learned which line never reached the check. */
+                if (ie instanceof ApiError && ie.status === 400) {
+                  toast((it.name || 'A queued item') + (it.seat ? ' (Seat ' + it.seat + ')' : '') + ' needs attention: ' + (ie.message || 'sync failed'), 'err');
+                }
+                throw ie;
+              }
               const iid = r && (r.id || (r.item && r.item.id));
               if (it.temp_id && iid) { idmap[it.temp_id] = iid; }
             }
@@ -1650,7 +1662,7 @@ async function renderOrder(app, checkId) {
       '<div class="field"><label class="check-line"><input type="checkbox" id="m-allergy"' + (preset && preset.allergy ? ' checked' : '') + '> ⚠️ Allergy alert for this item</label>' +
       '<input type="text" id="m-allergy-detail" maxlength="140" value="' + esc((preset && preset.allergy_detail) || '') + '" placeholder="Allergy detail (optional)" autocomplete="off" style="' + (preset && preset.allergy ? '' : 'display:none;') + 'margin-top:6px"></div>' +
       '<div class="modal-actions"><button class="btn btn-ghost" data-x="cancel">Cancel</button>' +
-      '<button class="btn btn-primary" data-x="add">Add to order</button></div>');
+      '<button class="btn btn-primary" data-x="add">' + (preset ? 'Save' : 'Add to order') + '</button></div>');
     $('[data-q="dec"]', bd).onclick = () => { qty = Math.max(1, qty - 1); delete $('#m-qty', bd).dataset.editing; $('#m-qty', bd).textContent = qty; };
     $('[data-q="inc"]', bd).onclick = () => { qty = Math.min(24, qty + 1); delete $('#m-qty', bd).dataset.editing; $('#m-qty', bd).textContent = qty; };
     /* Tap-to-type on the quantity — same local qty the steppers drive. */
@@ -1841,8 +1853,16 @@ async function renderOrder(app, checkId) {
         const editBtn = (kind !== 'staged' && (ref.state === 'held' || ref.state === 'sent'))
           ? '<button class="icon-btn" data-edit="' + esc(String(ref.id)) + '" aria-label="Edit item" title="Edit item (fired items need manager PIN)">✎</button>'
           : '';
-        const lineHtml = '<div class="cart-line' + (quickKey === selKey ? ' qsel' : '') + '" data-line="' + esc(selKey) + '">' + selBox + '<div class="nm">' + esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '') +
-          (mods ? '<span class="mods">' + mods + '</span>' : '') + courseHtml + noteHtml + allergyHtml + '</div>' + pill +
+        /* Line summary segments join with a real space: the note and
+           allergy spans are inline, so bare concatenation rendered them
+           run together as one blob (note text fused to the allergy
+           flag). Block segments (mods, course) ignore the extra space. */
+        const nmSegs = [esc(ref.name) + (ref.qty > 1 ? ' <span class="qty">×' + ref.qty + '</span>' : '')];
+        if (mods) nmSegs.push('<span class="mods">' + mods + '</span>');
+        if (courseHtml) nmSegs.push(courseHtml);
+        if (noteHtml) nmSegs.push(noteHtml);
+        if (allergyHtml) nmSegs.push(allergyHtml);
+        const lineHtml = '<div class="cart-line' + (quickKey === selKey ? ' qsel' : '') + '" data-line="' + esc(selKey) + '">' + selBox + '<div class="nm">' + nmSegs.join(' ') + '</div>' + pill +
           '<span class="pr">' + fmt(lineTotal) + '</span>' + editBtn + refireBtn + voidBtn + '</div>';
         /* Quick-action bar: tapping the line opens qty/seat steppers plus
            Repeat / Void / Modify directly under it — qty and seat apply in
@@ -2302,6 +2322,7 @@ async function renderOrder(app, checkId) {
         const rid = realId(checkId);
         const heldIds = new Set();
         let failure = null;
+        let failLine = null;
         for (const it of items) {
           try {
             const body = { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers,
@@ -2309,7 +2330,7 @@ async function renderOrder(app, checkId) {
             if (it.course !== undefined) body.course = it.course;
             await api('/api/checks/' + rid + '/items', 'POST', body);
             heldIds.add(it.temp_id);
-          } catch (e) { failure = e; break; }
+          } catch (e) { failure = e; failLine = it; break; }
         }
         staged = staged.filter((s) => !heldIds.has(s.temp_id));
         saveStaged(checkId, staged);
@@ -2318,8 +2339,15 @@ async function renderOrder(app, checkId) {
         } else if (failure instanceof ApiError && (failure.status === 401 || failure.status === 403)) {
           handleApiError(failure);
         } else {
-          const left = staged.length;
-          toast((heldIds.size ? heldIds.size + ' held · ' : '') + left + ' need' + (left === 1 ? 's' : '') + ' attention: ' + (failure.message || 'request failed'), 'err');
+          /* Name the ONE line the server actually rejected. Lines after
+             it were never attempted — they are still staged, not in need
+             of attention. (The old toast counted every remaining staged
+             line as bad and named none: one flavorless Edamame in a
+             five-line order read as "5 need attention".) */
+          const nm = failLine ? (failLine.name + (failLine.seat ? ' (Seat ' + failLine.seat + ')' : '')) : 'One line';
+          const rest = staged.length - (failLine ? 1 : 0);
+          toast((heldIds.size ? heldIds.size + ' held · ' : '') + nm + ' needs attention: ' + (failure.message || 'request failed') +
+            (rest > 0 ? ' · ' + rest + ' more line' + (rest === 1 ? '' : 's') + ' still staged' : ''), 'err');
         }
       }
     } catch (e) { handleApiError(e); }
@@ -2391,7 +2419,16 @@ async function renderOrder(app, checkId) {
       const r = await api('/api/checks/' + realId(checkId) + '/send-now', 'POST', { items });
       staged = []; saveStaged(checkId, staged);
       toast('Sent now — ' + (r.sent || 0) + ' line' + ((r.sent || 0) === 1 ? '' : 's') + ' fired', 'ok');
-    } catch (e) { handleApiError(e); }
+    } catch (e) {
+      /* A rejected line is named, not just described: the server tags a
+         per-line validation failure with its line index, so the toast
+         can point at the exact staged line the kitchen never got. */
+      const li = (e instanceof ApiError && e.body && Number.isInteger(e.body.line_index)) ? e.body.line_index : -1;
+      const bad = li >= 0 ? staged[li] : null;
+      if (bad && e.status === 400) {
+        toast(bad.name + (bad.seat ? ' (Seat ' + bad.seat + ')' : '') + ' needs attention: ' + (e.message || 'request failed'), 'err');
+      } else handleApiError(e);
+    }
     renderRoute(true);
   };
 
