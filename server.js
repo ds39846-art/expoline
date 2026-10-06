@@ -167,6 +167,20 @@ db.exec('PRAGMA busy_timeout=5000;');
   if (!ccols.has('tax_exempt')) db.exec('ALTER TABLE checks ADD COLUMN tax_exempt INTEGER DEFAULT 0');
 })();
 
+/* Revenue centers (Toast/SpotOn parity): checks.center_label snapshots
+   the check's revenue center — its table's zone name, or its service
+   channel for table-less checks — at CLOSE time (stampCheckCenter,
+   below). Snapshot discipline per the tax batch: zones can be renamed
+   and tables re-zoned or deleted after a check closes, and report-time
+   derivation would silently rewrite (or orphan) closed-day history.
+   NULL = legacy (closed before this batch): the sales report derives
+   the label from the table's CURRENT zone at read time; the fallback
+   is documented in the sales report notes. */
+(() => {
+  const ccols = new Set(db.prepare('PRAGMA table_info(checks)').all().map((c) => c.name));
+  if (!ccols.has('center_label')) db.exec('ALTER TABLE checks ADD COLUMN center_label TEXT');
+})();
+
 /* Discount library (audit gap #4): manager-defined named discounts and
    their per-check applications. Definitions are a real table (the
    menu_items precedent — independently CRUD'd named entities that
@@ -1373,6 +1387,52 @@ function checkLocationLabel(tableRow, chk) {
   return chk.tab_name || null;
 }
 
+/* ------------------------- revenue centers -------------------------
+ * The ONE derivation rule, shared by the close-time stamp and the
+ * report-time legacy fallback. A bar tab is its own center ("Bar
+ * Tabs"), never the Bar ZONE: a zone is a physical area, a tab is a
+ * service channel, and the GM adds them if they want a bar total.
+ * Table checks land in their table's zone — including guest-QR checks,
+ * whose revenue happened at that table. The kiosk's virtual table
+ * (label 'KIOSK', zone_id NULL, channel left 'dine_in' by its INSERT)
+ * is the one table that maps to a channel center instead. A check
+ * whose table was deleted (or never had one and matches no channel)
+ * lands in 'Unassigned' — history keeps a bucket, it never vanishes. */
+const CHANNEL_CENTERS = { bar_tab: 'Bar Tabs', delivery: 'Delivery', qr_guest: 'Guest', kiosk: 'Kiosk', online: 'Online', takeout: 'Takeout' };
+const CENTER_ORDER_TAIL = ['Bar Tabs', 'Kiosk', 'Delivery', 'Guest', 'Online', 'Takeout', 'Unassigned'];
+
+function centerLabelFrom(check, table, zone) {
+  if (!check) return 'Unassigned';
+  if (check.channel === 'bar_tab') return 'Bar Tabs';
+  if (check.table_id != null) {
+    if (table && table.label === 'KIOSK') return 'Kiosk';
+    if (zone && zone.name) return zone.name;
+    return 'Unassigned';
+  }
+  return CHANNEL_CENTERS[check.channel || 'dine_in'] || 'Unassigned';
+}
+
+/** Freeze a check's revenue center. Called by EVERY path that stamps
+ *  closed_at (staff close; split / split-item-cost / merge source-empty
+ *  closes; guest split + split-reverse closes; LAN brain close) so the
+ *  label reflects the table the check sat on when it closed — a check
+ *  moved while open lands in its DESTINATION zone. Unconditional: a
+ *  reopened check re-derives at its next close. */
+function stampCheckCenter(dbh, checkId) {
+  const check = dbh.prepare('SELECT * FROM checks WHERE id = ?').get(checkId);
+  if (!check) return null;
+  let table = null, zone = null;
+  if (check.table_id != null) {
+    table = dbh.prepare('SELECT * FROM tables WHERE id = ?').get(check.table_id) || null;
+    if (table && table.zone_id != null) {
+      zone = dbh.prepare('SELECT * FROM zones WHERE id = ?').get(table.zone_id) || null;
+    }
+  }
+  const label = centerLabelFrom(check, table, zone);
+  dbh.prepare('UPDATE checks SET center_label = ? WHERE id = ?').run(label, checkId);
+  return label;
+}
+
 // Canonical KDS station slugs; accepts display names too ("Expediter", "Garde Manger", ...)
 const KDS_STATION_SLUGS = ['bar', 'expediter', 'garde_manger', 'dessert'];
 function canonStation(s) {
@@ -1787,7 +1847,7 @@ app.use((req, res, next) => {
 parityKdsPay.registerPublic(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse,
   broadcastTicket, ticketView, broadcastCheckUpdated, broadcastMenuUpdated, effectivePriceCents,
-  taxSnapshotOf,
+  taxSnapshotOf, stampCheckCenter,
   dayClosedToday,
 });
 
@@ -1805,7 +1865,7 @@ const lanRuntime = (() => {
     helpers: {
       persistTotals, checkResponse, ticketView, checkLocationLabel,
       broadcastTicket, broadcastCheckUpdated, broadcastMenuUpdated,
-      auditApproval, auditMenu, effectivePriceCents, dayClosedToday,
+      auditApproval, auditMenu, effectivePriceCents, dayClosedToday, stampCheckCenter,
       verifyManagerPin, verifyOfflineApproval, consumeOfflineApproval,
       parseJson, crypto,
     },
@@ -4448,6 +4508,7 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
     ).get(check.id).n;
     if (remaining === 0) {
       db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(now, check.id);
+      stampCheckCenter(db, check.id);
     }
     persistTotals(check.id);
     broadcastCheckUpdated(check.id);
@@ -4641,6 +4702,7 @@ app.post('/api/checks/:id/split-item-cost', serverPlus(), (req, res) => {
       ).get(check.id).n;
       if (remaining === 0) {
         db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(now, check.id);
+        stampCheckCenter(db, check.id);
         persistTotals(check.id);
       }
     }
@@ -5014,6 +5076,7 @@ app.post('/api/checks/:id/close', serverPlus(), (req, res) => {
     return res.status(400).json({ error: `Cannot close: outstanding balance of ${totals.balance}¢ remains` });
   }
   db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(nowIso(), check.id);
+  stampCheckCenter(db, check.id);
   broadcastCheckUpdated(check.id);
   res.json(checkResponse(check.id));
 });
@@ -5534,7 +5597,9 @@ const REPORT_DEFS = {
     title: 'Sales summary',
     notes: ['Net sales = gross + surcharge + service charge − comps.', 'Tips are not sales and are not taxed.',
       'The mandatory service charge is restaurant revenue (NOT a tip): it is never auto-distributed to staff and never appears in tip lines or the Tips report.',
-      'Tax treatment follows CA CDTFA guidance for mandatory service charges (Publication 22, Jan 2025; Annotation 550.0740). Expoline is not giving tax advice — confirm with your accountant.'],
+      'Tax treatment follows CA CDTFA guidance for mandatory service charges (Publication 22, Jan 2025; Annotation 550.0740). Expoline is not giving tax advice — confirm with your accountant.',
+      'Revenue centers: every check in this report belongs to exactly ONE center, so the Revenue centers rows sum exactly to the day row on every figure. A table check belongs to its table\'s zone, snapshotted onto the check when it closes — later zone renames, table re-zones and table deletions never rewrite it, and a check moved between tables while open lands in the zone it closed in. Bar tabs are their own center ("Bar Tabs"), not the Bar zone: a zone is a physical area, a tab is a service channel — add the two if you want a combined bar figure. Kiosk, delivery and other table-less checks report under their channel.',
+      'Checks closed before revenue centers shipped carry no snapshot: they are attributed by their table\'s CURRENT zone, so renaming a zone or re-zoning a table does restate those legacy checks (and only those). Web online orders are not checks — they never enter this report (see Online orders).'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'checks', label: 'Checks', kind: 'int' },
@@ -5557,25 +5622,92 @@ const REPORT_DEFS = {
         if (!payByCheck.has(p.check_id)) payByCheck.set(p.check_id, []);
         payByCheck.get(p.check_id).push(p);
       }
+      /* Revenue centers accumulate in the SAME pass over the SAME
+       * population with the SAME persistTotals values as the day row —
+       * that identity is what makes the cross-foot exact by
+       * construction, not by reconciliation. The center label is the
+       * close-time snapshot when present, else the legacy derivation
+       * from the table's current zone (see notes). */
+      const tableByIdC = new Map(db.prepare('SELECT * FROM tables WHERE site_id = ?').all(SITE_ID).map((t) => [t.id, t]));
+      const zoneByIdC = new Map(db.prepare('SELECT * FROM zones WHERE site_id = ?').all(SITE_ID).map((z) => [z.id, z]));
+      const centerOrder = [...zoneByIdC.values()].sort((a, b) => ((a.sort || 0) - (b.sort || 0)) || (a.id - b.id)).map((z) => z.name)
+        .concat(CENTER_ORDER_TAIL);
+      const centerRows = [];
       const rows = eachDate(from, to).map((date) => {
         const r = { date, checks: 0, covers: 0, gross_cents: 0, surcharge_cents: 0, service_cents: 0, comp_cents: 0, net_cents: 0, tax_cents: 0, tips_cents: 0, cash_cents: 0, card_cents: 0 };
+        const centerAcc = new Map();
         for (const c of checks) {
           if (tzDate(c.closed_at) !== date) continue;
           const t = persistTotals(c.id);
+          let pTips = 0, pCash = 0, pCard = 0;
+          for (const p of (payByCheck.get(c.id) || [])) {
+            pTips += p.tip_cents || 0;
+            const net = p.amount_cents - (p.refunded_cents || 0);
+            if (p.method === 'cash' || p.method === 'gift_card') pCash += net;
+            else if (p.method === 'card_demo') pCard += net;
+          }
           r.checks++; r.covers += c.guest_count || 0;
           r.gross_cents += t.subtotal; r.surcharge_cents += t.surcharge; r.service_cents += t.service_charge;
           r.comp_cents += t.comp; r.tax_cents += t.tax;
-          for (const p of (payByCheck.get(c.id) || [])) {
-            r.tips_cents += p.tip_cents || 0;
-            const net = p.amount_cents - (p.refunded_cents || 0);
-            if (p.method === 'cash' || p.method === 'gift_card') r.cash_cents += net;
-            else if (p.method === 'card_demo') r.card_cents += net;
+          r.tips_cents += pTips; r.cash_cents += pCash; r.card_cents += pCard;
+          const tbl = c.table_id != null ? (tableByIdC.get(c.table_id) || null) : null;
+          const zn = tbl && tbl.zone_id != null ? (zoneByIdC.get(tbl.zone_id) || null) : null;
+          const center = c.center_label || centerLabelFrom(c, tbl, zn);
+          let b = centerAcc.get(center);
+          if (!b) {
+            b = { date, center, checks: 0, covers: 0, gross_cents: 0, item_discounts_cents: 0, surcharge_cents: 0, service_cents: 0, comp_cents: 0, net_cents: 0, tax_cents: 0, tax_included_cents: 0, tips_cents: 0, cash_cents: 0, card_cents: 0 };
+            centerAcc.set(center, b);
           }
+          b.checks++; b.covers += c.guest_count || 0;
+          b.gross_cents += t.subtotal; b.item_discounts_cents += t.item_discount_cents || 0;
+          b.surcharge_cents += t.surcharge; b.service_cents += t.service_charge;
+          b.comp_cents += t.comp; b.tax_cents += t.tax; b.tax_included_cents += t.tax_included_cents || 0;
+          b.net_cents += t.subtotal + t.surcharge + t.service_charge - t.comp;
+          b.tips_cents += pTips; b.cash_cents += pCash; b.card_cents += pCard;
         }
         r.net_cents = r.gross_cents + r.surcharge_cents + r.service_cents - r.comp_cents;
+        const ordered = [...centerAcc.values()].sort((a, b2) => {
+          const ia = centerOrder.indexOf(a.center), ib = centerOrder.indexOf(b2.center);
+          const ka = ia === -1 ? centerOrder.length : ia, kb = ib === -1 ? centerOrder.length : ib;
+          return (ka - kb) || (a.center < b2.center ? -1 : a.center > b2.center ? 1 : 0);
+        });
+        for (const b of ordered) centerRows.push(b);
         return r;
       });
-      return { rows, extraTables: [] };
+      const extraTables = [];
+      if (centerRows.length) {
+        const sum = (k) => centerRows.reduce((a, x) => a + x[k], 0);
+        extraTables.push({
+          title: 'Revenue centers',
+          columns: [
+            { key: 'date', label: 'Date', kind: 'date' },
+            { key: 'center', label: 'Center', kind: 'text' },
+            { key: 'checks', label: 'Checks', kind: 'int' },
+            { key: 'covers', label: 'Covers', kind: 'int' },
+            { key: 'gross_cents', label: 'Gross sales', kind: 'money' },
+            { key: 'item_discounts_cents', label: 'Item discounts', kind: 'money' },
+            { key: 'surcharge_cents', label: 'Surcharge', kind: 'money' },
+            { key: 'service_cents', label: 'Service charge', kind: 'money' },
+            { key: 'comp_cents', label: 'Comps', kind: 'money' },
+            { key: 'net_cents', label: 'Net sales', kind: 'money' },
+            { key: 'tax_cents', label: 'Tax', kind: 'money' },
+            { key: 'tax_included_cents', label: 'Tax included in prices', kind: 'money' },
+            { key: 'tips_cents', label: 'Tips', kind: 'money' },
+            { key: 'cash_cents', label: 'Cash sales', kind: 'money' },
+            { key: 'card_cents', label: 'Card sales', kind: 'money' },
+          ],
+          rows: centerRows,
+          totals: {
+            label: 'Total',
+            checks: sum('checks'), covers: sum('covers'), gross_cents: sum('gross_cents'),
+            item_discounts_cents: sum('item_discounts_cents'), surcharge_cents: sum('surcharge_cents'),
+            service_cents: sum('service_cents'), comp_cents: sum('comp_cents'), net_cents: sum('net_cents'),
+            tax_cents: sum('tax_cents'), tax_included_cents: sum('tax_included_cents'),
+            tips_cents: sum('tips_cents'), cash_cents: sum('cash_cents'), card_cents: sum('card_cents'),
+          },
+        });
+      }
+      return { rows, extraTables };
     },
   },
   payouts: {
@@ -6196,7 +6328,13 @@ function closeoutView(r, full) {
  *  discounts) and the cash count. cash = {expected, counted} computed by
  *  the caller so the stored row and the snapshot can never disagree. */
 function buildZSnapshot(date, cash) {
-  const salesRow = REPORT_DEFS.sales.build(date, date).rows[0];
+  const salesData = REPORT_DEFS.sales.build(date, date);
+  const salesRow = salesData.rows[0];
+  /* Revenue centers ride the SAME sales build pass (verbatim rows of
+   * the Revenue centers extraTable for this date) — the stored Z can
+   * never disagree with the live report for the day it froze. */
+  const rcTable = (salesData.extraTables || []).find((t) => t.title === 'Revenue centers');
+  const revenueCenters = rcTable ? rcTable.rows : [];
   const taxRow = REPORT_DEFS.tax.build(date, date).rows[0];
   const payoutsRow = payoutDay(date);
   const tipsData = REPORT_DEFS.tips.build(date, date);
@@ -6214,6 +6352,7 @@ function buildZSnapshot(date, cash) {
   return {
     business_date: date,
     sales: salesRow,
+    revenue_centers: revenueCenters,
     tax: taxRow,
     payouts: payoutsRow,
     tips: {
@@ -9478,13 +9617,13 @@ require('./routes/insights').register(app, {
 parityKdsPay.registerStaff(app, {
   db, SITE_ID, gateSiteAdmin, gateFinanceReports, gateRefunds, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
   persistTotals, checkResponse, broadcastCheckUpdated, broadcastMenuUpdated, broadcastTicket, ticketView,
-  effectivePriceCents, taxSnapshotOf, dayClosedToday, isDayClosed,
+  effectivePriceCents, taxSnapshotOf, stampCheckCenter, dayClosedToday, isDayClosed,
 });
 /* Phase 3A competitor parity: order & check flow (dayparts, timers, guest
    names, fired-item edits, merge, move). */
 parityOrders.register(app, {
   db, SITE_ID, SITE_TZ, gateAdminMenu, gateSiteAdmin, serverPlus, nowIso, crypto,
-  persistTotals, checkResponse, itemView, ticketView, broadcastCheckUpdated,
+  persistTotals, checkResponse, itemView, ticketView, broadcastCheckUpdated, stampCheckCenter,
   broadcastTicketUpdated, auditApproval, getConfig, parseJson, isInt,
   withTransaction, verifyManagerPin, cleanLabel, validateModifiers,
   actorName: (req) => (req.user && req.user.name) || '?',

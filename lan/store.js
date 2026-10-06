@@ -461,6 +461,7 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       const totals = h.persistTotals(checkId);
       if (totals.balance > 0) return { ok: false, error: 'outstanding_balance', balance_cents: totals.balance };
       db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(nowIso(), checkId);
+      if (h && typeof h.stampCheckCenter === 'function') h.stampCheckCenter(db, checkId);
       h.broadcastCheckUpdated(checkId);
       return { ok: true, check_id: checkId };
     }

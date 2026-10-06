@@ -5180,9 +5180,10 @@ async function renderFinance(app) {
     body.innerHTML = '<p class="muted">Loading reconciliation…</p>';
     try {
       const r = await api('/api/finance/payouts?date=' + encodeURIComponent(d));
-      body.innerHTML = financeHtml(r, d) + '<div id="pm-section"></div>' + '<div id="z-section"></div>';
+      body.innerHTML = financeHtml(r, d) + '<div id="pm-section"></div>' + '<div id="rc-section"></div>' + '<div id="z-section"></div>';
       wireReportExports(d);
       wireProductMix(d);
+      wireRevenueCenters(d);
       wireCloseout(d);
     } catch (e) { if (handleApiError(e) !== 'bounced') body.innerHTML = '<div class="empty">Could not load payouts.</div>'; }
   };
@@ -5232,6 +5233,11 @@ async function wireCloseout(date) {
       '<tr><td>Counted cash</td><td class="num">' + fmt(c.counted_cash_cents || 0) + '</td></tr>' +
       '<tr class="result"><td>Over / short</td><td class="num ' + (c.over_short_cents > 0 ? 'pos' : (c.over_short_cents < 0 ? 'neg' : '')) + '">' + (c.over_short_cents > 0 ? '+' : '') + fmt(c.over_short_cents || 0) + '</td></tr>' +
       '</table>' +
+      (Array.isArray(s.revenue_centers) && s.revenue_centers.length
+        ? '<h3 style="margin-top:14px">Revenue centers</h3><table class="fin-table">' +
+          s.revenue_centers.map((rc) => '<tr><td>' + esc(rc.center) + ' <span class="lbl-note">' + (rc.checks || 0) + ' checks</span></td><td class="num">' + fmt(rc.net_cents || 0) + '</td></tr>').join('') +
+          '</table>'
+        : '') +
       '<p class="muted small">Open checks carried over at close: ' + (s.open_checks_carried ? s.open_checks_carried.count : 0) +
       '. This day is locked — refunds, tip changes and new payments dated to it are refused until it is reopened.</p>' +
       '<div class="modal-actions"><button class="btn btn-ghost" id="z-reopen">Reopen day</button></div>' + listHtml + '</div>';
@@ -5446,6 +5452,37 @@ function productMixHtml(r) {
     '</div>';
 }
 
+
+/* Revenue centers for the selected day: the sales report's
+   "Revenue centers" breakdown (zone per table check; bar tabs, kiosk
+   and delivery are their own centers). The rows sum exactly to the
+   day row — the Total line below is summed from the same rows the
+   server cross-footed, never re-derived a second way. */
+async function wireRevenueCenters(date) {
+  const sec = document.getElementById('rc-section');
+  if (!sec) return;
+  sec.innerHTML = '<div class="card" style="margin-top:18px"><h2>Revenue centers</h2><div id="rc-body"><p class="muted">Loading…</p></div></div>';
+  const body = document.getElementById('rc-body');
+  try {
+    const r = await api('/api/finance/reports/sales?format=json&period=day&date=' + encodeURIComponent(date));
+    const t = (r.extraTables || []).find((x) => x.title === 'Revenue centers');
+    const rows = t ? (t.rows || []).filter((x) => x.date === date) : [];
+    if (!rows.length) { body.innerHTML = '<p class="muted small">No closed checks on this date yet.</p>'; return; }
+    const sum = (k) => rows.reduce((a, x) => a + (x[k] || 0), 0);
+    body.innerHTML = '<table class="fin-table"><thead><tr><th>Center</th><th class="num">Checks</th>' +
+      '<th class="num">Gross</th><th class="num">Comps</th><th class="num">Net sales</th><th class="num">Tax</th><th class="num">Tips</th></tr></thead><tbody>' +
+      rows.map((x) => '<tr><td>' + esc(x.center) + '</td><td class="num">' + (x.checks || 0) + '</td>' +
+        '<td class="num">' + fmt(x.gross_cents || 0) + '</td><td class="num">' + fmt(x.comp_cents || 0) + '</td>' +
+        '<td class="num">' + fmt(x.net_cents || 0) + '</td><td class="num">' + fmt(x.tax_cents || 0) + '</td>' +
+        '<td class="num">' + fmt(x.tips_cents || 0) + '</td></tr>').join('') +
+      '<tr class="result"><td>Total</td><td class="num">' + sum('checks') + '</td>' +
+      '<td class="num">' + fmt(sum('gross_cents')) + '</td><td class="num">' + fmt(sum('comp_cents')) + '</td>' +
+      '<td class="num">' + fmt(sum('net_cents')) + '</td><td class="num">' + fmt(sum('tax_cents')) + '</td>' +
+      '<td class="num">' + fmt(sum('tips_cents')) + '</td></tr>' +
+      '</tbody></table>' +
+      '<p class="muted small">Bar tabs are their own center, not the Bar zone — add the two for a combined bar figure. Full detail (item discounts, cash/card split) is in the Sales summary export.</p>';
+  } catch (e) { if (handleApiError(e) !== 'bounced') body.innerHTML = '<div class="empty">Could not load revenue centers.</div>'; }
+}
 
 async function downloadReportBlob(fmt) {
   const rq = repQuery();

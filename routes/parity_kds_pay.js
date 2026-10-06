@@ -257,6 +257,9 @@ function moneyInt(v) { return isInt(v) && v >= 0; }
 /* ============================ PUBLIC: guest QR ============================ */
 function registerPublic(app, ctx) {
   const { db, SITE_ID, nowIso, crypto, persistTotals, broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents, dayClosedToday } = ctx;
+  // Revenue-center stamp at close (host-injected); absent it, checks
+  // simply derive their center at report time like legacy checks.
+  const stampCenter = typeof ctx.stampCheckCenter === 'function' ? (id) => ctx.stampCheckCenter(db, id) : () => {};
   // Menu-refresh push for countdown flips this surface causes; older
   // hosts without it simply skip the push.
   const pushMenu = typeof ctx.broadcastMenuUpdated === 'function' ? ctx.broadcastMenuUpdated : () => {};
@@ -575,7 +578,7 @@ function registerPublic(app, ctx) {
       const remaining = db.prepare(
         "SELECT COUNT(*) AS n FROM check_items WHERE check_id = ? AND state IN ('held','sent','fulfilled')"
       ).get(check.id).n;
-      if (remaining === 0) db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(at, check.id);
+      if (remaining === 0) { db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(at, check.id); stampCenter(check.id); }
       persistTotals(check.id);
       broadcastCheckUpdated(check.id);
       db.prepare('COMMIT').run();
@@ -701,6 +704,7 @@ function tipoutReport(db, SITE_ID, date, siteDateOf) {
 function registerStaff(app, ctx) {
   const { db, SITE_ID, gateSiteAdmin, gateFinanceReports, gateRefunds, serverPlus, kitchenPlus, nowIso, crypto,
     persistTotals, broadcastCheckUpdated, broadcastTicket, ticketView, tzDate, effectivePriceCents, dayClosedToday, isDayClosed } = ctx;
+  const stampCenter = typeof ctx.stampCheckCenter === 'function' ? (id) => ctx.stampCheckCenter(db, id) : () => {};
   // EOD freeze helpers injected by the host (audit gap #5); absent them,
   // behavior is exactly as before.
   const todayClosed = typeof dayClosedToday === 'function' ? dayClosedToday : () => false;
@@ -984,6 +988,7 @@ function registerStaff(app, ctx) {
       for (const c of children) {
         moveStmt.run(parent.id, c.id);
         db.prepare("UPDATE checks SET status = 'closed', closed_at = ?, split_group = NULL WHERE id = ?").run(at, c.id);
+        stampCenter(c.id);
         broadcastCheckUpdated(c.id);
       }
       db.prepare("UPDATE checks SET status = 'open', closed_at = NULL, split_group = NULL WHERE id = ?").run(parent.id);

@@ -560,6 +560,7 @@ function register(app, ctx) {
         guestCount += s.guest_count;
         if (!tabName && s.tab_name) tabName = s.tab_name;
         db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(now, s.id);
+        if (typeof ctx.stampCheckCenter === 'function') ctx.stampCheckCenter(db, s.id);
         // Open KDS tickets from the absorbed checks re-point at the surviving table.
         const openTickets = db.prepare(
           "SELECT id FROM kds_tickets WHERE check_id = ? AND site_id = ? AND status IN ('new','in_progress')"
