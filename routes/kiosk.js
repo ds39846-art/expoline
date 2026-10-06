@@ -174,6 +174,13 @@ function register(app, ctx) {
   // next broadcast from any other path).
   const pushMenu = typeof ctx.broadcastMenuUpdated === 'function' ? ctx.broadcastMenuUpdated : () => {};
   const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
+  /* Tax snapshot (gap #9): freeze the item's rate/inclusive setting on
+     the line at ring time, like the price. Host-injected; the local
+     fallback is the identical computation for standalone hosts. */
+  const taxSnapOf = typeof ctx.taxSnapshotOf === 'function' ? ctx.taxSnapshotOf : (src) => {
+    const ok = !!src && Number.isInteger(src.tax_rate_bps) && src.tax_rate_bps >= 0 && src.tax_rate_bps <= 10000;
+    return { tax_rate_bps: ok ? src.tax_rate_bps : null, tax_inclusive: src && src.tax_inclusive ? 1 : 0 };
+  };
   // serverPlus is required: the staff-facing call-flag endpoints below must
   // reject unauthenticated/wrong-role callers server-side.
   if (typeof serverPlus !== 'function') throw new Error('kiosk.register requires ctx.serverPlus');
@@ -315,13 +322,14 @@ function register(app, ctx) {
       ).run(crypto.randomUUID(), SITE_ID, kioskTable.id, customerName ? `Kiosk · ${customerName}` : 'Kiosk', at).lastInsertRowid;
 
       const insItem = db.prepare(
-        "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at, sent_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, 'sent', ?, ?)"
+        "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, tax_rate_bps, tax_inclusive, modifiers_json, course, state, added_at, sent_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'sent', ?, ?)"
       );
       const byStation = new Map();
       for (const ln of lines) {
+        const taxSnap = taxSnapOf(ln.menuItem);
         const r = insItem.run(
           crypto.randomUUID(), checkId, ln.menuItem.id, ln.qty,
-          effPrice ? effPrice(ln.menuItem) : ln.menuItem.price_cents, JSON.stringify(ln.modifiers), ln.menuItem.course, at, at
+          effPrice ? effPrice(ln.menuItem) : ln.menuItem.price_cents, taxSnap.tax_rate_bps, taxSnap.tax_inclusive, JSON.stringify(ln.modifiers), ln.menuItem.course, at, at
         );
         const station = ln.menuItem.station || 'expediter';
         if (!byStation.has(station)) byStation.set(station, []);

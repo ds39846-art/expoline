@@ -698,6 +698,10 @@ async function getMenu() {
          the effective price (what the server will charge right now) and
          stageItem stages it, so screen, modal and cart always agree. */
       hh_price_cents: i.hh_price_cents != null ? i.hh_price_cents : null,
+      /* Tax breadth rides through too (gap #9): without these the order
+         screen could not know an item's rate or inclusive pricing. */
+      tax_rate_bps: i.tax_rate_bps != null ? i.tax_rate_bps : null,
+      tax_inclusive: !!i.tax_inclusive,
       effective_price_cents: i.effective_price_cents != null ? i.effective_price_cents
         : (i.price_cents != null ? i.price_cents : Math.round((Number(i.price) || 0) * 100)),
       hh_active: !!i.hh_active,
@@ -3061,6 +3065,7 @@ async function renderOrder(app, checkId) {
       '<div class="field"><label for="cs-note">Order note <span class="muted small">(whole check — prints on every KDS ticket)</span></label>' +
       '<input type="text" id="cs-note" maxlength="500" value="' + esc(check.order_note || '') + '" placeholder="e.g. allergy table — confirm with server" autocomplete="off"></div>' +
       '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+      '<button class="btn" id="cs-taxex" title="Tax exemption — manager PIN and reason required, audit-logged">' + (check.tax_exempt ? 'Remove tax exemption…' : 'Tax exempt…') + '</button>' +
       '<button class="btn btn-danger" id="cs-void" title="Void the entire check — manager approval required">Void check…</button>' +
       '<button class="btn btn-primary" data-x="go">Save</button></div>');
     $('[data-gc="dec"]', bd).onclick = () => { gc = Math.max(1, gc - 1); $('#cs-gc', bd).textContent = gc; };
@@ -3078,6 +3083,38 @@ async function renderOrder(app, checkId) {
         closeModal(); toast('Check updated', 'ok');
       } catch (e) { handleApiError(e); return; }
       renderRoute(true);
+    };
+    /* Tax exemption (gap #9): the comp idiom — a fresh manager PIN is
+       required EVERY time (even for a manager session), plus a reason,
+       and both directions are audit-logged. The endpoint recomputes the
+       totals; payments already taken stay taken. */
+    $('#cs-taxex', bd).onclick = () => {
+      const turningOn = !check.tax_exempt;
+      const b2 = openModal('<h2>' + (turningOn ? 'Make check tax-exempt' : 'Remove tax exemption') + '</h2>' +
+        '<p class="muted">' + (turningOn
+          ? 'No sales tax will be charged on this check while the exemption is set. This is a tax representation — it needs a manager PIN and a reason, and it is audit-logged.'
+          : 'Tax will be charged on this check again. Removing the exemption needs a manager PIN and a reason, and it is audit-logged.') + '</p>' +
+        '<div class="field"><label for="tx-reason">Reason (required)</label>' +
+        '<input type="text" id="tx-reason" maxlength="120" placeholder="e.g. nonprofit exemption certificate on file" autocomplete="off"></div>' +
+        '<div class="field"><label for="tx-pin">Manager PIN</label>' +
+        '<input type="password" id="tx-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' +
+        '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+        '<button class="btn btn-primary" data-x="go">' + (turningOn ? 'Make tax-exempt' : 'Remove exemption') + '</button></div>');
+      $('[data-x="c"]', b2).onclick = () => { closeModal(); };
+      $('[data-x="go"]', b2).onclick = async () => {
+        const reason = $('#tx-reason', b2).value.trim();
+        if (!reason) { toast('A reason is required for tax exemption changes', 'err'); return; }
+        const pin = $('#tx-pin', b2).value.trim();
+        if (!/^\d{4}$/.test(pin)) { toast("Enter the manager's 4-digit PIN", 'err'); return; }
+        try {
+          if (isOffline()) { toast('Changing tax exemption needs a connection — reconnect first', 'err'); return; }
+          const r = await api('/api/checks/' + realId(checkId) + '/tax-exempt', 'POST',
+            { exempt: turningOn, manager_pin: pin, reason });
+          closeModal(); closeModal();
+          toast(r.tax_exempt ? 'Check is tax-exempt' : 'Tax exemption removed', 'ok');
+          renderRoute(true);
+        } catch (e) { handleApiError(e); }
+      };
     };
     /* NG-B: full-check void — manager role direct, servers enter a PIN. */
     $('#cs-void', bd).onclick = () => {
@@ -3646,7 +3683,8 @@ async function renderPay(app, checkId) {
     ['Subtotal', fmt(t.subtotal)],
     [pctLabel(sc.surcharge_pct) + ' surcharge', fmt(t.surcharge)],
     t.service_charge ? [pctLabel(sc.service_charge_pct) + ' service charge <span class="lbl-note">' + sc.service_charge_min_guests + '+ guests · mandatory — not a tip</span>', fmt(t.service_charge)] : null,
-    ['Tax', fmt(t.tax)],
+    ['Tax' + (check.tax_exempt ? ' <span class="lbl-note">exempt</span>' : ''), fmt(t.tax)],
+    (t.tax_included > 0 ? ['<span class="lbl-note">of which included in prices</span>', fmt(t.tax_included)] : null),
     ...libCheckApps.map((a) => ['Discount · ' + esc(a.name) + ' <span class="lbl-note">library</span>', '−' + fmt(a.applied_cents)]),
     (t.comp - libSum) > 0 ? ['Comp <span class="lbl-note">manager approved</span>', '−' + fmt(t.comp - libSum)] : null,
   ].filter(Boolean);
@@ -4246,7 +4284,9 @@ function printReceipt(check, t, items, sc) {
     '<tr><td>Subtotal</td><td class="r">' + fmt(t.subtotal) + '</td></tr>' +
     (t.surcharge ? '<tr><td>' + pctLabel(sc.surcharge_pct) + ' surcharge</td><td class="r">' + fmt(t.surcharge) + '</td></tr>' : '') +
     (t.service_charge ? '<tr><td>' + pctLabel(sc.service_charge_pct) + ' service charge<br><span class="dim">' + sc.service_charge_min_guests + '+ guests · mandatory — NOT a tip</span></td><td class="r">' + fmt(t.service_charge) + '</td></tr>' : '') +
-    '<tr><td>Tax</td><td class="r">' + fmt(t.tax) + '</td></tr>' +
+    '<tr><td>Tax' + (check.tax_exempt ? ' — EXEMPT' : '') + '</td><td class="r">' + fmt(t.tax) + '</td></tr>' +
+    (check.tax_exempt ? '<tr><td colspan="2" class="dim">Tax exempt — no sales tax charged on this check</td></tr>' : '') +
+    (t.tax_included > 0 ? '<tr><td><span class="dim">Includes tax already in prices</span></td><td class="r">' + fmt(t.tax_included) + '</td></tr>' : '') +
     (libApps.map((a) =>
       '<tr><td>Discount · ' + esc(a.name) + '</td><td class="r">−' + fmt(a.applied_cents) + '</td></tr>').join('')) +
     ((t.comp - libSum) > 0
@@ -5539,6 +5579,8 @@ async function renderMenuViewer(app) {
       const dead = !i.active;
       const bits = [fmt(i.price_cents), i.course, kdsLabel(i.station)];
       if (i.hh_price_cents != null) bits.push('HH ' + fmt(i.hh_price_cents));
+      if (i.tax_rate_bps != null) bits.push(i.tax_rate_bps === 0 ? 'tax exempt' : 'tax ' + (i.tax_rate_bps / 100) + '%');
+      if (i.tax_inclusive) bits.push('tax incl.');
       if (i.daypart) bits.push(i.daypart);
       if ((i.modifiers || []).length) bits.push(i.modifiers.length + ' mods');
       if (i.price_note) bits.push(i.price_note);
@@ -5619,6 +5661,8 @@ async function renderMenuViewer(app) {
       '<div class="field"><label>Name</label><input id="mi-name" value="' + esc(it ? it.name : '') + '" maxlength="80"></div>' +
       '<div class="frow"><div class="field"><label>Price ($)</label><input id="mi-price" type="number" min="0" step="0.01" inputmode="decimal" value="' + (it ? (it.price_cents / 100).toFixed(2) : '') + '"></div>' +
       '<div class="field"><label>Happy-hour price ($) <span class="muted small">(blank = none)</span></label><input id="mi-hhprice" type="number" min="0" step="0.01" inputmode="decimal" value="' + (it && it.hh_price_cents != null ? (it.hh_price_cents / 100).toFixed(2) : '') + '"></div>' +
+      '<div class="field"><label>Tax rate (%) <span class="muted small">(blank = site rate; 0 = exempt)</span></label><input id="mi-taxrate" type="number" min="0" max="100" step="0.01" inputmode="decimal" value="' + (it && it.tax_rate_bps != null ? (it.tax_rate_bps / 100).toFixed(2).replace(/0+$/, '').replace(/\.$/, '') : '') + '"></div></div>' +
+      '<div class="frow"><div class="field"><label class="check-line"><input type="checkbox" id="mi-taxincl"' + (it && it.tax_inclusive ? ' checked' : '') + '> Price includes tax — the sticker price already contains this item\u2019s tax</label></div>' +
       '<div class="field"><label>Category</label><select id="mi-cat">' + me.cats.map((x) => '<option value="' + x.id + '"' + (String(x.id) === String(it ? it.category_id : me.activeCat) ? ' selected' : '') + '>' + esc(x.name) + '</option>').join('') + '</select></div></div>' +
       '<div class="frow"><div class="field"><label>Station</label><select id="mi-station">' + KDS_STATIONS.map((s) => '<option value="' + s.slug + '"' + (it && it.station === s.slug ? ' selected' : '') + '>' + esc(s.label) + '</option>').join('') + '</select></div>' +
       '<div class="field"><label>Course</label><select id="mi-course">' + ME_COURSES.map((x) => '<option' + (it && it.course === x ? ' selected' : '') + '>' + x + '</option>').join('') + '</select></div>' +
@@ -5723,12 +5767,22 @@ async function renderMenuViewer(app) {
     $('[data-x="save"]', bd).onclick = async () => {
       syncMods();
       const hhRaw = $('#mi-hhprice', bd).value.trim();
+      const taxRaw = $('#mi-taxrate', bd).value.trim();
+      const taxPct = taxRaw === '' ? null : parseFloat(taxRaw);
+      if (taxPct !== null && (!Number.isFinite(taxPct) || taxPct < 0 || taxPct > 100)) {
+        toast('Tax rate must be between 0% and 100% (blank = site rate)', 'err'); return;
+      }
       const body = {
         name: $('#mi-name', bd).value,
         price_cents: Math.round((parseFloat($('#mi-price', bd).value) || 0) * 100),
         /* Happy-hour price: blank clears it (null); a value sets it. The
            server validates it is a non-negative integer number of cents. */
         hh_price_cents: hhRaw === '' ? null : Math.round((parseFloat(hhRaw) || 0) * 100),
+        /* Tax breadth (gap #9): percent → basis points; blank clears the
+           override back to the site rate; the checkbox is the inclusive
+           flag. The server validates the bps as a whole number 0–10000. */
+        tax_rate_bps: taxPct === null ? null : Math.round(taxPct * 100),
+        tax_inclusive: !!$('#mi-taxincl', bd).checked,
         category_id: Number($('#mi-cat', bd).value),
         station: $('#mi-station', bd).value,
         course: $('#mi-course', bd).value,

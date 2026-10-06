@@ -81,6 +81,23 @@ function migrate(db) {
   // mainline boot migration — the brain enforces the same 86 state.
   if (!cols.has('is_86')) db.exec('ALTER TABLE menu_items ADD COLUMN is_86 INTEGER DEFAULT 0');
   if (!cols.has('remaining')) db.exec('ALTER TABLE menu_items ADD COLUMN remaining INTEGER');
+  // Tax breadth (audit gap #9): per-item rate override + inclusive flag
+  // on the menu, the ring-time snapshot on lines, and the check-level
+  // exempt flag — same columns as the mainline boot migration.
+  if (!cols.has('tax_rate_bps')) db.exec('ALTER TABLE menu_items ADD COLUMN tax_rate_bps INTEGER');
+  if (!cols.has('tax_inclusive')) db.exec('ALTER TABLE menu_items ADD COLUMN tax_inclusive INTEGER DEFAULT 0');
+  const icols = new Set(db.prepare('PRAGMA table_info(check_items)').all().map((c) => c.name));
+  if (!icols.has('tax_rate_bps')) db.exec('ALTER TABLE check_items ADD COLUMN tax_rate_bps INTEGER');
+  if (!icols.has('tax_inclusive')) db.exec('ALTER TABLE check_items ADD COLUMN tax_inclusive INTEGER');
+  const ccols = new Set(db.prepare('PRAGMA table_info(checks)').all().map((c) => c.name));
+  if (!ccols.has('tax_exempt')) db.exec('ALTER TABLE checks ADD COLUMN tax_exempt INTEGER DEFAULT 0');
+}
+
+/* Tax snapshot for a new line (gap #9), mirroring server.js
+ * taxSnapshotOf: freeze the item's rate/inclusive setting at ring time. */
+function taxSnapOf(src) {
+  const ok = !!src && Number.isInteger(src.tax_rate_bps) && src.tax_rate_bps >= 0 && src.tax_rate_bps <= 10000;
+  return { tax_rate_bps: ok ? src.tax_rate_bps : null, tax_inclusive: src && src.tax_inclusive ? 1 : 0 };
 }
 
 function getKv(db, key, dflt) {
@@ -210,7 +227,7 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       const itemIds = [];
       const itemUuids = [];
       const insItem = db.prepare(
-        "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at, note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)"
+        "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, tax_rate_bps, tax_inclusive, modifiers_json, course, state, added_at, note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)"
       );
       for (const it of p.items || []) {
         const itemUuid = String(it.item_uuid || it.temp_id || crypto.randomUUID());
@@ -283,7 +300,9 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
           unitPrice = it.unit_price_cents;
         }
         const mods = Array.isArray(it.modifiers) ? it.modifiers : [];
+        const taxSnap = taxSnapOf(menuItem);
         const r = insItem.run(itemUuid, checkId, menuItem.id, it.seat, it.qty, unitPrice,
+          taxSnap.tax_rate_bps, taxSnap.tax_inclusive,
           JSON.stringify(mods), lineCourse, nowIso(), note, allergy, allergyDetail);
         itemIds.push(Number(r.lastInsertRowid));
         itemUuids.push(itemUuid);
@@ -470,7 +489,7 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       if (!viaGossip && (!actor || actor.role !== 'manager')) {
         return { ok: false, error: 'manager_role_required' };
       }
-      const cur = db.prepare('SELECT id, name, price_cents, hh_price_cents, is_86, remaining, version FROM menu_items WHERE id = ? AND site_id = ?').get(p.item_id, siteSlug);
+      const cur = db.prepare('SELECT id, name, price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, is_86, remaining, version FROM menu_items WHERE id = ? AND site_id = ?').get(p.item_id, siteSlug);
       if (!cur) return { ok: false, error: 'menu_item_not_found', item_id: p.item_id };
       const curVer = cur.version || 1;
       if (p.version !== curVer + 1) {
@@ -483,6 +502,18 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       const hhPrice = p.hh_price_cents === null ? null
         : (Number.isInteger(p.hh_price_cents) && p.hh_price_cents >= 0 ? p.hh_price_cents
           : (cur.hh_price_cents != null ? cur.hh_price_cents : null));
+      /* Tax fields ride the same op under the same guarded assignment
+         (audit gap #9): an explicit null clears the rate back to the
+         site default, a valid bps integer (0..10000) sets it, a boolean
+         sets the inclusive flag — anything absent or invalid keeps the
+         stored value, so pre-field editors never wipe tax config they
+         do not know about. */
+      const taxBps = p.tax_rate_bps === null ? null
+        : (Number.isInteger(p.tax_rate_bps) && p.tax_rate_bps >= 0 && p.tax_rate_bps <= 10000 ? p.tax_rate_bps
+          : (cur.tax_rate_bps != null ? cur.tax_rate_bps : null));
+      const taxIncl = (p.tax_inclusive === true || p.tax_inclusive === 1) ? 1
+        : (p.tax_inclusive === false || p.tax_inclusive === 0) ? 0
+          : (cur.tax_inclusive ? 1 : 0);
       /* Floor 86 state rides the same op under the same guard (audit
          gap #8): an explicit 0/1 sets is_86, an explicit null or
          non-negative integer sets remaining, anything else keeps the
@@ -497,11 +528,11 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       if (rem86 === 0) is86 = 1;
       else if (is86 === 1) rem86 = null;
       if (rem86 != null && rem86 > 0) is86 = 0;
-      db.prepare('UPDATE menu_items SET name = ?, price_cents = ?, hh_price_cents = ?, is_86 = ?, remaining = ?, version = ? WHERE id = ?')
-        .run(name, price, hhPrice, is86, rem86, p.version, cur.id);
-      h.auditMenu({ user: actor }, 'item.update', { item_id: cur.id }, { name, price_cents: price, hh_price_cents: hhPrice, is_86: !!is86, remaining: rem86, via: 'sync_batch', version: p.version });
+      db.prepare('UPDATE menu_items SET name = ?, price_cents = ?, hh_price_cents = ?, tax_rate_bps = ?, tax_inclusive = ?, is_86 = ?, remaining = ?, version = ? WHERE id = ?')
+        .run(name, price, hhPrice, taxBps, taxIncl, is86, rem86, p.version, cur.id);
+      h.auditMenu({ user: actor }, 'item.update', { item_id: cur.id }, { name, price_cents: price, hh_price_cents: hhPrice, tax_rate_bps: taxBps, tax_inclusive: !!taxIncl, is_86: !!is86, remaining: rem86, via: 'sync_batch', version: p.version });
       h.broadcastMenuUpdated();
-      return { ok: true, item_id: cur.id, version: p.version, is_86: !!is86, remaining: rem86 };
+      return { ok: true, item_id: cur.id, version: p.version, tax_rate_bps: taxBps, tax_inclusive: !!taxIncl, is_86: !!is86, remaining: rem86 };
     }
 
     default:

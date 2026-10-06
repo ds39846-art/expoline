@@ -243,6 +243,15 @@ function lineCents(it) {
   const modSum = mods.reduce((a, m) => a + (isInt(m.price_delta_cents) ? m.price_delta_cents : 0), 0);
   return it.qty * (it.unit_price_cents + modSum);
 }
+/* Tax snapshot (gap #9): freeze a menu item's tax_rate_bps /
+   tax_inclusive onto the line at ring time, like the price. The host
+   injects the canonical helper (server.js taxSnapshotOf); this local
+   copy is the identical computation for standalone hosts. */
+function taxSnapOf(ctx, src) {
+  if (ctx && typeof ctx.taxSnapshotOf === 'function') return ctx.taxSnapshotOf(src);
+  const ok = !!src && Number.isInteger(src.tax_rate_bps) && src.tax_rate_bps >= 0 && src.tax_rate_bps <= 10000;
+  return { tax_rate_bps: ok ? src.tax_rate_bps : null, tax_inclusive: src && src.tax_inclusive ? 1 : 0 };
+}
 function moneyInt(v) { return isInt(v) && v >= 0; }
 
 /* ============================ PUBLIC: guest QR ============================ */
@@ -377,12 +386,13 @@ function registerPublic(app, ctx) {
       `QR · ${table.label}${guestName ? ' · ' + guestName : ''}`, at).lastInsertRowid;
 
     const insItem = db.prepare(
-      "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, note, allergy, allergy_detail, added_at, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?)"
+      "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, tax_rate_bps, tax_inclusive, modifiers_json, course, state, note, allergy, allergy_detail, added_at, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?)"
     );
     const byStation = new Map();
     for (const ln of priced.lines) {
+      const taxSnap = taxSnapOf(ctx, ln.mi);
       const r = insItem.run(crypto.randomUUID(), checkId, ln.mi.id, ln.seat, ln.qty,
-        ln.unit_price_cents, JSON.stringify(ln.modifiers), ln.mi.course,
+        ln.unit_price_cents, taxSnap.tax_rate_bps, taxSnap.tax_inclusive, JSON.stringify(ln.modifiers), ln.mi.course,
         ln.note, ln.allergy, ln.allergy_detail, at, at);
       const st = ln.mi.station || 'expediter';
       if (!byStation.has(st)) byStation.set(st, []);
@@ -860,12 +870,13 @@ function registerStaff(app, ctx) {
       `Delivery · ${source}${customer ? ' · ' + customer : ''}`, source, at).lastInsertRowid;
 
     const insItem = db.prepare(
-      "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at, sent_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, 'sent', ?, ?)"
+      "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, tax_rate_bps, tax_inclusive, modifiers_json, course, state, added_at, sent_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'sent', ?, ?)"
     );
     const byStation = new Map();
     for (const ln of priced.lines) {
+      const taxSnap = taxSnapOf(ctx, ln.mi);
       const r = insItem.run(crypto.randomUUID(), checkId, ln.mi.id, ln.qty,
-        ln.unit_price_cents, JSON.stringify(ln.modifiers), ln.mi.course, at, at);
+        ln.unit_price_cents, taxSnap.tax_rate_bps, taxSnap.tax_inclusive, JSON.stringify(ln.modifiers), ln.mi.course, at, at);
       const st = ln.mi.station || 'expediter';
       if (!byStation.has(st)) byStation.set(st, []);
       byStation.get(st).push({

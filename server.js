@@ -133,6 +133,11 @@ db.exec('PRAGMA busy_timeout=5000;');
      many more may be rung before the item auto-86s at zero. */
   if (!cols.has('is_86')) db.exec('ALTER TABLE menu_items ADD COLUMN is_86 INTEGER DEFAULT 0');
   if (!cols.has('remaining')) db.exec('ALTER TABLE menu_items ADD COLUMN remaining INTEGER');
+  /* Tax breadth (audit gap #9): per-item tax rate override in basis
+     points (NULL = site default, 0 = exempt item) and tax-inclusive
+     pricing (sticker price already contains its tax). */
+  if (!cols.has('tax_rate_bps')) db.exec('ALTER TABLE menu_items ADD COLUMN tax_rate_bps INTEGER');
+  if (!cols.has('tax_inclusive')) db.exec('ALTER TABLE menu_items ADD COLUMN tax_inclusive INTEGER DEFAULT 0');
   db.exec(`CREATE TABLE IF NOT EXISTS menu_audit (
     id INTEGER PRIMARY KEY,
     site_id TEXT,
@@ -143,6 +148,23 @@ db.exec('PRAGMA busy_timeout=5000;');
     details TEXT,
     created_at TEXT
   )`);
+})();
+
+/* Tax breadth (audit gap #9): the per-line tax snapshot and the
+   check-level exempt flag. Lines snapshot the item's rate/inclusive
+   setting at ring time — the unit_price_cents precedent — because
+   reports re-run persistTotals on CLOSED checks; resolving rates live
+   from menu_items at totals time would let a later menu edit rewrite a
+   closed day's tax history. NULL snapshot (lines rung before this
+   batch, incl. seeded checks) falls back to the item's CURRENT setting
+   at totals time, which for un-edited menus is the site default —
+   byte-identical to the pre-batch engine. */
+(() => {
+  const icols = new Set(db.prepare('PRAGMA table_info(check_items)').all().map((c) => c.name));
+  if (!icols.has('tax_rate_bps')) db.exec('ALTER TABLE check_items ADD COLUMN tax_rate_bps INTEGER');
+  if (!icols.has('tax_inclusive')) db.exec('ALTER TABLE check_items ADD COLUMN tax_inclusive INTEGER');
+  const ccols = new Set(db.prepare('PRAGMA table_info(checks)').all().map((c) => c.name));
+  if (!ccols.has('tax_exempt')) db.exec('ALTER TABLE checks ADD COLUMN tax_exempt INTEGER DEFAULT 0');
 })();
 
 /* Discount library (audit gap #4): manager-defined named discounts and
@@ -1001,6 +1023,20 @@ function effectivePriceCents(menuItem, active) {
   return menuItem.price_cents;
 }
 
+/* Tax snapshot for a NEW check_items row (audit gap #9): the item's
+   tax_rate_bps (NULL = site default) and tax_inclusive flag, frozen at
+   ring time exactly like unit_price_cents — a later menu edit must not
+   reprice the tax on lines already rung (reports re-run persistTotals
+   on closed checks). Copy paths (duplicate / transfer / split shares)
+   pass the SOURCE LINE row instead of a menu item: it carries the same
+   two property names, so the snapshot rides along unchanged. */
+function taxSnapshotOf(src) {
+  if (!src) return { tax_rate_bps: null, tax_inclusive: 0 };
+  const bps = (isInt(src.tax_rate_bps) && src.tax_rate_bps >= 0 && src.tax_rate_bps <= 10000)
+    ? src.tax_rate_bps : null;
+  return { tax_rate_bps: bps, tax_inclusive: src.tax_inclusive ? 1 : 0 };
+}
+
 /* ------------------------- floor 86 (audit gap #8) -------------------------
  * Runtime availability, separate from the manager's structural `active`
  * flag (the menu editor's one-tap 86 flips `active`; that stays). A menu
@@ -1096,34 +1132,121 @@ const BILLABLE_STATES = "('held','sent','fulfilled')";
 
 function calcTotals(checkId) {
   const cfg = getConfig();
+  const check = db.prepare('SELECT guest_count, COALESCE(comp_cents, 0) AS comp_cents, COALESCE(tax_exempt, 0) AS tax_exempt FROM checks WHERE id = ?').get(checkId);
+  const guests = check ? (check.guest_count || 0) : 0;
+  const comp = check ? (check.comp_cents || 0) : 0;
+  const taxExempt = !!(check && check.tax_exempt);
   // Billable = every non-void line: held, sent, AND fulfilled (served food is still owed).
+  // The menu_items join is consulted ONLY for lines whose ring-time tax
+  // snapshot is NULL (lines rung before the tax-breadth batch).
   const items = db.prepare(
-    `SELECT * FROM check_items WHERE check_id = ? AND state IN ${BILLABLE_STATES}`
+    `SELECT ci.*, mi.tax_rate_bps AS mi_tax_rate_bps, mi.tax_inclusive AS mi_tax_inclusive
+     FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id
+     WHERE ci.check_id = ? AND ci.state IN ${BILLABLE_STATES}`
   ).all(checkId);
   const gross = items.reduce((s, it) => s + lineGross(it), 0);
   const subtotal = items.reduce((s, it) => s + lineTotal(it), 0);
   // P0-1: gross − item discounts = net subtotal. Surcharges/tax apply to net.
   const itemDiscounts = gross - subtotal;
-  const surcharge = Math.round(subtotal * cfg.surcharge_pct);
-  const check = db.prepare('SELECT guest_count, COALESCE(comp_cents, 0) AS comp_cents FROM checks WHERE id = ?').get(checkId);
-  const guests = check ? (check.guest_count || 0) : 0;
-  const comp = check ? (check.comp_cents || 0) : 0;
+
+  /* --- Tax breadth (audit gap #9) -------------------------------------
+     Effective rate per line: check exempt → 0; else the line's ring-time
+     snapshot (check_items.tax_rate_bps); else — NULL snapshot, a line
+     rung before this batch — the item's CURRENT setting; else the site
+     default. Grouping is by the effective rate as a DOUBLE (bps/10000
+     and the parsed 0.0775 are the identical double), so with no
+     overrides every line lands in ONE group keyed by cfg.tax_rate
+     itself and the operations below are the identical float operations
+     the pre-batch engine performed — byte-identical totals.
+
+     Tax-inclusive lines: the sticker price CONTAINS its tax. The line
+     contributes its net-of-tax amount to every base and its backed-out
+     tax to tax_cents, but that tax is NOT added again into the guest
+     total (it is already inside the sticker). Back-out is per line:
+       net = Math.round(lineTotal / (1 + rate)); included = lineTotal − net
+     so net + included == the charged price to the cent, always.
+     lineTotal here is the CHARGED price — after any HH price snapshot
+     and after line discounts — so the back-out always applies to what
+     the guest actually pays for the line. */
+  const groups = new Map(); // rate (double) -> { rate, exclBase, inclBase, inclTax }
+  let lineBaseSum = 0;
+  let taxIncluded = 0;
+  for (const it of items) {
+    const lt = lineTotal(it);
+    let bps = it.tax_rate_bps;
+    if (bps == null) bps = it.mi_tax_rate_bps;
+    const rate = taxExempt ? 0 : (bps != null ? bps / 10000 : cfg.tax_rate);
+    const incl = !taxExempt && rate > 0
+      && !!((it.tax_inclusive != null ? it.tax_inclusive : it.mi_tax_inclusive));
+    let g = groups.get(rate);
+    if (!g) { g = { rate, exclBase: 0, inclBase: 0, inclTax: 0 }; groups.set(rate, g); }
+    if (incl) {
+      const net = Math.round(lt / (1 + rate));
+      g.inclBase += net;
+      g.inclTax += lt - net;
+      taxIncluded += lt - net;
+      lineBaseSum += net;
+    } else {
+      g.exclBase += lt;
+      lineBaseSum += lt;
+    }
+  }
+  // Surcharge / service charge: the pre-batch bases with the net-of-tax
+  // substitution — computed on lineBaseSum, which EQUALS subtotal unless
+  // an inclusive line is present (same operands, same Math.round then).
+  const surcharge = Math.round(lineBaseSum * cfg.surcharge_pct);
   const serviceCharge = (cfg.service_charge_min_guests > 0 && guests >= cfg.service_charge_min_guests)
-    ? Math.round(subtotal * cfg.service_charge_pct) : 0;
+    ? Math.round(lineBaseSum * cfg.service_charge_pct) : 0;
   // Taxable base (California): subtotal + surcharge + mandatory service charge.
   // Tips are NEVER taxed. Mandatory service charges ARE taxed — they are
   // part of the taxable sale (CDTFA Publication 22, Jan 2025; Annotation
-  // 550.0740). Manager-approved comps reduce the amount owed (never below zero).
-  const taxable = subtotal + surcharge + serviceCharge;
-  const tax = Math.round(taxable * cfg.tax_rate);
-  const total = Math.max(0, subtotal + surcharge + serviceCharge + tax - comp);
+  // 550.0740). Manager-approved comps reduce the amount owed (never below zero);
+  // comps do NOT reduce the tax base (accountant's open question — unchanged).
+  const fees = surcharge + serviceCharge;
+  /* Allocate the fees across rate groups by group base share. Every
+     group but one gets Math.round(fees × share); the group with the
+     largest base (ties → the higher rate) absorbs the residue, so
+     Σ group bases == lineBaseSum + fees EXACTLY. With a single group
+     the allocation is the identity and its tax is
+     Math.round((subtotal + fees) × cfg.tax_rate) — the exact pre-batch
+     operation sequence, which is what makes the defaults path
+     byte-identical. Tax on a group's fee share is ADDED tax (the fees
+     are added charges) even when the group is inclusive-priced. */
+  const glist = [...groups.values()].map((g) => ({ ...g, base: g.exclBase + g.inclBase, alloc: 0 }));
+  if (fees !== 0 && lineBaseSum > 0 && glist.length > 0) {
+    let anchor = glist[0];
+    for (const g of glist) {
+      if (g.base > anchor.base || (g.base === anchor.base && g.rate > anchor.rate)) anchor = g;
+    }
+    let assigned = 0;
+    for (const g of glist) {
+      if (g === anchor) continue;
+      g.alloc = Math.round(fees * g.base / lineBaseSum);
+      assigned += g.alloc;
+    }
+    anchor.alloc = fees - assigned;
+  }
+  let tax = taxIncluded;
+  const taxDetail = [];
+  for (const g of glist) {
+    const added = Math.round((g.exclBase + g.alloc) * g.rate);
+    tax += added;
+    const row = { rate_bps: Math.round(g.rate * 10000), base_cents: g.base + g.alloc, tax_cents: added + g.inclTax, included_cents: g.inclTax };
+    if (row.base_cents > 0 || row.tax_cents > 0) taxDetail.push(row);
+  }
+  taxDetail.sort((a, b) => a.rate_bps - b.rate_bps);
+  // Guest total: sticker subtotal + fees + ADDED tax only − comp. The
+  // included tax is already inside the sticker subtotal.
+  const total = Math.max(0, subtotal + surcharge + serviceCharge + (tax - taxIncluded) - comp);
   const pay = db.prepare(
     'SELECT COALESCE(SUM(amount_cents),0) AS amt, COALESCE(SUM(refunded_cents),0) AS ref FROM payments WHERE check_id = ?'
   ).get(checkId);
   const paid = (pay.amt || 0) - (pay.ref || 0);
   const balance = total - paid;
   return { subtotal, surcharge, service_charge: serviceCharge, tax, total, paid, balance, comp,
-    gross_subtotal: gross, item_discount_cents: itemDiscounts };
+    gross_subtotal: gross, item_discount_cents: itemDiscounts,
+    tax_included_cents: taxIncluded, tax_added_cents: tax - taxIncluded,
+    taxable_base_cents: lineBaseSum + fees, tax_exempt: taxExempt, tax_detail: taxDetail };
 }
 
 /** Recompute + persist the money columns on the checks row. Call on every mutation. */
@@ -1162,6 +1285,11 @@ function itemView(it) {
     allergy_detail: it.allergy_detail || null,
     discount_cents: it.discount_cents || 0,
     discount_reason: it.discount_reason || null,
+    // Tax breadth (gap #9): the rate actually applied to this line — the
+    // ring-time snapshot (null = site default) + inclusive flag, so the
+    // receipt can show the rate that was charged, not today's menu.
+    tax_rate_bps: it.tax_rate_bps != null ? it.tax_rate_bps : null,
+    tax_inclusive: it.tax_inclusive ? true : false,
   };
 }
 
@@ -1194,6 +1322,7 @@ function checkResponse(checkId) {
     tab_name: c.tab_name,
     channel: c.channel || 'dine_in',
     guest_count: c.guest_count,
+    tax_exempt: c.tax_exempt ? true : false,
     status: c.status,
     coursing: c.coursing || 'off',
     order_note: c.order_note || null,
@@ -1203,6 +1332,7 @@ function checkResponse(checkId) {
     surcharge_cents: t.surcharge,
     service_charge_cents: t.service_charge,
     tax_cents: t.tax,
+    tax_included_cents: t.tax_included_cents,
     comp_cents: t.comp,
     gross_subtotal_cents: t.gross_subtotal,
     item_discount_cents: t.item_discount_cents,
@@ -1215,6 +1345,13 @@ function checkResponse(checkId) {
       surcharge: t.surcharge,
       service_charge: t.service_charge,
       tax: t.tax,
+      // Tax breadth (gap #9): of the tax figure, how much was already
+      // inside tax-inclusive sticker prices (0 on a classic check), the
+      // per-rate breakdown the receipt/report reconcile against, and
+      // the check-level exempt flag (also on the check itself).
+      tax_included: t.tax_included_cents,
+      tax_detail: t.tax_detail,
+      tax_exempt: t.tax_exempt,
       comp: t.comp,
       total: t.total,
       paid: t.paid,
@@ -1548,6 +1685,7 @@ app.use((req, res, next) => {
 parityKdsPay.registerPublic(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse,
   broadcastTicket, ticketView, broadcastCheckUpdated, broadcastMenuUpdated, effectivePriceCents,
+  taxSnapshotOf,
   dayClosedToday,
 });
 
@@ -1583,7 +1721,7 @@ const lanRuntime = (() => {
    the wall, so role checks work). */
 require('./routes/kiosk').register(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated, broadcastMenuUpdated,
-  effectivePriceCents,
+  effectivePriceCents, taxSnapshotOf,
   // Staff-facing call-flag endpoints are gated server-side; the customer
   // kiosk flows (menu/order/call-staff) stay public by design.
   serverPlus,
@@ -1675,7 +1813,7 @@ app.get('/api/menu', (req, res) => {
     'SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id'
   ).all(SITE_ID);
   const itemStmt = db.prepare(
-    'SELECT id, name, description, price_cents, hh_price_cents, item_type, station, course, price_note, daypart, popular, is_86, remaining FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
+    'SELECT id, name, description, price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, item_type, station, course, price_note, daypart, popular, is_86, remaining FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
   );
   const modStmt = db.prepare(
     'SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id'
@@ -1695,6 +1833,10 @@ app.get('/api/menu', (req, res) => {
       // price a line rung right now would actually be charged, and
       // whether the HH price is the one in effect for this item.
       hh_price_cents: it.hh_price_cents != null ? it.hh_price_cents : null,
+      // Tax breadth (gap #9): per-item rate override (null = site
+      // default) + whether the sticker price already includes its tax.
+      tax_rate_bps: it.tax_rate_bps != null ? it.tax_rate_bps : null,
+      tax_inclusive: it.tax_inclusive ? true : false,
       effective_price_cents: effectivePriceCents(it, hhActive),
       hh_active: hhActive && it.price_cents > 0 && it.hh_price_cents != null,
       // Floor 86: staff keep SEEING a sold-out item (visible-but-disabled
@@ -1946,7 +2088,7 @@ function menuCategoryById(id) {
   return db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function menuItemById(id) {
-  return db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, is_86, remaining, price_note, image_url, daypart FROM menu_items WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+  return db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, item_type, station, course, active, is_86, remaining, price_note, image_url, daypart FROM menu_items WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function auditMenu(req, action, ids, details) {
   db.prepare('INSERT INTO menu_audit (site_id, actor, action, item_id, category_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
@@ -1955,6 +2097,11 @@ function auditMenu(req, action, ids, details) {
 function validPriceCents(v) { return isInt(v) && v >= 0; }
 /** Happy-hour price: null clears it; otherwise the same rule as a price. */
 function validHhPriceCents(v) { return v === null || validPriceCents(v); }
+/** Per-item tax rate (gap #9): null = site default; otherwise a whole
+ *  number of basis points 0..10000 (0 = exempt item, 10000 = 100%). */
+function validTaxRateBps(v) { return v === null || (isInt(v) && v >= 0 && v <= 10000); }
+/** Tax-inclusive flag: booleans only (0/1 from JSON clients tolerated). */
+function validTaxInclusive(v) { return v === true || v === false || v === 0 || v === 1; }
 function cleanOpt(v) { const s = cleanLabel(v); return s ? s : null; }
 function validCourse(v) { return typeof v === 'string' && COURSES.has(v.trim().toLowerCase()); }
 function validItemType(v) { return typeof v === 'string' && ITEM_TYPES.has(v.trim().toLowerCase()); }
@@ -1977,6 +2124,8 @@ function itemAdminView(it) {
   return {
     id: it.id, category_id: it.category_id, name: it.name, description: it.description,
     price_cents: it.price_cents, hh_price_cents: it.hh_price_cents != null ? it.hh_price_cents : null,
+    tax_rate_bps: it.tax_rate_bps != null ? it.tax_rate_bps : null,
+    tax_inclusive: it.tax_inclusive ? true : false,
     item_type: it.item_type, station: it.station, course: it.course,
     active: it.active,
     /* Floor 86 state rides the admin view too, so the editor shows what
@@ -1991,7 +2140,7 @@ function itemAdminView(it) {
    /api/menu deliberately hides. */
 app.get('/api/admin/menu', managerOnly(), (req, res) => {
   const cats = db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id').all(SITE_ID);
-  const itemStmt = db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, is_86, remaining, price_note, image_url, daypart FROM menu_items WHERE category_id = ? ORDER BY id');
+  const itemStmt = db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, item_type, station, course, active, is_86, remaining, price_note, image_url, daypart FROM menu_items WHERE category_id = ? ORDER BY id');
   res.json(cats.map((c) => ({
     id: c.id, name: c.name, parent: c.parent, sort: c.sort,
     items: itemStmt.all(c.id).map(itemAdminView),
@@ -2053,6 +2202,10 @@ app.post('/api/admin/menu/items', managerOnly(), (req, res) => {
   if (!validPriceCents(b.price_cents)) return res.status(400).json({ error: 'price_cents must be a whole number of cents ≥ 0' });
   const hh_price_cents = b.hh_price_cents === undefined ? null : b.hh_price_cents;
   if (!validHhPriceCents(hh_price_cents)) return res.status(400).json({ error: 'hh_price_cents must be a whole number of cents ≥ 0 or null' });
+  const tax_rate_bps = b.tax_rate_bps === undefined ? null : b.tax_rate_bps;
+  if (!validTaxRateBps(tax_rate_bps)) return res.status(400).json({ error: 'tax_rate_bps must be a whole number of basis points 0–10000 or null (site default)' });
+  if (b.tax_inclusive !== undefined && !validTaxInclusive(b.tax_inclusive)) return res.status(400).json({ error: 'tax_inclusive must be a boolean' });
+  const tax_inclusive = b.tax_inclusive ? 1 : 0;
   const station = canonStation(b.station);
   if (!station) return res.status(400).json({ error: 'station must be one of: bar, expediter, garde_manger, dessert' });
   if (!validCourse(b.course)) return res.status(400).json({ error: 'course must be one of: drink, appetizer, entree, dessert' });
@@ -2062,13 +2215,13 @@ app.post('/api/admin/menu/items', managerOnly(), (req, res) => {
   const modErr = validateModifiers(b.modifiers);
   if (modErr) return res.status(400).json({ error: modErr });
   const r = db.prepare(`INSERT INTO menu_items
-    (site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, price_note, image_url, daypart)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`)
-    .run(SITE_ID, cat.id, name, cleanOpt(b.description), b.price_cents, hh_price_cents, item_type, station, course,
+    (site_id, category_id, name, description, price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, item_type, station, course, active, price_note, image_url, daypart)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`)
+    .run(SITE_ID, cat.id, name, cleanOpt(b.description), b.price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, item_type, station, course,
       cleanOpt(b.price_note), cleanOpt(b.image_url), cleanOpt(b.daypart));
   const id = r.lastInsertRowid;
   if (b.modifiers) saveModifiers(id, b.modifiers);
-  auditMenu(req, 'item.create', { item_id: id, category_id: cat.id }, { name, price_cents: b.price_cents, hh_price_cents, station, course });
+  auditMenu(req, 'item.create', { item_id: id, category_id: cat.id }, { name, price_cents: b.price_cents, hh_price_cents, tax_rate_bps, tax_inclusive: !!tax_inclusive, station, course });
   broadcastMenuUpdated();
   res.status(201).json(itemAdminView(menuItemById(id)));
 });
@@ -2083,6 +2236,12 @@ app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
   if (!validPriceCents(price_cents)) return res.status(400).json({ error: 'price_cents must be a whole number of cents ≥ 0' });
   const hh_price_cents = b.hh_price_cents === undefined ? (it.hh_price_cents != null ? it.hh_price_cents : null) : b.hh_price_cents;
   if (!validHhPriceCents(hh_price_cents)) return res.status(400).json({ error: 'hh_price_cents must be a whole number of cents ≥ 0 or null' });
+  /* Tax fields (gap #9): absent preserves; explicit null clears the rate
+     back to the site default; a boolean sets the inclusive flag. */
+  const tax_rate_bps = b.tax_rate_bps === undefined ? (it.tax_rate_bps != null ? it.tax_rate_bps : null) : b.tax_rate_bps;
+  if (!validTaxRateBps(tax_rate_bps)) return res.status(400).json({ error: 'tax_rate_bps must be a whole number of basis points 0–10000 or null (site default)' });
+  if (b.tax_inclusive !== undefined && !validTaxInclusive(b.tax_inclusive)) return res.status(400).json({ error: 'tax_inclusive must be a boolean' });
+  const tax_inclusive = b.tax_inclusive === undefined ? (it.tax_inclusive ? 1 : 0) : (b.tax_inclusive ? 1 : 0);
   const station = b.station === undefined ? it.station : canonStation(b.station);
   if (!station) return res.status(400).json({ error: 'station must be one of: bar, expediter, garde_manger, dessert' });
   const course = b.course === undefined ? it.course : b.course.trim().toLowerCase();
@@ -2094,9 +2253,9 @@ app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
   const modErr = validateModifiers(b.modifiers);
   if (modErr) return res.status(400).json({ error: modErr });
   db.prepare(`UPDATE menu_items SET category_id = ?, name = ?, description = ?, price_cents = ?,
-    hh_price_cents = ?, item_type = ?, station = ?, course = ?, price_note = ?, image_url = ?, daypart = ? WHERE id = ?`)
+    hh_price_cents = ?, tax_rate_bps = ?, tax_inclusive = ?, item_type = ?, station = ?, course = ?, price_note = ?, image_url = ?, daypart = ? WHERE id = ?`)
     .run(category_id, name, b.description === undefined ? it.description : cleanOpt(b.description),
-      price_cents, hh_price_cents, item_type, station, course,
+      price_cents, hh_price_cents, tax_rate_bps, tax_inclusive, item_type, station, course,
       b.price_note === undefined ? it.price_note : cleanOpt(b.price_note),
       b.image_url === undefined ? it.image_url : cleanOpt(b.image_url),
       b.daypart === undefined ? it.daypart : cleanOpt(b.daypart), it.id);
@@ -2105,10 +2264,11 @@ app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
      name/price edits so a stale LAN editor's write is rejected with the
      current version instead of silently clobbering. Unread in
      single-server mode. */
-  if (LAN_ENABLED && (name !== it.name || price_cents !== it.price_cents || hh_price_cents !== (it.hh_price_cents != null ? it.hh_price_cents : null))) {
+  if (LAN_ENABLED && (name !== it.name || price_cents !== it.price_cents || hh_price_cents !== (it.hh_price_cents != null ? it.hh_price_cents : null)
+    || tax_rate_bps !== (it.tax_rate_bps != null ? it.tax_rate_bps : null) || tax_inclusive !== (it.tax_inclusive ? 1 : 0))) {
     db.prepare('UPDATE menu_items SET version = COALESCE(version, 1) + 1 WHERE id = ?').run(it.id);
   }
-  auditMenu(req, 'item.update', { item_id: it.id, category_id }, { name, price_cents, hh_price_cents, station, course });
+  auditMenu(req, 'item.update', { item_id: it.id, category_id }, { name, price_cents, hh_price_cents, tax_rate_bps, tax_inclusive: !!tax_inclusive, station, course });
   broadcastMenuUpdated();
   res.json(itemAdminView(menuItemById(it.id)));
 });
@@ -2693,10 +2853,11 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
       return res.status(400).json({ error: cr.error });
     }
     consumed86 = cr.consumed;
+    const taxSnap = taxSnapshotOf(menuItem);
     const r = db.prepare(
-      `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
-         note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
-    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, JSON.stringify(cleanMods), lineCourse, nowIso(),
+      `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, tax_rate_bps, tax_inclusive, modifiers_json, course, state, added_at,
+         note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
+    ).run(crypto.randomUUID(), check.id, menuItem.id, seat, qty, unitPrice, taxSnap.tax_rate_bps, taxSnap.tax_inclusive, JSON.stringify(cleanMods), lineCourse, nowIso(),
       note, allergy, allergyDetail);
     item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
     persistTotals(check.id);
@@ -3265,11 +3426,12 @@ app.post('/api/checks/:id/items/:item_id/duplicate', serverPlus(), (req, res) =>
       }
       consumed86 = cr.consumed;
     }
+    const taxSnap = taxSnapshotOf(item);
     const r = db.prepare(
-      `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
-         note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
+      `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, tax_rate_bps, tax_inclusive, modifiers_json, course, state, added_at,
+         note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
     ).run(crypto.randomUUID(), check.id, item.menu_item_id, item.seat, item.qty, item.unit_price_cents,
-      item.modifiers_json, item.course, nowIso(), item.note, item.allergy, item.allergy_detail);
+      taxSnap.tax_rate_bps, taxSnap.tax_inclusive, item.modifiers_json, item.course, nowIso(), item.note, item.allergy, item.allergy_detail);
     dup = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(r.lastInsertRowid);
     t = persistTotals(check.id);
     db.exec('COMMIT');
@@ -3330,6 +3492,42 @@ app.post('/api/checks/:id/comp', serverPlus(), (req, res) => {
   auditApproval(req, 'comp', { check_id: check.id },
     { approver: mgr.name, approver_id: mgr.id, before: { comp_cents: before }, after: { comp_cents: after }, added_cents: comp, percent: b.percent ?? null, reason });
   res.json({ check_id: check.id, comp_cents: after, added_cents: comp, approved_by: mgr.name, totals: t });
+});
+
+/**
+ * POST /api/checks/:id/tax-exempt {exempt, manager_pin, reason}
+ * Check-level tax exemption (audit gap #9) — the comp idiom, at least as
+ * strict: a fresh manager PIN is ALWAYS required (even for a manager
+ * session; a server role alone is refused), a reason is REQUIRED both
+ * ways, and both directions are audit-logged — an exemption is a tax
+ * representation to a government. While set, every line taxes at 0.
+ * Open checks only; reversible while open. Totals recompute through
+ * persistTotals like every other mutation: payments already taken stay
+ * taken and the balance simply follows the recomputed total (no special
+ * cases — the same machinery a comp uses).
+ */
+app.post('/api/checks/:id/tax-exempt', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const mgr = verifyManagerPin(b.manager_pin);
+  if (!mgr) { recordManagerPinAttempt(req, false); return res.status(403).json({ error: 'Manager PIN required to change tax exemption' }); }
+  recordManagerPinAttempt(req, true);
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot change tax exemption on a ${check.status} check` });
+  if (typeof b.exempt !== 'boolean') return res.status(400).json({ error: 'exempt must be a boolean' });
+  const reason = cleanLabel(b.reason);
+  if (!reason) return res.status(400).json({ error: 'A reason is required for tax exemption changes' });
+  const before = check.tax_exempt ? 1 : 0;
+  const after = b.exempt ? 1 : 0;
+  if (before === after) {
+    return res.status(400).json({ error: b.exempt ? 'Check is already tax-exempt' : 'Check is not tax-exempt' });
+  }
+  db.prepare('UPDATE checks SET tax_exempt = ? WHERE id = ?').run(after, check.id);
+  const t = persistTotals(check.id);
+  broadcastCheckUpdated(check.id);
+  auditApproval(req, 'tax_exempt', { check_id: check.id },
+    { approver: mgr.name, approver_id: mgr.id, before: { tax_exempt: !!before }, after: { tax_exempt: !!after }, reason });
+  res.json({ check_id: check.id, tax_exempt: !!after, approved_by: mgr.name, totals: t });
 });
 
 /* ============================ discount library =============================
@@ -3868,8 +4066,8 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
     }
   } catch { /* parity_orders migrate owns this table */ }
   const insertLine = db.prepare(
-    `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
-       note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
+    `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, tax_rate_bps, tax_inclusive, modifiers_json, course, state, added_at,
+       note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
   );
   const newTicket = db.prepare(
     `INSERT INTO kds_tickets (uuid, site_id, check_id, station, table_label, server_name, items_json, status, created_at)
@@ -3904,8 +4102,9 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
     }
     const insertedIds = [];
     for (const p of prepared) {
+      const taxSnap = taxSnapshotOf(p.menuItem);
       const r = insertLine.run(crypto.randomUUID(), check.id, p.menuItem.id, p.seat, p.qty, p.unitPrice,
-        p.modifiersJson, p.course, nowIso(), p.note, p.allergy, p.allergyDetail);
+        taxSnap.tax_rate_bps, taxSnap.tax_inclusive, p.modifiersJson, p.course, nowIso(), p.note, p.allergy, p.allergyDetail);
       insertedIds.push(r.lastInsertRowid);
     }
     const held = db.prepare(
@@ -4094,11 +4293,14 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
     const movedDisc = Math.round((it.discount_cents || 0) * q / it.qty);
     db.prepare('UPDATE check_items SET qty = qty - ?, discount_cents = discount_cents - ? WHERE id = ?')
       .run(q, movedDisc, it.id);
+    const taxSnap = taxSnapshotOf(it);
     db.prepare(`INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents,
+        tax_rate_bps, tax_inclusive,
         modifiers_json, course, state, sent_at, added_at, note, allergy, allergy_detail,
         discount_cents, discount_reason)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(crypto.randomUUID(), targetCheckId, it.menu_item_id, it.seat, q, it.unit_price_cents,
+        taxSnap.tax_rate_bps, taxSnap.tax_inclusive,
         it.modifiers_json, it.course, it.state, it.sent_at, nowIso(),
         it.note, it.allergy, it.allergy_detail, movedDisc, it.discount_reason);
   }
@@ -4300,10 +4502,12 @@ app.post('/api/checks/:id/split-item-cost', serverPlus(), (req, res) => {
   const n = targetIds.length;
   const shareRows = [];
   const doSplitCost = () => {
+    const taxSnap = taxSnapshotOf(item);
     const insItem = db.prepare(`INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents,
+        tax_rate_bps, tax_inclusive,
         modifiers_json, course, state, sent_at, added_at, note, allergy, allergy_detail,
         discount_cents, discount_reason)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     /* Modifier deltas fold into the share price; the modifiers ride at
      * 0 delta so they render (cart, receipt, a later KDS fire of a held
      * share) without ever being charged twice. Per-modifier notes and
@@ -4314,6 +4518,7 @@ app.post('/api/checks/:id/split-item-cost', serverPlus(), (req, res) => {
       const prov = `Split share ${i + 1} of ${n} — ${item.name} from check #${check.id}`;
       const note = item.note ? `${item.note} · ${prov}` : prov;
       const r = insItem.run(crypto.randomUUID(), tid, item.menu_item_id, item.seat, 1, grossShares[i],
+        taxSnap.tax_rate_bps, taxSnap.tax_inclusive,
         JSON.stringify(displayMods), item.course, item.state, item.sent_at, now,
         note, item.allergy, item.allergy_detail, discShares[i], item.discount_reason);
       shareRows.push({ check_id: tid, item_id: Number(r.lastInsertRowid), share_cents: shares[i], gross_cents: grossShares[i], discount_cents: discShares[i] });
@@ -5291,41 +5496,88 @@ const REPORT_DEFS = {
   },
   tax: {
     title: 'Sales tax',
-    notes: ['Taxable sales = subtotal (net of item discounts) + surcharge + mandatory service charge — the exact base calcTotals taxes. Comps reduce the amount owed AFTER tax; they do NOT reduce taxable sales, and are reported in their own column. Tips are not taxed and are shown only for completeness.',
+    notes: ['Taxable sales = the base calcTotals actually taxed: line totals net of item discounts (tax-inclusive lines at their net-of-tax amount) + surcharge + mandatory service charge. Comps reduce the amount owed AFTER tax; they do NOT reduce taxable sales, and are reported in their own column. Tips are not taxed and are shown only for completeness.',
       'Whether comps SHOULD reduce the taxable base is a tax-policy question — Expoline reports what it actually charges; confirm the treatment with your accountant.',
-      'Mandatory service charges are included in taxable gross receipts in CA (CDTFA Publication 22, Jan 2025; Annotation 550.0740). Confirm with your accountant.'],
+      'Mandatory service charges are included in taxable gross receipts in CA (CDTFA Publication 22, Jan 2025; Annotation 550.0740). Confirm with your accountant.',
+      'Tax breadth (gap #9): per-item rates, tax-inclusive prices, and manager-approved exempt checks. "Tax included in prices" is the part of Tax collected that was already inside tax-inclusive sticker prices (backed out, not added on top). Exempt checks contribute no taxable sales and no tax; their would-be taxable base is shown in Exempt sales and they are counted in Exempt checks. The Tax by rate table breaks each day down per rate and sums exactly to the day row.'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'checks', label: 'Checks', kind: 'int' },
       { key: 'taxable_cents', label: 'Taxable sales', kind: 'money' },
       { key: 'tax_cents', label: 'Tax collected', kind: 'money' },
+      { key: 'tax_included_cents', label: 'Tax included in prices', kind: 'money' },
+      { key: 'exempt_checks', label: 'Exempt checks', kind: 'int' },
+      { key: 'exempt_sales_cents', label: 'Exempt sales', kind: 'money' },
       { key: 'comp_cents', label: 'Comps', kind: 'money' },
       { key: 'tips_cents', label: 'Tips (nontaxable)', kind: 'money' },
     ],
-    totalKeys: ['checks', 'taxable_cents', 'tax_cents', 'comp_cents', 'tips_cents'],
+    totalKeys: ['checks', 'taxable_cents', 'tax_cents', 'tax_included_cents', 'exempt_checks', 'exempt_sales_cents', 'comp_cents', 'tips_cents'],
     build(from, to) {
       const checks = db.prepare("SELECT * FROM checks WHERE site_id = ? AND status IN ('paid','closed') AND closed_at IS NOT NULL").all(SITE_ID);
       const tipByCheck = new Map();
       for (const p of db.prepare('SELECT check_id, tip_cents FROM payments WHERE site_id = ?').all(SITE_ID)) {
         tipByCheck.set(p.check_id, (tipByCheck.get(p.check_id) || 0) + (p.tip_cents || 0));
       }
+      const rateRows = [];
       const rows = eachDate(from, to).map((date) => {
-        const r = { date, checks: 0, taxable_cents: 0, tax_cents: 0, comp_cents: 0, tips_cents: 0 };
+        const r = { date, checks: 0, taxable_cents: 0, tax_cents: 0, tax_included_cents: 0, exempt_checks: 0, exempt_sales_cents: 0, comp_cents: 0, tips_cents: 0 };
+        const byRate = new Map(); // rate_bps -> { base_cents, tax_cents, included_cents }
         for (const c of checks) {
           if (tzDate(c.closed_at) !== date) continue;
           const t = persistTotals(c.id);
           r.checks++;
-          // Taxable = the base calcTotals actually taxed (subtotal + surcharge
-          // + service charge). Comps never reduce it — they reduce the amount
-          // owed after tax — and are summed into their own column instead.
-          r.taxable_cents += t.subtotal + t.surcharge + t.service_charge;
           r.tax_cents += t.tax;
+          r.tax_included_cents += t.tax_included_cents || 0;
           r.comp_cents += t.comp;
           r.tips_cents += tipByCheck.get(c.id) || 0;
+          if (c.tax_exempt) {
+            // Exempt checks are identifiable and carry zero tax; their
+            // base is NOT taxable sales — it is reported separately so
+            // the by-rate table still sums exactly to taxable_cents.
+            r.exempt_checks++;
+            r.exempt_sales_cents += t.taxable_base_cents || 0;
+            continue;
+          }
+          // Taxable = the base calcTotals actually taxed (net-of-tax line
+          // bases + surcharge + service charge). Comps never reduce it —
+          // they reduce the amount owed after tax — and are summed into
+          // their own column instead. For a classic check this equals
+          // subtotal + surcharge + service charge exactly.
+          r.taxable_cents += t.taxable_base_cents;
+          for (const d of t.tax_detail || []) {
+            const g = byRate.get(d.rate_bps) || { base_cents: 0, tax_cents: 0, included_cents: 0 };
+            g.base_cents += d.base_cents;
+            g.tax_cents += d.tax_cents;
+            g.included_cents += d.included_cents;
+            byRate.set(d.rate_bps, g);
+          }
+        }
+        for (const [bps, g] of [...byRate.entries()].sort((a, b) => a[0] - b[0])) {
+          rateRows.push({ date, rate_bps: bps, rate: Math.floor(bps / 100) + '.' + String(bps % 100).padStart(2, '0') + '%', base_cents: g.base_cents, tax_cents: g.tax_cents, included_cents: g.included_cents });
         }
         return r;
       });
-      return { rows, extraTables: [] };
+      const extraTables = [];
+      if (rateRows.length) {
+        extraTables.push({
+          title: 'Tax by rate',
+          columns: [
+            { key: 'date', label: 'Date', kind: 'date' },
+            { key: 'rate', label: 'Rate', kind: 'text' },
+            { key: 'base_cents', label: 'Taxable base', kind: 'money' },
+            { key: 'tax_cents', label: 'Tax', kind: 'money' },
+            { key: 'included_cents', label: 'Of which included', kind: 'money' },
+          ],
+          rows: rateRows,
+          totals: {
+            label: 'Total',
+            base_cents: rateRows.reduce((a, r) => a + r.base_cents, 0),
+            tax_cents: rateRows.reduce((a, r) => a + r.tax_cents, 0),
+            included_cents: rateRows.reduce((a, r) => a + r.included_cents, 0),
+          },
+        });
+      }
+      return { rows, extraTables };
     },
   },
   labor: {
@@ -7921,7 +8173,7 @@ app.post('/api/waitlist/:id/seat', serverPlus(), (req, res) => {
   // Attach the pre-order as HELD items — the kitchen fires nothing until /send.
   const preorder = parseJson(w.preorder_json, []);
   const insPre = db.prepare(
-    "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
+    "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, tax_rate_bps, tax_inclusive, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
   );
   const skipped = [];
   let seatConsumed86 = false;
@@ -7941,7 +8193,9 @@ app.post('/api/waitlist/:id/seat', serverPlus(), (req, res) => {
         if (cr.consumed) seatConsumed86 = true;
       }
       const unit = ln.unit_price_cents != null ? ln.unit_price_cents : mi.price_cents;
+      const taxSnap = taxSnapshotOf(mi);
       insPre.run(crypto.randomUUID(), opened.check.id, mi.id, seat, qty, unit,
+        taxSnap.tax_rate_bps, taxSnap.tax_inclusive,
         JSON.stringify(Array.isArray(ln.modifiers) ? ln.modifiers : []), mi.course, nowIso());
     }
   });
@@ -9052,7 +9306,7 @@ require('./routes/insights').register(app, {
 parityKdsPay.registerStaff(app, {
   db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
   persistTotals, checkResponse, broadcastCheckUpdated, broadcastMenuUpdated, broadcastTicket, ticketView,
-  effectivePriceCents, dayClosedToday, isDayClosed,
+  effectivePriceCents, taxSnapshotOf, dayClosedToday, isDayClosed,
 });
 /* Phase 3A competitor parity: order & check flow (dayparts, timers, guest
    names, fired-item edits, merge, move). */
