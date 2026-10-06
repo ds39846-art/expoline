@@ -171,6 +171,10 @@ function baseCtx() {
     console,
     esc: (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'),
     fmt: (cents) => '$' + ((Number(cents) || 0) / 100).toFixed(2),
+    /* Mirror of the real helper in app.js (the REAL dispPrice and
+       priceHtml are pinned by harness46); addItemFlow's modal header
+       renders the charged-right-now price through it. */
+    dispPrice: (item) => (item && item.effective_price_cents != null ? item.effective_price_cents : (item ? item.price_cents : 0)),
   };
   vm.createContext(ctx);
   return ctx;

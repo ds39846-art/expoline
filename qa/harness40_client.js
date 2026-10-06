@@ -264,6 +264,7 @@ section('F. addItemFlow — course picker, seat stepper, Modify preset plumbing'
     console, menu: [], activeCat: null,
     esc: (s) => String(s == null ? '' : s),
     fmt: (c) => '$' + ((Number(c) || 0) / 100).toFixed(2),
+    dispPrice: (item) => (item && item.effective_price_cents != null ? item.effective_price_cents : (item ? item.price_cents : 0)), /* mirror of the real helper — harness46 pins the real one */
     $: (sel, root) => (root || ctx.__bd).querySelector(sel),
     $$: (sel, root) => (root || ctx.__bd).querySelectorAll(sel),
     toast: (m) => toasts.push(m),

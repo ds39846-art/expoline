@@ -275,6 +275,7 @@ section('K. addItemFlow — "Add to order" on add, "Save" on Modify');
     console, menu: [], activeCat: null,
     esc: (s) => String(s == null ? '' : s),
     fmt: (c) => '$' + ((Number(c) || 0) / 100).toFixed(2),
+    dispPrice: (item) => (item && item.effective_price_cents != null ? item.effective_price_cents : (item ? item.price_cents : 0)), /* mirror of the real helper — harness46 pins the real one */
     $: (sel, root) => (root || ctx.__bd).querySelector(sel),
     $$: (sel, root) => (root || ctx.__bd).querySelectorAll(sel),
     toast: () => {},
@@ -324,6 +325,7 @@ section('L. drawCart — note and allergy do not render fused');
     __cb: cartBody,
     esc: (s) => String(s == null ? '' : s),
     fmt: (c) => '$' + ((Number(c) || 0) / 100).toFixed(2),
+    dispPrice: (item) => (item && item.effective_price_cents != null ? item.effective_price_cents : (item ? item.price_cents : 0)), /* mirror of the real helper — harness46 pins the real one */
     /* The sel-bar buttons are part of the HTML drawCart itself renders,
        so the real code wires their handlers unguarded — the shim hands
        back a benign stub element instead of null. */
