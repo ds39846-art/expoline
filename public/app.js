@@ -4036,7 +4036,7 @@ async function renderSvcChargeSettings(app) {
     '<label>Min guests (threshold)<input type="number" id="sc-min" min="0" max="99" step="1" inputmode="numeric" placeholder="8"></label>' +
     '<label>Manager PIN<input type="password" id="sc-pin" inputmode="numeric" maxlength="8" placeholder="••••" style="max-width:140px"></label>' +
     '</div>' +
-    '<p class="muted small">The percentage applies to the check subtotal for parties at or above the threshold. Set the threshold to <b>0</b> to disable the charge entirely. Sales tax is computed on subtotal + surcharge + service charge − comps.</p>' +
+    '<p class="muted small">The percentage applies to the check subtotal for parties at or above the threshold. Set the threshold to <b>0</b> to disable the charge entirely. Sales tax is computed on subtotal + surcharge + service charge. Comps reduce the amount owed after tax — they never reduce the taxable base.</p>' +
     '<button class="btn btn-primary" id="sc-save">Save changes</button></div>' +
     '<div class="card mt"><h2>Cash drawer closeout</h2>' +
     '<p class="muted small">Who may perform the blind drawer close. <b>Manager-only</b> is the safe default: only a manager enters the counted cash while the server computes expected vs. counted. Relaxing to <b>Servers too</b> lets servers close the drawer themselves (the count stays blind — they never see expected).</p>' +

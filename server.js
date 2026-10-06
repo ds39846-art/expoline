@@ -20,7 +20,9 @@
  *   California it is part of the taxable sale (see below). The manager UI
  *   and every report carry a "confirm with your accountant" note — Expoline
  *   is not giving tax or legal advice.
- *   taxable        : subtotal + surcharge + service_charge - comps
+ *   taxable        : subtotal + surcharge + service_charge
+ *     (comps do NOT reduce the taxable base — they reduce the amount
+ *      owed, after tax; see total below)
  *     - tips are NEVER taxed (only voluntary tips retained by employees are
  *       nontaxable — CA CDTFA Publication 22, Dining and Beverage Industry,
  *       Jan 2025)
@@ -28,7 +30,7 @@
  *       in taxable gross receipts (CDTFA Pub 22 §"Tips, gratuities, and
  *       service charges"; Sales and Use Tax Annotation 550.0740)
  *   tax            : round(taxable * tax_rate)          (7.75% from site_config)
- *   total          : subtotal + surcharge + service_charge + tax
+ *   total          : max(0, subtotal + surcharge + service_charge + tax - comps)
  *   balance        : total - Σ(amount_cents - refunded_cents) over all payments
  *     (NOTE: the spec's literal formula `total - Σ(completed amount) +
  *      Σ(refunded)` double-counts refunds for refunded/partial_refund rows, so
@@ -4558,16 +4560,18 @@ const REPORT_DEFS = {
   },
   tax: {
     title: 'Sales tax',
-    notes: ['Taxable sales = gross + surcharge + service charge − comps. Tips are not taxed and are shown only for completeness.',
+    notes: ['Taxable sales = subtotal (net of item discounts) + surcharge + mandatory service charge — the exact base calcTotals taxes. Comps reduce the amount owed AFTER tax; they do NOT reduce taxable sales, and are reported in their own column. Tips are not taxed and are shown only for completeness.',
+      'Whether comps SHOULD reduce the taxable base is a tax-policy question — Expoline reports what it actually charges; confirm the treatment with your accountant.',
       'Mandatory service charges are included in taxable gross receipts in CA (CDTFA Publication 22, Jan 2025; Annotation 550.0740). Confirm with your accountant.'],
     columns: [
       { key: 'date', label: 'Date', kind: 'date' },
       { key: 'checks', label: 'Checks', kind: 'int' },
       { key: 'taxable_cents', label: 'Taxable sales', kind: 'money' },
       { key: 'tax_cents', label: 'Tax collected', kind: 'money' },
+      { key: 'comp_cents', label: 'Comps', kind: 'money' },
       { key: 'tips_cents', label: 'Tips (nontaxable)', kind: 'money' },
     ],
-    totalKeys: ['checks', 'taxable_cents', 'tax_cents', 'tips_cents'],
+    totalKeys: ['checks', 'taxable_cents', 'tax_cents', 'comp_cents', 'tips_cents'],
     build(from, to) {
       const checks = db.prepare("SELECT * FROM checks WHERE site_id = ? AND status IN ('paid','closed') AND closed_at IS NOT NULL").all(SITE_ID);
       const tipByCheck = new Map();
@@ -4575,13 +4579,17 @@ const REPORT_DEFS = {
         tipByCheck.set(p.check_id, (tipByCheck.get(p.check_id) || 0) + (p.tip_cents || 0));
       }
       const rows = eachDate(from, to).map((date) => {
-        const r = { date, checks: 0, taxable_cents: 0, tax_cents: 0, tips_cents: 0 };
+        const r = { date, checks: 0, taxable_cents: 0, tax_cents: 0, comp_cents: 0, tips_cents: 0 };
         for (const c of checks) {
           if (tzDate(c.closed_at) !== date) continue;
           const t = persistTotals(c.id);
           r.checks++;
-          r.taxable_cents += t.subtotal + t.surcharge + t.service_charge - t.comp;
+          // Taxable = the base calcTotals actually taxed (subtotal + surcharge
+          // + service charge). Comps never reduce it — they reduce the amount
+          // owed after tax — and are summed into their own column instead.
+          r.taxable_cents += t.subtotal + t.surcharge + t.service_charge;
           r.tax_cents += t.tax;
+          r.comp_cents += t.comp;
           r.tips_cents += tipByCheck.get(c.id) || 0;
         }
         return r;
