@@ -16,17 +16,18 @@ couldn't tell the price already included tax. This rider adds the
       TV menu boards (/api/menuboards -> public/views/menuboards.js),
       which share routes/kiosk.js buildMenu: kiosk orders snapshot
       the flag and total through persistTotals/calcTotals too.
-  OUT online ordering (/api/online/menu -> public/views/online.js):
-      routes/online.js prices orders with its OWN math —
-      tax = Math.round(subtotal * flat site rate) on the FULL sticker
-      price, with no per-item rate and no inclusive back-out (the
-      module never references tax_inclusive). An inclusive item
-      ordered online is taxed ON TOP, so a "Tax included" label there
-      would be a LIE. Section E pins the exclusion three ways
-      (payload carries no flag, view renders no label, and a placed
-      order's tax is hand-verified to be the on-top amount) so a
-      future well-meaning change can't quietly add the label without
-      fixing the online math first.
+  ONLINE ordering (/api/online/menu -> public/views/online.js) was
+      OUT of scope for the original rider: routes/online.js priced
+      orders with its own flat math — tax = Math.round(subtotal *
+      site rate) on the FULL sticker price, no per-item rate, no
+      inclusive back-out — so a "Tax included" label there would have
+      been a LIE, and section E pinned that exclusion. The online
+      tax-parity batch (test60) then gave online orders the floor's
+      per-item tax semantics, so the exclusion is LIFTED: section E
+      now pins the parity (payload carries the flag, view renders the
+      label conditioned on it, route applies the semantics, and a
+      placed order's tax is hand-verified to be the BACKED-OUT amount
+      — the exact behavior change test60 proves exhaustively).
 
 This batch is presentation + payload passthrough ONLY — no totals
 change anywhere. Section F is the equivalence anchor: a guest order
@@ -237,26 +238,31 @@ def main():
         ok("D5 menu-board view: no negated-flag render anywhere in the file",
            not re.search(r"!\s*it\.tax_inclusive", msrc))
 
-        print("--- E: online ordering — label honestly ABSENT ---")
+        print("--- E: online ordering — tax parity landed (test60), label TRUE ---")
         s, om = req("GET", "/api/online/menu")
         assert s == 200, (s, om)
         oi = flat_menu({"categories": om})
-        ok("E1 online payload carries NO tax_inclusive flag",
-           "tax_inclusive" not in oi[ids["incl"]], oi[ids["incl"]])
+        ok("E1 online payload carries the flag (true on the inclusive item)",
+           oi[ids["incl"]].get("tax_inclusive") is True
+           and oi[ids["plain"]].get("tax_inclusive") is False, oi[ids["incl"]])
         osrc = src_of("public/views/online.js")
-        ok("E2 online view has no inclusive label or flag logic",
-           "Tax included" not in osrc and "tax_inclusive" not in osrc)
-        ok("E3 online route never reads the flag (own flat-rate math)",
-           "tax_inclusive" not in src_of("routes/online.js"))
-        # The reason, proven with money: an inclusive item ordered online
-        # is taxed ON TOP of its full sticker price (round(2000*.0775)=155),
-        # so "Tax included" there would be false.
+        ok("E2 online view renders the label, conditioned on the flag (no negation)",
+           "(it.tax_inclusive ? '<span class=\"olo-taxincl\">Tax included</span>'" in osrc
+           and not re.search(r"!\s*it\.tax_inclusive", osrc))
+        ok("E3 online route applies the per-item tax semantics",
+           "tax_inclusive" in src_of("routes/online.js")
+           and "taxSnapshotOf" in src_of("routes/online.js"))
+        # Proven with money: the inclusive item ordered online now backs
+        # its tax OUT — net = round(2000/1.0775) = 1856, included = 144 —
+        # tax_cents 144 (all of it included), total stays the $20.00
+        # sticker. (Pre-parity this was tax 155 ON TOP, total 2155.)
         s, o = req("POST", "/api/online/orders",
                    {"customer_name": "QA59", "phone": "5555901001",
                     "items": [{"menu_item_id": ids["incl"], "qty": 1}]})
-        ok("E4 online math taxes the inclusive sticker ON TOP (label would lie)",
+        ok("E4 online math backs the inclusive tax OUT (label is true)",
            s == 201 and o.get("subtotal_cents") == 2000
-           and o.get("tax_cents") == 155 and o.get("total_cents") == 2155,
+           and o.get("tax_cents") == 144 and o.get("tax_included_cents") == 144
+           and o.get("total_cents") == 2000,
            (s, o))
 
         print("--- F: totals equivalence a368b34 vs HEAD (no money moved) ---")
