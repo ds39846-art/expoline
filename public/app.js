@@ -1957,6 +1957,125 @@ async function renderOrder(app, checkId) {
      Online-only, like comps: the offline outbox and the LAN op
      vocabulary have no discount op, so offline gets a plain refusal
      instead of a queue entry that could never sync. */
+  /* Split item cost (audit gap #7): divide ONE server line across 2+
+     open checks — evenly, or typed per-check amounts that must add up
+     to the line total exactly. The source check is preselected (the
+     common case keeps a share here). The endpoint carries the split
+     permission gate, so staff without it detour through the PIN step
+     and retry, the split-flow pattern. */
+  const openSplitItemCost = async (item) => {
+    if (isOffline()) { toast('Splits need a connection — reconnect to split', 'err'); return; }
+    const amount = item.line_total_cents || 0;
+    if (amount < 2) { toast('This line totals ' + fmt(amount) + ' — too small to split across checks', 'err'); return; }
+    let openRows = [];
+    try { openRows = await api('/api/checks/open'); } catch (e) { handleApiError(e); return; }
+    const rows = (Array.isArray(openRows) ? openRows : []).filter((c) => c && c.id != null);
+    if (rows.length < 2) { toast('No other open checks to split this line with', 'err'); return; }
+    const sel = new Set([Number(check.id)]);
+    const typed = {}; // check id -> raw dollars string (custom mode)
+    let scMode = 'even';
+    const labelFor = (c) => c.table_label || c.tab_name || ('Check #' + c.id);
+    const bd = openModal('<h2>Split item cost</h2>' +
+      '<p class="muted">Divide <b>' + esc(item.name) + '</b> — ' + fmt(amount) + ' — across open checks. The line is consumed here; each picked check gets its share as its own line.</p>' +
+      '<div class="field"><label>How to divide</label><div class="frow">' +
+      '<button class="btn btn-sm btn-primary" data-scm="even">Evenly</button>' +
+      '<button class="btn btn-sm btn-ghost" data-scm="custom">Custom amounts</button></div></div>' +
+      '<div class="checkbox-list" id="sc-list"></div>' +
+      '<p class="small" id="sc-readout"></p>' +
+      '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+      '<button class="btn btn-primary" data-x="go">Split cost</button></div>');
+    const selectedIds = () => rows.filter((c) => sel.has(Number(c.id))).map((c) => Number(c.id));
+    const customShares = () => selectedIds().map((id) => {
+      const p = parseShareInput(typed[id]);
+      return p.error ? null : p.cents;
+    });
+    const drawReadout = () => {
+      const ids = selectedIds();
+      const el = $('#sc-readout', bd);
+      if (!el) return;
+      if (ids.length < 2) { el.textContent = 'Pick at least 2 checks.'; return; }
+      if (scMode === 'even') {
+        el.textContent = amount < ids.length
+          ? 'The line total is too small to give every picked check at least 1¢ — use fewer checks.'
+          : 'Each picked check is charged the share shown — they add up to ' + fmt(amount) + '.';
+      } else {
+        const sh = customShares();
+        if (sh.some((s) => s == null)) { el.textContent = 'Type an amount over zero for every picked check.'; return; }
+        const sum = sh.reduce((a, s) => a + s, 0);
+        el.textContent = splitSharesValid(amount, sh)
+          ? 'Shares add up to ' + fmt(amount) + ' — ready.'
+          : 'Shares add to ' + fmt(sum) + ' of ' + fmt(amount) + ' — they must match exactly.';
+      }
+    };
+    const draw = () => {
+      const ids = selectedIds();
+      const even = splitSharesEven(amount, ids.length);
+      $('#sc-list', bd).innerHTML = rows.map((c) => {
+        const id = Number(c.id), on = sel.has(id);
+        const shareHtml = !on ? ''
+          : scMode === 'even' ? '<span class="sc-share">' + fmt(even[ids.indexOf(id)] || 0) + '</span>'
+          : '<input class="sc-amt" data-scamt="' + id + '" type="text" inputmode="decimal" placeholder="0.00" value="' + esc(typed[id] || '') + '">';
+        return '<label><input type="checkbox" data-scsel="' + id + '"' + (on ? ' checked' : '') + '>' +
+          '<span style="flex:1">' + esc(labelFor(c)) + (id === Number(check.id) ? ' <span class="muted small">(this check)</span>' : '') +
+          ' <span class="muted small">' + esc(c.server_name || '') + ' · total ' + fmt(c.total_cents || 0) + '</span></span>' + shareHtml + '</label>';
+      }).join('');
+      $$('[data-scsel]', bd).forEach((cb) => cb.onchange = () => {
+        const id = Number(cb.dataset.scsel);
+        if (cb.checked) sel.add(id); else sel.delete(id);
+        draw();
+      });
+      $$('[data-scamt]', bd).forEach((inp) => inp.oninput = () => { typed[Number(inp.dataset.scamt)] = inp.value; drawReadout(); });
+      $$('[data-scm]', bd).forEach((b) => { b.className = 'btn btn-sm ' + (b.dataset.scm === scMode ? 'btn-primary' : 'btn-ghost'); });
+      drawReadout();
+    };
+    $$('[data-scm]', bd).forEach((b) => b.onclick = () => { scMode = b.dataset.scm; draw(); });
+    $('[data-x="c"]', bd).onclick = () => closeModal();
+    $('[data-x="go"]', bd).onclick = async () => {
+      const ids = selectedIds();
+      if (ids.length < 2) { toast('Pick at least 2 checks', 'err'); return; }
+      const body = { item_id: item.id, targets: ids };
+      if (scMode === 'even') {
+        if (amount < ids.length) { toast('The line total is too small to split that many ways', 'err'); return; }
+      } else {
+        const sh = customShares();
+        if (sh.some((s) => s == null)) { toast('Type an amount over zero for every picked check', 'err'); return; }
+        if (!splitSharesValid(amount, sh)) { toast('Shares add to ' + fmt(sh.reduce((a, s) => a + s, 0)) + ' — the line is ' + fmt(amount), 'err'); return; }
+        body.shares = sh;
+      }
+      closeModal();
+      await postSplitCost(body);
+    };
+    draw();
+  };
+
+  const postSplitCost = async (body) => {
+    try {
+      const r = await api('/api/checks/' + realId(checkId) + '/split-item-cost', 'POST', body);
+      toast('Split ' + fmt(r.amount_cents) + ' across ' + (r.checks || []).length + ' checks', 'ok');
+      renderRoute(true);
+    } catch (e) {
+      /* Staff without the split permission: PIN step, then retry with
+         the same body — the split-flow pattern. */
+      if (e instanceof ApiError && e.status === 403 && e.body && e.body.need_manager_pin) {
+        const bd = openModal('<h2>Manager approval</h2>' +
+          '<p class="muted">Splitting checks needs the split permission. A manager can approve with their PIN.</p>' +
+          '<div class="field"><label for="spc-pin">Manager PIN</label>' +
+          '<input type="password" id="spc-pin" inputmode="numeric" maxlength="4" placeholder="••••" style="max-width:140px" autocomplete="off"></div>' +
+          '<div class="modal-actions"><button class="btn btn-ghost" data-x="c">Cancel</button>' +
+          '<button class="btn btn-primary" data-x="go">Approve split</button></div>');
+        $('[data-x="c"]', bd).onclick = closeModal;
+        $('[data-x="go"]', bd).onclick = async () => {
+          const pin = $('#spc-pin', bd).value.trim();
+          if (!/^\d{4}$/.test(pin)) { toast("Enter the manager's 4-digit PIN", 'err'); return; }
+          closeModal();
+          await postSplitCost(Object.assign({}, body, { manager_pin: pin }));
+        };
+        return;
+      }
+      if (e instanceof ApiError) toast(e.message, 'err'); else handleApiError(e);
+    }
+  };
+
   const openDiscountPicker = async (opts) => {
     const scope = opts.scope;
     const item = opts.item || null;
@@ -2371,6 +2490,9 @@ async function renderOrder(app, checkId) {
                 const it = (check.items || []).find((x) => String(x.id) === String(ref.id));
                 if (it && await PO.openEditItemModal(check, it)) renderRoute(true);
               }
+            } else if (a === 'splitcost') {
+              const it = (check.items || []).find((x) => String(x.id) === String(ref.id));
+              if (it) await openSplitItemCost(it);
             }
           } catch (e) { handleApiError(e); }
           finally {
@@ -3348,6 +3470,43 @@ function declaredTipsPreview(cardCents, recordedCashCents, declaredStr) {
   if (p.error) return { error: p.error };
   const t = tipsOfRecord(cardCents, recordedCashCents, p.cents);
   return { declared_cents: p.cents, cash_of_record_cents: t.cash_of_record_cents, total_tips_cents: t.total_tips_cents };
+}
+
+/* Split item cost (audit gap #7): three small helpers carry the
+   dialog math. The even rule is the server rule verbatim — every
+   share is the floor and the first shares in order absorb one extra
+   cent each — so the preview the server sees is the charge the
+   checks get. Explicit shares are valid only when every share is a
+   positive whole number of cents and they add up to the line amount
+   exactly; the dialog never posts an invalid set. */
+function splitSharesEven(amountCents, n) {
+  const amount = Math.max(0, Math.round(Number(amountCents) || 0));
+  const count = Math.max(0, Math.floor(Number(n) || 0));
+  if (!count) return [];
+  const base = Math.floor(amount / count);
+  const rem = amount - base * count;
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(base + (i < rem ? 1 : 0));
+  return out;
+}
+
+function parseShareInput(str) {
+  const raw = String(str == null ? '' : str).trim();
+  if (!raw) return { error: 'Enter an amount' };
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return { error: 'Enter the share as dollars, e.g. 12.50' };
+  if (v <= 0) return { error: 'Each share must be more than zero' };
+  return { cents: Math.round(v * 100) };
+}
+
+function splitSharesValid(amountCents, shares) {
+  if (!Array.isArray(shares) || !shares.length) return false;
+  let sum = 0;
+  for (const s of shares) {
+    if (!Number.isInteger(s) || s < 1) return false;
+    sum += s;
+  }
+  return sum === amountCents;
 }
 
 /* Discount library (audit gap #4): three small helpers carry the

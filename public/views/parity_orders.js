@@ -552,7 +552,10 @@ function seatStripHtml(o) {
  *  reopens the modifier flow on the staged line (app.js restage).
  *  Course pills (o.canCourse — staged + held lines): one tap re-courses
  *  the line; app.js applies staged changes locally and held changes via
- *  the item PATCH. Fired lines get no pills (PIN-gated modal instead). */
+ *  the item PATCH. Fired lines get no pills (PIN-gated modal instead).
+ *  "Split cost" shows for server lines only (never staged — a staged
+ *  line has no server row to divide): it opens the split-item-cost
+ *  dialog in app.js, which divides this one line across open checks. */
 function quickBarHtml(o) {
   const qty = Math.max(1, o.qty || 1), seat = Math.max(1, o.seat || 1);
   const guests = Math.max(1, o.guestCount || 1);
@@ -575,6 +578,7 @@ function quickBarHtml(o) {
     '<button class="btn btn-sm" data-qa="repeat">Repeat 🔁</button>' +
     '<button class="btn btn-sm qb-void" data-qa="void">Void</button>' +
     '<button class="btn btn-sm" data-qa="more">Modify</button>' +
+    (o.staged ? '' : '<button class="btn btn-sm" data-qa="splitcost">Split cost</button>') +
     '</div>';
 }
 

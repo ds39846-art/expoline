@@ -3930,6 +3930,194 @@ app.post('/api/checks/:id/split', serverPlus(), (req, res) => {
   res.json({ split_from: check.id, checks: createdIds });
 });
 
+/* ------------------------- split one line by cost --------------------------
+ * POST /api/checks/:id/split-item-cost {item_id, targets: [checkId, ...],
+ *   shares?: [cents, ...], manager_pin?}
+ * Audit gap #7 (Toast/SpotOn parity): divide ONE line's cost across 2+
+ * EXISTING open checks — the shared bottle of wine four guests each want
+ * on their own check. The split family above moves whole lines or whole
+ * quantities; this endpoint divides the amount itself.
+ *
+ * What is split: the line's NET total (lineGross − line discount). The
+ * ad-hoc line discount follows proportionally — the same treatment the
+ * qty-division split gives it (Math.round proration) — so every share
+ * line carries gross_i and discount_i with gross_i − discount_i = net_i,
+ * Σ gross_i = lineGross and Σ discount_i = the line discount exactly
+ * (the LAST target in request order takes the proration residue, the
+ * exact-cent analogue of the residue staying on a qty-divided line).
+ * A live LIBRARY item discount on the line refuses the split, exactly
+ * like the split family: its snapshot is never prorated.
+ *
+ * Share lines are ordinary check_items rows (qty 1) whose unit price is
+ * the share's gross with the source line's modifier deltas folded in
+ * (modifiers ride for display at 0 delta), so lineGross(share) =
+ * gross_i and lineTotal(share) = net_i by construction — calcTotals
+ * needs no changes and each target check taxes its own share. The
+ * source line is consumed the way voids consume a line (state →
+ * 'cancelled', provenance appended to its note) and every share line
+ * carries its provenance in its note. State rides along: held shares
+ * stay held; a fired line's shares stay 'sent' with the original
+ * sent_at, so no new KDS ticket is ever created by the split (the
+ * kitchen made the item once) and nothing can re-fire.
+ *
+ * Gates mirror POST /split exactly, in the same order: source check
+ * open → no large-party service charge → no payments on the source →
+ * the split permission (manager role, split_allowed, or a manager PIN).
+ * Targets only need to exist and be open (the family's move target
+ * rule); a target with partial payments simply owes more. Open checks
+ * carry no closed business date, so the EOD freeze cannot apply —
+ * the same reason the split family has no day guard. */
+function evenShareCents(amount, n) {
+  const base = Math.floor(amount / n);
+  const rem = amount - base * n;
+  return Array.from({ length: n }, (_, i) => base + (i < rem ? 1 : 0));
+}
+
+app.post('/api/checks/:id/split-item-cost', serverPlus(), (req, res) => {
+  const b = req.body || {};
+  const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
+  if (!check) return res.status(404).json({ error: 'Check not found' });
+  if (check.status !== 'open') return res.status(400).json({ error: `Cannot split item cost on a ${check.status} check` });
+
+  // Large parties carry a service charge and must stay on ONE check.
+  const totals = persistTotals(check.id);
+  if (totals.service_charge > 0) {
+    const pctLabel = Math.round(getConfig().service_charge_pct * 1000) / 10;
+    return res.status(400).json({ error: `Cannot split: this check has a ${pctLabel}% large-party service charge and must stay on a single check` });
+  }
+  const payCount = db.prepare('SELECT COUNT(*) AS n FROM payments WHERE check_id = ?').get(check.id).n;
+  if (payCount > 0) {
+    return res.status(400).json({ error: 'Cannot split a check that already has payments' });
+  }
+  // Split permission, identical to POST /split: managers always; staff
+  // with split_allowed; anyone else needs a manager PIN fallback.
+  let splitApprovedBy = null;
+  if (req.user.role !== 'manager' && !req.user.split_allowed) {
+    const mgr = verifyManagerPin(b.manager_pin);
+    if (!mgr) {
+      return res.status(403).json({ error: 'Splitting checks needs the split permission — ask a manager', need_manager_pin: true });
+    }
+    splitApprovedBy = mgr.name;
+  }
+
+  const itemId = b.item_id != null ? Number(b.item_id) : NaN;
+  if (!Number.isFinite(itemId)) return res.status(400).json({ error: 'item_id is required' });
+  const item = db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ? AND ci.check_id = ?')
+    .get(itemId, check.id);
+  if (!item) return res.status(404).json({ error: 'Item not found on this check' });
+  if (item.state === 'cancelled') return res.status(400).json({ error: 'Item is already voided' });
+  if (!['held', 'sent', 'fulfilled'].includes(item.state)) {
+    return res.status(400).json({ error: `Cannot split a line in state ${item.state}` });
+  }
+  /* A live library application owns this line's discount slot and its
+   * removal reverses exactly the applied amount — prorating it across
+   * shares would orphan the snapshot. Refuse until it is removed. */
+  const libApp = db.prepare("SELECT * FROM check_discounts WHERE check_id = ? AND item_id = ? AND status = 'applied'").get(check.id, item.id);
+  if (libApp) return res.status(400).json({ error: `Remove the library discount "${libApp.name}" before splitting this line — library item discounts do not split` });
+
+  const gross = lineGross(item);
+  const disc = item.discount_cents || 0;
+  const net = lineTotal(item);
+  if (gross <= 0) return res.status(400).json({ error: 'Nothing to split: the line has no value' });
+  if (net <= 0) return res.status(400).json({ error: 'Nothing to split: the line discount covers the whole line — there is no cost left to divide' });
+
+  if (!Array.isArray(b.targets) || b.targets.length < 2) {
+    return res.status(400).json({ error: 'targets must list at least 2 checks to split the cost across' });
+  }
+  const targetIds = b.targets.map((t) => Number(t));
+  if (targetIds.some((t) => !Number.isInteger(t) || t <= 0)) {
+    return res.status(400).json({ error: 'targets must be check ids' });
+  }
+  if (new Set(targetIds).size !== targetIds.length) {
+    return res.status(400).json({ error: 'targets must be distinct checks' });
+  }
+  const targetChecks = [];
+  for (const tid of targetIds) {
+    const tc = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(tid, SITE_ID);
+    if (!tc) return res.status(404).json({ error: 'Target check not found' });
+    if (tc.status !== 'open') return res.status(400).json({ error: `Target check #${tid} is not open` });
+    targetChecks.push(tc);
+  }
+
+  let shares;
+  if (b.shares === undefined) {
+    if (net < targetIds.length) {
+      return res.status(400).json({ error: `The line total of ${net}¢ is too small to split ${targetIds.length} ways — every share must be at least 1¢` });
+    }
+    shares = evenShareCents(net, targetIds.length);
+  } else {
+    if (!Array.isArray(b.shares) || b.shares.length !== targetIds.length) {
+      return res.status(400).json({ error: 'shares must list one amount per target check' });
+    }
+    if (b.shares.some((s) => !isInt(s) || s < 1)) {
+      return res.status(400).json({ error: 'each share must be a positive integer number of cents' });
+    }
+    const sum = b.shares.reduce((a, s) => a + s, 0);
+    if (sum !== net) {
+      return res.status(400).json({ error: `shares must add up to the line total of ${net}¢ — got ${sum}¢` });
+    }
+    shares = b.shares;
+  }
+  /* Discount proration, proportional to each net share (the qty-division
+   * precedent); the last target takes the residue so Σ discount_i is the
+   * line discount to the cent. gross_i = net_i + discount_i. */
+  const discShares = shares.map((s, i) => (i === shares.length - 1 ? null : Math.round(disc * s / net)));
+  discShares[discShares.length - 1] = disc - discShares.reduce((a, s) => a + (s || 0), 0);
+  const grossShares = shares.map((s, i) => s + discShares[i]);
+
+  const now = nowIso();
+  const n = targetIds.length;
+  const shareRows = [];
+  const doSplitCost = () => {
+    const insItem = db.prepare(`INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents,
+        modifiers_json, course, state, sent_at, added_at, note, allergy, allergy_detail,
+        discount_cents, discount_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    /* Modifier deltas fold into the share price; the modifiers ride at
+     * 0 delta so they render (cart, receipt, a later KDS fire of a held
+     * share) without ever being charged twice. Per-modifier notes and
+     * the allergy flag/detail ride verbatim — a share of an allergy
+     * item is still an allergy item. */
+    const displayMods = parseJson(item.modifiers_json, []).map((m) => Object.assign({}, m, { price_delta_cents: 0 }));
+    targetIds.forEach((tid, i) => {
+      const prov = `Split share ${i + 1} of ${n} — ${item.name} from check #${check.id}`;
+      const note = item.note ? `${item.note} · ${prov}` : prov;
+      const r = insItem.run(crypto.randomUUID(), tid, item.menu_item_id, item.seat, 1, grossShares[i],
+        JSON.stringify(displayMods), item.course, item.state, item.sent_at, now,
+        note, item.allergy, item.allergy_detail, discShares[i], item.discount_reason);
+      shareRows.push({ check_id: tid, item_id: Number(r.lastInsertRowid), share_cents: shares[i], gross_cents: grossShares[i], discount_cents: discShares[i] });
+    });
+    // Consume the source line (the void idiom) with its provenance.
+    const srcProv = `Split across checks ${targetIds.map((t) => '#' + t).join(', ')}`;
+    const srcNote = item.note ? `${item.note} · ${srcProv}` : srcProv;
+    db.prepare('UPDATE check_items SET state = ?, note = ? WHERE id = ?').run('cancelled', srcNote, item.id);
+    for (const id of new Set([check.id, ...targetIds])) {
+      persistTotals(id);
+      broadcastCheckUpdated(id);
+    }
+    // Split-family behavior: a source check left with nothing billable
+    // closes (only reachable when the source is not itself a target).
+    if (!targetIds.includes(check.id)) {
+      const remaining = db.prepare(
+        "SELECT COUNT(*) AS n FROM check_items WHERE check_id = ? AND state IN " + BILLABLE_STATES
+      ).get(check.id).n;
+      if (remaining === 0) {
+        db.prepare("UPDATE checks SET status = 'closed', closed_at = ? WHERE id = ?").run(now, check.id);
+        persistTotals(check.id);
+      }
+    }
+  };
+  try {
+    withTransaction(doSplitCost);
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: e.message || 'Split failed' });
+  }
+  auditApproval(req, 'split_item_cost', { check_id: check.id, item_id: item.id },
+    { item_name: item.name, line_gross_cents: gross, discount_cents: disc, net_cents: net,
+      state: item.state, targets: shareRows, approved_by: splitApprovedBy });
+  res.json({ split_from: check.id, item_id: item.id, amount_cents: net, shares: shareRows, checks: targetIds });
+});
+
 /* -------------------------------- payments --------------------------------- */
 app.post('/api/checks/:id/payments', serverPlus(), (req, res) => {
   const check = db.prepare('SELECT * FROM checks WHERE id = ? AND site_id = ?').get(req.params.id, SITE_ID);
@@ -8471,6 +8659,7 @@ const API_DOCS = [
   { method: 'POST', path: '/api/checks/:id/transfer', auth: 'server+ (+manager PIN to take another server\'s check)', summary: 'Transfer check to another server / claim unassigned (NEW 3.6)', params: 'to_server_id, from_server_id, manager_pin?, reason?' },
   { method: 'POST', path: '/api/checks/:id/reopen', auth: 'manager (+fresh manager PIN)', summary: 'Reopen a paid check that still has a positive balance (e.g. refund could not auto-reopen because table was re-seated)', params: 'manager_pin' },
   { method: 'POST', path: '/api/checks/:id/split', auth: 'server+', summary: 'Even / by-seat / by-item split', params: 'mode, ...' },
+  { method: 'POST', path: '/api/checks/:id/split-item-cost', auth: 'server+ (split permission or manager PIN)', summary: 'Divide one line\u2019s cost across 2+ existing open checks — even or explicit cent shares; the line discount prorates, the source line is consumed', params: 'item_id, targets, shares?, manager_pin?' },
   { method: 'POST', path: '/api/checks/:id/payments', auth: 'server+', summary: 'Take cash, card_demo, or house_account payment (house_account requires a manager-created account)', params: 'method, amount_cents, tip_cents, tendered_cents?, memo?' },
   { method: 'GET', path: '/api/admin/house-accounts', auth: 'server+', summary: 'List house accounts (manager-created only)', params: '—' },
   { method: 'POST', path: '/api/admin/house-accounts', auth: 'manager', summary: 'Create a house account', params: 'name' },
