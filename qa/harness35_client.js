@@ -67,6 +67,10 @@ function extractFrom(srcText, anchor) {
 
 const getMenuSrc = extractFrom(src, 'async function getMenu(');
 const addItemFlowSrc = extractFrom(src, 'function addItemFlow(');
+/* addItemFlow renders its course picker from the module-level ME_COURSES
+ * const (test40, WS-A) — extracted flows need it in scope, exactly like
+ * the real module provides. */
+const meCoursesSrc = (src.match(/const ME_COURSES = \[[^\]]*\];/) || [''])[0];
 let holdSrc = extractFrom(src, "$('#btn-hold').onclick");
 const apiErrorSrc = (src.match(/^class ApiError .*$/m) || [])[0];
 if (!apiErrorSrc) throw new Error('ApiError class line not found');
@@ -222,7 +226,18 @@ async function main() {
     ctx.itemModifiers = (it) => it.modifiers || [];
     ctx.isDrink = () => false;
     ctx.PO = { tappableValue: () => {} };
-    vm.runInContext('var seat = 1;', ctx);
+    /* Scope the modal-seat logic (test40 WS-A) touches: the guest count
+       the seat stepper clamps to and the grow-path helpers. With the
+       working seat inside the count, Add never reaches the PATCH path. */
+    ctx.setSeat = () => {};
+    ctx.isOffline = () => false;
+    ctx.realId = (id) => id;
+    ctx.api = async () => ({});
+    ctx.getCheckView = async () => null;
+    ctx.handleApiError = (e) => { throw e; };
+    ctx.paintGuests = () => {};
+    vm.runInContext('var seat = 1; var guests = 4;', ctx);
+    if (meCoursesSrc) vm.runInContext(meCoursesSrc, ctx);
     vm.runInContext(addItemFlowSrc + '\nglobalThis.__addItemFlow = addItemFlow;', ctx);
     ctx.__addItemFlow(item, catName);
     ok(prefix + '1', `addItemFlow(${item.name}): modifier modal opens (no instant stage)`,
