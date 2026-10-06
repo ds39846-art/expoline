@@ -548,7 +548,7 @@ function seatStripHtml(o) {
  *  buttons — app.js routes those taps to the manager-approved edit modal.
  *  The value spans carry data-qbval hooks: app.js makes them tap-to-type
  *  (tappableValue below) so a server can key the exact qty/seat instead
- *  of tapping + a dozen times. "More…" shows for staged lines too — it
+ *  of tapping + a dozen times. "Modify" shows for staged lines too — it
  *  reopens the modifier flow on the staged line (app.js restage).
  *  Course pills (o.canCourse — staged + held lines): one tap re-courses
  *  the line; app.js applies staged changes locally and held changes via
@@ -574,7 +574,7 @@ function quickBarHtml(o) {
     courseHtml +
     '<button class="btn btn-sm" data-qa="repeat">Repeat 🔁</button>' +
     '<button class="btn btn-sm qb-void" data-qa="void">Void</button>' +
-    '<button class="btn btn-sm" data-qa="more">More…</button>' +
+    '<button class="btn btn-sm" data-qa="more">Modify</button>' +
     '</div>';
 }
 

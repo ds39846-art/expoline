@@ -1578,9 +1578,11 @@ async function renderOrder(app, checkId) {
      required/min/max, defaults pre-checked, 86'd options disabled, nested
      groups revealed by their parent option; per-modifier notes ("light on
      the cheese"); per-line special request + allergy flag. */
-  /* preset (staged-line "More…" restage): prefill qty / modifiers / note /
-     allergy from the staged entry being edited, so the flow reopens the
-     way the line already is instead of making the server rebuild it. */
+  /* preset (staged-line "Modify" restage): prefill qty / seat / course /
+     modifiers / note / allergy from the staged entry being edited, so the
+     flow reopens the way the line already is instead of making the server
+     rebuild it. The editor this opens is the full one — everything on the
+     line is changeable before the line ever reaches the kitchen. */
   function addItemFlow(item, catName, preset) {
     const groups = Array.isArray(item.modifier_groups) && item.modifier_groups.length
       ? item.modifier_groups : null;
@@ -1593,7 +1595,7 @@ async function renderOrder(app, checkId) {
     let mSeat = (preset && preset.seat != null) ? preset.seat : seat;
     const startCourse = preset && preset.course !== undefined ? preset.course : (item.course || null);
     /* Fast path for FRESH adds only: nothing to configure, so stage in
-       one tap. In edit mode (preset from a staged line's "More…") the
+       one tap. In edit mode (preset from a staged line's "Modify") the
        modal must ALWAYS open — even when the item has no modifiers —
        so qty, the special-request note and the allergy flag stay
        editable; the shortcut would otherwise re-stage instantly and
@@ -1843,7 +1845,7 @@ async function renderOrder(app, checkId) {
           (mods ? '<span class="mods">' + mods + '</span>' : '') + courseHtml + noteHtml + allergyHtml + '</div>' + pill +
           '<span class="pr">' + fmt(lineTotal) + '</span>' + editBtn + refireBtn + voidBtn + '</div>';
         /* Quick-action bar: tapping the line opens qty/seat steppers plus
-           Repeat / Void / More… directly under it — qty and seat apply in
+           Repeat / Void / Modify directly under it — qty and seat apply in
            one tap via PATCH, no modal round-trip. */
         const quickHtml = quickKey === selKey
           ? PO.quickBarHtml({ qty: ref.qty || 1, seat: ref.seat || s, guestCount: guests, staged: kind === 'staged',
@@ -1904,7 +1906,7 @@ async function renderOrder(app, checkId) {
       const ref = (check.items || []).find((x) => String(x.id) === id);
       return ref ? { kind, ref } : null;
     };
-    /* Staged "More…": a staged line has no server row for the edit modal,
+    /* Staged "Modify": a staged line has no server row for the edit modal,
        so More reopens the guided add-item modifier flow on the same menu
        item — prefilled with the line's seat, qty, modifiers, note and
        allergy — and the staged entry is swapped for the flow's result.
