@@ -926,3 +926,33 @@ ul.clean li { padding: 6px 0; border-bottom: 1px solid var(--line); }
   .kds-root .ticket .t-banner { font-size: 1.35rem; padding: 12px 16px; }
   .kds-root .ticket .bump-row .btn { min-height: 64px; font-size: 1.3rem; }
 }
+
+/* ---- online orders board (KDS section) ---- */
+.olo-board { margin-bottom: 14px; }
+.olo-board-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.olo-board-head h2 { font-family: var(--serif); font-size: 1.3rem; color: var(--brass-hi); margin: 0; }
+.olo-newpill { background: var(--amber-dim); border: 1px solid var(--amber); color: var(--amber); border-radius: 999px; padding: 3px 12px; font-size: .8rem; font-weight: 700; letter-spacing: .04em; }
+.olo-grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
+@media (min-width: 700px) { .olo-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 1200px) { .olo-grid { grid-template-columns: repeat(3, 1fr); } }
+.olo-card { border: 1px solid var(--line); border-left: 6px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #0a0f1c; }
+.olo-card.st-placed { border-left-color: var(--amber); }
+.olo-card.st-confirmed { border-left-color: var(--brass-hi); }
+.olo-card.st-ready { border-left-color: var(--green); }
+.olo-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+.olo-oid { font-family: var(--serif); font-size: 1.15rem; color: var(--brass-hi); }
+.olo-status { font-size: .72rem; font-weight: 700; letter-spacing: .06em; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--text-dim); }
+.olo-status.st-placed { color: var(--amber); border-color: var(--amber); }
+.olo-status.st-confirmed { color: var(--brass-hi); border-color: var(--brass-hi); }
+.olo-status.st-ready { color: var(--green); border-color: var(--green); }
+.olo-pickup { color: var(--text-dim); font-size: .85rem; }
+.olo-age { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 700; color: var(--text-dim); }
+.olo-cust { font-weight: 600; margin-bottom: 6px; }
+.olo-items { border-top: 1px dashed var(--line); padding-top: 6px; margin-bottom: 6px; }
+.olo-line { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+.olo-totals .r { display: flex; justify-content: space-between; gap: 10px; padding: 1px 0; color: var(--text-dim); font-size: .92rem; }
+.olo-totals .r.tt { color: var(--text, #f2ead8); font-weight: 700; border-top: 1px solid var(--line); margin-top: 4px; padding-top: 5px; }
+.olo-actions { display: flex; gap: 8px; margin-top: 10px; }
+.olo-actions .btn { flex: 1; }
+.olo-empty { text-align: center; color: var(--text-faint); padding: 18px 12px; border: 1px dashed var(--line); border-radius: 10px; }
+.kds-root.kds-tv .olo-card { font-size: 1.2rem; }

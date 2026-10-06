@@ -60,7 +60,7 @@ const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = se
 const state = {
   user: null,          // {id,name,role}
   route: null,
-  kds: { station: 'expediter', tickets: [], ws: null, wsUp: false, recall: false, retryMs: 1000 },
+  kds: { station: 'expediter', tickets: [], onlineOrders: [], ws: null, wsUp: false, recall: false, retryMs: 1000 },
   timers: { kds: null },
   reviewNudged: {},    // checkId -> true (post-payment nudge shown once per check)
   reviewPrompt: true,   // from /api/login-summary (manager can disable site-wide)
@@ -3227,6 +3227,8 @@ function closeKdsSocket() {
   closeKdsWs();
   if (state.timers.kds) { clearInterval(state.timers.kds); state.timers.kds = null; }
   if (state.timers.kdsAlerts) { clearInterval(state.timers.kdsAlerts); state.timers.kdsAlerts = null; }
+  if (state.timers.online) { clearInterval(state.timers.online); state.timers.online = null; }
+  if (state.timers.onlineAge) { clearInterval(state.timers.onlineAge); state.timers.onlineAge = null; }
 }
 
 function kdsElapsed(ts) {
@@ -3249,6 +3251,85 @@ function kdsWarnIn(elapsedS) {
   return Math.max(0, th.warn_secs - elapsedS);
 }
 
+/* ============================================================
+   ONLINE ORDERS BOARD (a section of the KDS view): web orders
+   placed on order.html land here for the kitchen — placed →
+   confirmed (the server fires the station KDS tickets) → ready →
+   picked_up, or cancelled from placed/confirmed. The list/PATCH
+   endpoints are kitchenPlus (the kitchen_ops capability), so the
+   board only fetches and renders for capability holders — anyone
+   else never sees dead controls. Nothing is broadcast when a
+   guest places an order (placement emits no WS event, and the
+   online register ctx wires no ticket broadcast), so the board
+   polls on the KDS alerts cadence (20s) and refreshes immediately
+   after every action. The builders below are pure + top-level on
+   purpose: harness61 extracts and drives them in node; the
+   renderKds wiring is a thin fetch + click layer over them.
+   ============================================================ */
+function oloBoardActions(status) {
+  switch (status) {
+    case 'placed':
+      return [
+        { act: 'confirm', next: 'confirmed', label: 'Confirm', cls: 'btn-green' },
+        { act: 'cancel', next: 'cancelled', label: 'Cancel', cls: 'btn-ghost' },
+      ];
+    case 'confirmed':
+      return [
+        { act: 'ready', next: 'ready', label: 'Mark ready', cls: 'btn-green' },
+        { act: 'cancel', next: 'cancelled', label: 'Cancel', cls: 'btn-ghost' },
+      ];
+    case 'ready':
+      return [{ act: 'picked_up', next: 'picked_up', label: 'Picked up', cls: 'btn-green' }];
+    default:
+      return [];
+  }
+}
+function oloBoardPlacedCount(orders) {
+  return (orders || []).filter((o) => o.status === 'placed').length;
+}
+function oloBoardPickupLabel(o) {
+  if (!o.pickup_at) return 'ASAP';
+  return new Date(o.pickup_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+function oloBoardCardHtml(o) {
+  const lines = (o.items || []).map((i) =>
+    '<div class="olo-line"><span>' + (i.qty || 1) + '× ' + esc(i.name || 'Item') + '</span>' +
+    '<span>' + fmt((i.qty || 1) * (i.unit_price_cents || 0)) + '</span></div>').join('');
+  const acts = oloBoardActions(o.status).map((a) =>
+    '<button class="btn ' + a.cls + '" data-olo-act="' + a.act + '" data-olo-next="' + a.next +
+    '" data-oid="' + esc(String(o.id)) + '">' + a.label + '</button>').join('');
+  return '<div class="olo-card st-' + esc(o.status) + '" data-oid="' + esc(String(o.id)) + '">' +
+    '<div class="olo-head"><span class="olo-oid">ONLINE #' + esc(String(o.id)) + '</span>' +
+    '<span class="olo-status st-' + esc(o.status) + '">' + esc(String(o.status || '').replace('_', ' ').toUpperCase()) + '</span>' +
+    '<span class="olo-pickup">Pickup ' + esc(oloBoardPickupLabel(o)) + '</span>' +
+    '<span class="olo-age" data-oage="' + esc(String(o.created_at || '')) + '">' + kdsElapsed(o.created_at || Date.now()).mmss + '</span></div>' +
+    '<div class="olo-cust">' + esc(o.customer_name || '') + (o.phone ? ' · ' + esc(o.phone) : '') + '</div>' +
+    '<div class="olo-items">' + lines + '</div>' +
+    '<div class="olo-totals">' +
+    '<div class="r"><span>Subtotal</span><span>' + fmt(o.subtotal_cents) + '</span></div>' +
+    '<div class="r"><span>Tax</span><span>' + fmt(o.tax_cents) + '</span></div>' +
+    (o.tax_included_cents > 0
+      ? '<div class="r"><span></span><span>includes ' + fmt(o.tax_included_cents) + ' tax in prices</span></div>' : '') +
+    '<div class="r tt"><span>Due at pickup</span><span>' + fmt(o.total_cents) + '</span></div></div>' +
+    (acts ? '<div class="olo-actions">' + acts + '</div>' : '') +
+    '</div>';
+}
+function oloBoardHtml(orders) {
+  const list = orders || [];
+  const placed = oloBoardPlacedCount(list);
+  const pill = placed > 0
+    ? '<span class="olo-newpill">' + placed + ' NEW — awaiting confirmation</span>' : '';
+  const body = list.length
+    ? '<div class="olo-grid">' + list.map(oloBoardCardHtml).join('') + '</div>'
+    : '<div class="olo-empty">No online orders waiting</div>';
+  return '<div class="olo-board"><div class="olo-board-head"><h2>Online orders</h2>' + pill + '</div>' + body + '</div>';
+}
+/* The one call every board button issues — top-level so harness61
+ * can prove the click path sends exactly this PATCH. */
+async function oloBoardPatch(apiFn, id, nextStatus) {
+  return apiFn('/api/online/orders/' + id, 'PATCH', { status: nextStatus });
+}
+
 async function renderKds(app) {
   if (state.user.role === 'server') { app.innerHTML = notAuthorized('The kitchen display is for kitchen and manager roles.'); return; }
   closeKdsSocket();
@@ -3267,12 +3348,14 @@ async function renderKds(app) {
     '<button class="btn btn-ghost" id="kds-recall-btn">Recall</button>' +
     '<button class="btn btn-ghost" id="kds-tv-btn" aria-pressed="false">🖥 TV</button></div>' +
     '<div id="kds-alerts"></div>' +
+    '<div id="kds-online"></div>' +
     '<div class="tabs" id="kds-tabs">' +
     KDS_STATIONS.map((s) => '<button class="tab' + (s.slug === state.kds.station ? ' active' : '') + '" data-st="' + esc(s.slug) + '">' + esc(s.label) + '</button>').join('') +
     '</div><div class="kds-grid" id="kds-grid"></div></div>';
 
   const grid = $('#kds-grid'), wsBadge = $('#kds-ws'), recallBtn = $('#kds-recall-btn');
   const alertsEl = $('#kds-alerts');
+  const onlineEl = $('#kds-online');
 
   /* TV mode (presentation only): toggles the .kds-tv scale on the
      board root for a wall-mounted kitchen display. Persisted per
@@ -3472,6 +3555,39 @@ async function renderKds(app) {
     }).join('') + '</div>';
   }
 
+  /* ---------------- online orders board ----------------
+   * kitchen_ops holders only: the endpoints are kitchenPlus, so a
+   * session without the capability would just 403 — it never sees
+   * the section at all (no fetch, no dead controls). Poll errors
+   * are swallowed like loadAlerts — the next poll retries. */
+  const canOnline = roleHasCap(state.user, 'kitchen_ops');
+  function drawOnlineOrders() {
+    if (!canOnline || !onlineEl) return;
+    onlineEl.innerHTML = oloBoardHtml(state.kds.onlineOrders);
+    $$('#kds-online [data-olo-act]', onlineEl).forEach((b) => b.onclick = async () => {
+      const id = b.dataset.oid, next = b.dataset.oloNext;
+      if (b.dataset.oloAct === 'cancel' && !confirm('Cancel online order #' + id + '?')) return;
+      b.disabled = true;
+      try {
+        await oloBoardPatch(api, id, next);
+        toast(next === 'confirmed' ? 'Online order #' + id + ' confirmed — tickets fired'
+          : next === 'ready' ? 'Online order #' + id + ' marked ready'
+          : next === 'picked_up' ? 'Online order #' + id + ' picked up'
+          : 'Online order #' + id + ' cancelled', 'ok');
+        await loadOnlineOrders();
+        if (next === 'confirmed') loadTickets();
+      } catch (e) { handleApiError(e); b.disabled = false; }
+    });
+  }
+  async function loadOnlineOrders() {
+    if (!canOnline || !onlineEl) return;
+    try {
+      const r = await api('/api/online/orders');
+      state.kds.onlineOrders = Array.isArray(r) ? r : (r.orders || []);
+      drawOnlineOrders();
+    } catch (e) { /* silent — alerts pattern; next poll retries */ }
+  }
+
   // 1-second timer updates (mm:ss; band colors from /api/kds/settings thresholds)
   state.timers.kds = setInterval(() => {
     $$('#kds-grid .t-timer').forEach((el) => {
@@ -3489,10 +3605,20 @@ async function renderKds(app) {
   }, 1000);
   state.timers.kdsAlerts = setInterval(loadAlerts, 20000);
 
+  // Online board: poll on the alerts cadence (20s — placement
+  // broadcasts nothing), age readouts tick with the 1s clock.
+  if (canOnline) {
+    state.timers.online = setInterval(loadOnlineOrders, 20000);
+    state.timers.onlineAge = setInterval(() => {
+      $$('#kds-online [data-oage]').forEach((el) => { el.textContent = kdsElapsed(el.dataset.oage).mmss; });
+    }, 1000);
+  }
+
   app._cleanup = () => { closeKdsSocket(); };
   await loadTickets();
   kdsSubscribe();
   loadAlerts();
+  loadOnlineOrders();
 }
 
 /* ============================================================
