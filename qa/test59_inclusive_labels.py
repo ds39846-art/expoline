@@ -37,12 +37,17 @@ Rendering pins are source-level (the house pattern — cf. test58
 section H): guest.js/kiosk.js/menuboards.js are standalone DOM-boot
 IIFEs with no node harness in the repo, so the suite pins the exact
 flag-conditioned render expressions plus the payload contract that
-drives them.
+drives them. The pins are polarity-discriminating: each anchors the
+condition's opening paren (so "(!i.tax_inclusive ? ..." does NOT
+satisfy them), and each in-scope view file is asserted free of any
+negated-flag occurrence anywhere in the file, so an inverted
+condition — label on every NON-inclusive item, no inclusive item —
+fails the suite.
 
 Boot discipline mirrors test58: this suite owns ports 4345 (HEAD)
 and 4346 (control, pristine a368b34 worktree) and its own scratch DBs.
 """
-import json, os, signal, subprocess, sys, time
+import json, os, re, signal, subprocess, sys, time
 import urllib.request, urllib.error
 from pathlib import Path
 
@@ -200,8 +205,10 @@ def main():
         ok("B1 label copy + pill class present",
            "Tax included" in gsrc and "gx-taxincl" in gsrc)
         ok("B2 item render is conditioned on the payload flag",
-           "i.tax_inclusive ? '<br><span class=\"gx-taxincl\">Tax included</span>'" in gsrc)
+           "(i.tax_inclusive ? '<br><span class=\"gx-taxincl\">Tax included</span>'" in gsrc)
         ok("B3 pill style rule defined", ".gx-taxincl{" in gsrc)
+        ok("B4 guest view: no negated-flag render anywhere in the file",
+           not re.search(r"!\s*i\.tax_inclusive", gsrc))
 
         print("--- C: kiosk + menu-board payloads carry the flag ---")
         ki = kiosk_items()
@@ -219,12 +226,16 @@ def main():
         print("--- D: kiosk + menu-board views render the label (source pins) ---")
         ksrc = src_of("public/views/kiosk.js")
         ok("D1 kiosk grid pill conditioned on the flag",
-           "it.tax_inclusive ? '<span class=\"ti\">Tax included</span>'" in ksrc)
+           "(it.tax_inclusive ? '<span class=\"ti\">Tax included</span>'" in ksrc)
         ok("D2 kiosk item sheet note conditioned on the flag",
-           "it.tax_inclusive ? '<div class=\"kx-taxnote\">Tax included</div>'" in ksrc)
+           "(it.tax_inclusive ? '<div class=\"kx-taxnote\">Tax included</div>'" in ksrc)
+        ok("D4 kiosk view: no negated-flag render anywhere in the file",
+           not re.search(r"!\s*it\.tax_inclusive", ksrc))
         msrc = src_of("public/views/menuboards.js")
         ok("D3 menu-board label conditioned on the flag",
-           "it.tax_inclusive ? '<div class=\"ti\">Tax included</div>'" in msrc)
+           "(it.tax_inclusive ? '<div class=\"ti\">Tax included</div>'" in msrc)
+        ok("D5 menu-board view: no negated-flag render anywhere in the file",
+           not re.search(r"!\s*it\.tax_inclusive", msrc))
 
         print("--- E: online ordering — label honestly ABSENT ---")
         s, om = req("GET", "/api/online/menu")
