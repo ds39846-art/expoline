@@ -30,6 +30,11 @@ const SUPPORTED_OPS = new Set([
   'payment', 'close', 'table_state', 'menu_update',
 ]);
 
+/* The course vocabulary, matching the mainline API (server.js COURSES
+ * and the client COURSE_LIST): a synced line may carry any of these,
+ * null for no course, or nothing for the menu default. */
+const COURSES = new Set(['drink', 'appetizer', 'entree', 'dessert']);
+
 /* Additive, guarded migrations. IF NOT EXISTS everywhere; PRAGMA checks
  * before ALTER. Safe to run on every boot next to the existing migrations. */
 function migrate(db) {
@@ -162,7 +167,7 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       const itemIds = [];
       const itemUuids = [];
       const insItem = db.prepare(
-        "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
+        "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at, note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)"
       );
       for (const it of p.items || []) {
         const itemUuid = String(it.item_uuid || it.temp_id || crypto.randomUUID());
@@ -179,6 +184,35 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
           return { ok: false, error: 'invalid_seat', seat: it.seat };
         }
         if (!Number.isInteger(it.qty) || it.qty < 1) return { ok: false, error: 'invalid_qty' };
+        /* Per-line special request, allergy flag, and ring-time
+           course — mainline POST /items parity. The old insert never
+           wrote these columns and forced the menu course, so a line
+           synced through the brain lost its note, its allergy
+           warning, and its picked course. Absent course keeps the
+           menu default; null means no course; a note or detail must
+           be a string of at most 140 chars. */
+        let note = null;
+        if (it.note !== undefined && it.note !== null) {
+          if (typeof it.note !== 'string' || it.note.length > 140) {
+            return { ok: false, error: 'invalid_note' };
+          }
+          note = it.note.trim() || null;
+        }
+        const allergy = it.allergy ? 1 : 0;
+        let allergyDetail = null;
+        if (it.allergy_detail !== undefined && it.allergy_detail !== null) {
+          if (typeof it.allergy_detail !== 'string' || it.allergy_detail.length > 140) {
+            return { ok: false, error: 'invalid_allergy_detail' };
+          }
+          allergyDetail = it.allergy_detail.trim() || null;
+        }
+        let lineCourse = menuItem.course;
+        if (it.course !== undefined) {
+          if (it.course !== null && !COURSES.has(it.course)) {
+            return { ok: false, error: 'invalid_course' };
+          }
+          lineCourse = it.course;
+        }
         // Same pricing rule as POST /api/checks/:id/items: fixed-price items
         // ALWAYS use the menu price; MP (price 0) items need a manager price.
         let unitPrice = menuItem.price_cents;
@@ -191,7 +225,7 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
         }
         const mods = Array.isArray(it.modifiers) ? it.modifiers : [];
         const r = insItem.run(itemUuid, checkId, menuItem.id, it.seat, it.qty, unitPrice,
-          JSON.stringify(mods), menuItem.course, nowIso());
+          JSON.stringify(mods), lineCourse, nowIso(), note, allergy, allergyDetail);
         itemIds.push(Number(r.lastInsertRowid));
         itemUuids.push(itemUuid);
       }

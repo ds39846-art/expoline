@@ -288,10 +288,20 @@ function lanEnvelope(o, siteSlug) {
       break;
     case 'add_items':
       payload.check_uuid = checkUuid;
-      payload.items = (p.items || []).map((it) => ({
-        item_uuid: String(it.temp_id || ''), menu_item_id: it.menu_item_id,
-        seat: it.seat, qty: it.qty, modifiers: it.modifiers || [],
-      }));
+      payload.items = (p.items || []).map((it) => {
+        const item = { item_uuid: String(it.temp_id || ''), menu_item_id: it.menu_item_id,
+          seat: it.seat, qty: it.qty, modifiers: it.modifiers || [] };
+        /* Same field fidelity as the legacy flush: the ring-time
+           note, allergy flag and detail, and course ride the envelope
+           when the queued line carries them. Absent stays absent —
+           the store then applies the menu default course, while an
+           explicit null course still means no course. */
+        if (it.note !== undefined) item.note = it.note || null;
+        if (it.allergy !== undefined) item.allergy = !!it.allergy;
+        if (it.allergy_detail !== undefined) item.allergy_detail = it.allergy_detail || null;
+        if (it.course !== undefined) item.course = it.course;
+        return item;
+      });
       break;
     case 'void_item':
       payload.check_uuid = checkUuid;
@@ -447,6 +457,22 @@ async function flushOutboxLegacy(ops) {
           if (o.op === 'add_items') {
             for (const it of (p.items || [])) {
               const postBody = { menu_item_id: it.menu_item_id, seat: it.seat, qty: it.qty, modifiers: it.modifiers || [] };
+              /* Field fidelity: the queued line also carries the
+                 ring-time note, allergy flag and detail, and course
+                 (the HOLD handler enqueues all four and POST /items
+                 stores all four). The old body dropped them, so an
+                 offline-held line reached the kitchen with no special
+                 request, no allergy warning, and the menu default
+                 course instead of the picked one. Values are
+                 normalized exactly like the online HOLD body; a field
+                 the queued line does not carry stays absent, so
+                 pre-field queue entries post byte-identically to
+                 before — most importantly course, where absent means
+                 menu default and null means no course at all. */
+              if (it.note !== undefined) postBody.note = it.note || null;
+              if (it.allergy !== undefined) postBody.allergy = !!it.allergy;
+              if (it.allergy_detail !== undefined) postBody.allergy_detail = it.allergy_detail || null;
+              if (it.course !== undefined) postBody.course = it.course;
               /* Per-line idempotency: the key derives from the line
                  temp_id, which is persisted inside the queue entry
                  itself, so the key is identical on every retry and
