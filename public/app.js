@@ -750,6 +750,16 @@ function applyOps(check, ops, idmap) {
           id: it.temp_id, menu_item_id: it.menu_item_id, name: it.name,
           price_cents: it.price_cents, seat: it.seat, qty: it.qty,
           modifiers: it.modifiers || [], state: 'held', pending: true,
+          /* Field fidelity: the queued line carries the ring-time note,
+             allergy flag and detail, and course (the same fields both
+             flush paths send). Mirror them onto the preview line with
+             the server check-view key names (itemView), so the cart
+             renders the allergy flag and the note before sync, not
+             only after the line lands. */
+          note: it.note || null,
+          allergy: !!it.allergy,
+          allergy_detail: it.allergy_detail || null,
+          course: it.course !== undefined ? it.course : null,
         });
       }
       estimated = true;

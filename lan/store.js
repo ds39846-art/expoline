@@ -307,7 +307,17 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
         if (!byStation.has(station)) byStation.set(station, []);
         byStation.get(station).push({
           item_id: it.id, item_uuid: it.uuid, name: it.name, seat: it.seat, qty: it.qty,
+          course: it.course,
           modifiers: h.parseJson(it.modifiers_json, []),
+          /* Allergy + special-request note ride the ticket to KDS,
+           * composed exactly as the mainline fire composes them
+           * (server.js fireHeldItemsToKdsCore): the ticket-level
+           * allergy banner derives from these per-line flags, so a
+           * LAN-fired allergy line gets the same high-visibility
+           * alert as an online-fired one. */
+          note: it.note || null,
+          allergy: it.allergy ? 1 : 0,
+          allergy_detail: it.allergy_detail || null,
         });
       }
       const tickets = [];
