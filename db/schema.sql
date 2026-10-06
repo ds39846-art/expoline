@@ -49,6 +49,7 @@ CREATE TABLE menu_items (
   name TEXT,
   description TEXT,
   price_cents INTEGER,
+  hh_price_cents INTEGER,
   item_type TEXT CHECK(item_type IN ('drink','food','dessert')),
   station TEXT CHECK(station IN ('bar','expediter','garde_manger','dessert')),
   course TEXT CHECK(course IN ('drink','appetizer','entree','dessert')),

@@ -256,6 +256,11 @@ button, input, select, textarea { font-family: var(--sans); font-size: 1rem; col
   align-self: flex-start; font-size: .68rem; font-weight: 800; letter-spacing: .08em;
   color: var(--text-dim); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px;
 }
+.hh-tag {
+  align-self: flex-start; font-size: .68rem; font-weight: 800; letter-spacing: .08em;
+  color: var(--brass-hi); border: 1px solid var(--brass); border-radius: 4px; padding: 2px 6px;
+}
+.item-card .pr-was { color: var(--text-dim); font-weight: 500; }
 .cart-panel { margin-top: 16px; }
 .seat-group { border-top: 1px solid var(--line-soft); padding: 10px 0; }
 .seat-group:first-child { border-top: none; }

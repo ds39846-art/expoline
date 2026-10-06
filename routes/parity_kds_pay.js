@@ -247,7 +247,10 @@ function moneyInt(v) { return isInt(v) && v >= 0; }
 
 /* ============================ PUBLIC: guest QR ============================ */
 function registerPublic(app, ctx) {
-  const { db, SITE_ID, nowIso, crypto, persistTotals, broadcastTicket, ticketView, broadcastCheckUpdated } = ctx;
+  const { db, SITE_ID, nowIso, crypto, persistTotals, broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents } = ctx;
+  // Happy-hour resolver injected by the host; without it lines price at
+  // the regular menu price, exactly as before.
+  const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
 
   const tableByToken = (token) =>
     db.prepare('SELECT * FROM tables WHERE qr_token = ? AND site_id = ?').get(String(token || ''), SITE_ID);
@@ -295,7 +298,7 @@ function registerPublic(app, ctx) {
         if (it.allergy_detail.trim().length > 140) return { error: `items[${idx}].allergy_detail is limited to 140 characters` };
         allergyDetail = it.allergy_detail.trim();
       }
-      lines.push({ mi, qty, seat, modifiers: priced, note, allergy, allergy_detail: allergyDetail });
+      lines.push({ mi, qty, seat, modifiers: priced, note, allergy, allergy_detail: allergyDetail, unit_price_cents: effPrice ? effPrice(mi) : mi.price_cents });
     }
     return { lines };
   }
@@ -318,7 +321,7 @@ function registerPublic(app, ctx) {
       'SELECT id, name FROM menu_categories WHERE site_id = ? ORDER BY id'
     ).all(SITE_ID);
     const itemStmt = db.prepare(
-      'SELECT id, name, description, price_cents, item_type, course FROM menu_items WHERE category_id = ? AND site_id = ? AND active = 1 ORDER BY id'
+      'SELECT id, name, description, price_cents, hh_price_cents, item_type, course FROM menu_items WHERE category_id = ? AND site_id = ? AND active = 1 ORDER BY id'
     );
     const modStmt = db.prepare('SELECT name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id');
     res.json({
@@ -327,6 +330,9 @@ function registerPublic(app, ctx) {
         id: c.id, name: c.name,
         items: itemStmt.all(c.id, SITE_ID).map((i) => ({
           id: i.id, name: i.name, description: i.description, price_cents: i.price_cents,
+          hh_price_cents: i.hh_price_cents != null ? i.hh_price_cents : null,
+          effective_price_cents: effPrice ? effPrice(i) : i.price_cents,
+          hh_active: effPrice ? effPrice(i) !== i.price_cents : false,
           item_type: i.item_type, course: i.course,
           modifiers: modStmt.all(i.id),
         })),
@@ -361,7 +367,7 @@ function registerPublic(app, ctx) {
     const byStation = new Map();
     for (const ln of priced.lines) {
       const r = insItem.run(crypto.randomUUID(), checkId, ln.mi.id, ln.seat, ln.qty,
-        ln.mi.price_cents, JSON.stringify(ln.modifiers), ln.mi.course,
+        ln.unit_price_cents, JSON.stringify(ln.modifiers), ln.mi.course,
         ln.note, ln.allergy, ln.allergy_detail, at, at);
       const st = ln.mi.station || 'expediter';
       if (!byStation.has(st)) byStation.set(st, []);
@@ -573,7 +579,8 @@ function registerPublic(app, ctx) {
 /* ============================ STAFF (behind auth wall) ============================ */
 function registerStaff(app, ctx) {
   const { db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto,
-    persistTotals, broadcastCheckUpdated, broadcastTicket, ticketView, tzDate } = ctx;
+    persistTotals, broadcastCheckUpdated, broadcastTicket, ticketView, tzDate, effectivePriceCents } = ctx;
+  const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
   /* Business-date bucketing matches Finance payouts: the SITE-LOCAL date of
    * a timestamp (server.js tzDate), never the raw UTC date inside the stored
    * string — California evening service is already the next UTC day, and the
@@ -793,7 +800,7 @@ function registerStaff(app, ctx) {
       return res.status(400).json({ error: 'items must be a non-empty array (max 24)' });
     }
     // Reuse the guest pricer — server-side validation + re-pricing.
-    const priced = priceGuestLines(db, SITE_ID, items);
+    const priced = priceGuestLines(db, SITE_ID, items, effPrice);
     if (priced.error) return res.status(400).json({ error: priced.error });
 
     const at = nowIso();
@@ -808,7 +815,7 @@ function registerStaff(app, ctx) {
     const byStation = new Map();
     for (const ln of priced.lines) {
       const r = insItem.run(crypto.randomUUID(), checkId, ln.mi.id, ln.qty,
-        ln.mi.price_cents, JSON.stringify(ln.modifiers), ln.mi.course, at, at);
+        ln.unit_price_cents, JSON.stringify(ln.modifiers), ln.mi.course, at, at);
       const st = ln.mi.station || 'expediter';
       if (!byStation.has(st)) byStation.set(st, []);
       byStation.get(st).push({
@@ -944,8 +951,10 @@ function registerStaff(app, ctx) {
   });
 }
 
-/* Shared guest/delivery line pricer (server-side validation + re-pricing). */
-function priceGuestLines(db, siteId, items) {
+/* Shared guest/delivery line pricer (server-side validation + re-pricing).
+ * effPrice, when the host injects it, is the happy-hour resolver: a line
+ * is priced at what the resolver returns for its menu item right now. */
+function priceGuestLines(db, siteId, items, effPrice) {
   const itemStmt = db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ? AND active = 1');
   const modStmt = db.prepare('SELECT price_delta_cents FROM menu_modifiers WHERE item_id = ? AND name = ?');
   const lines = [];
@@ -965,7 +974,7 @@ function priceGuestLines(db, siteId, items) {
       if (!row) return { error: `items[${idx}]: unknown modifier "${m.name}" for "${mi.name}"` };
       priced.push({ name: m.name.trim(), price_delta_cents: row.price_delta_cents });
     }
-    lines.push({ mi, qty, modifiers: priced });
+    lines.push({ mi, qty, modifiers: priced, unit_price_cents: effPrice ? effPrice(mi) : mi.price_cents });
   }
   return { lines };
 }

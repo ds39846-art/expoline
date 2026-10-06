@@ -12,6 +12,15 @@ const esc = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 const fmt = (cents) => '$' + ((Number(cents) || 0) / 100).toFixed(2);
+/* The price a line rung right now would be charged, per the server: the
+   effective price during a happy-hour pricing window, else the regular
+   price. Server-sent on every menu item (getMenu passes it through). */
+const dispPrice = (item) => (item && item.effective_price_cents != null ? item.effective_price_cents : (item ? item.price_cents : 0));
+/* Card price cell: during HH the effective (HH) price leads, the regular
+   price shows struck through, and an HH badge matches the BAR tag style. */
+const priceHtml = (item) => (item && item.hh_active
+  ? '<span class="pr"><s class="pr-was">' + fmt(item.price_cents) + '</s> ' + fmt(item.effective_price_cents) + '</span><span class="hh-tag">HH</span>'
+  : '<span class="pr">' + fmt(item ? item.price_cents : 0) + '</span>');
 /* Location label for a check: a bar tab reads TAB · <name> (the same
    prefixed form the server stamps on KDS tickets); a table check reads
    its table label. Returns null when neither exists. */
@@ -675,6 +684,13 @@ async function getMenu() {
          so a line course could never be picked at ring time — the
          server silently substituted the menu default at HOLD. */
       course: i.course || null,
+      /* Happy-hour pricing rides through too: the order screen renders
+         the effective price (what the server will charge right now) and
+         stageItem stages it, so screen, modal and cart always agree. */
+      hh_price_cents: i.hh_price_cents != null ? i.hh_price_cents : null,
+      effective_price_cents: i.effective_price_cents != null ? i.effective_price_cents
+        : (i.price_cents != null ? i.price_cents : Math.round((Number(i.price) || 0) * 100)),
+      hh_active: !!i.hh_active,
       station: i.station || i.kds_station || null,
       daypart: i.daypart || null,
     })),
@@ -1686,7 +1702,7 @@ async function renderOrder(app, checkId) {
         const drink = isDrink(i, catName);
         return '<button class="item-card" data-i="' + esc(String(i.id)) + '" data-cat="' + esc(catName) + '">' +
           (drink ? '<span class="drink-tag">BAR</span>' : '') +
-          '<span class="nm">' + esc(i.name) + '</span><span class="pr">' + fmt(i.price_cents) + '</span>' +
+          '<span class="nm">' + esc(i.name) + '</span>' + priceHtml(i) +
           '<span class="cat-lbl">' + esc(catName) + '</span></button>';
       }).join('');
       $$('.item-card', itemGrid).forEach((b) => b.onclick = () => {
@@ -1701,7 +1717,7 @@ async function renderOrder(app, checkId) {
       const drink = isDrink(i, cat.name);
       return '<button class="item-card" data-i="' + esc(String(i.id)) + '">' +
         (drink ? '<span class="drink-tag">BAR</span>' : '') +
-        '<span class="nm">' + esc(i.name) + '</span><span class="pr">' + fmt(i.price_cents) + '</span></button>';
+        '<span class="nm">' + esc(i.name) + '</span>' + priceHtml(i) + '</button>';
     }).join('');
     $$('.item-card', itemGrid).forEach((b) => b.onclick = () => {
       const item = cat.items.find((x) => String(x.id) === b.dataset.i);
@@ -1781,7 +1797,7 @@ async function renderOrder(app, checkId) {
           '<input class="mod-note-in" data-fmn="' + i + '" maxlength="60" placeholder="Note for ' + esc(m.name) + ' (optional)" value="' + esc((pm && pm.note) || '') + '"' + (on ? '' : ' style="display:none"') + '>';
         }).join('') + '</div>' : '');
     const bd = openModal(
-      '<h2>' + esc(item.name) + ' <span class="muted">· ' + fmt(item.price_cents) + '</span></h2>' +
+      '<h2>' + esc(item.name) + ' <span class="muted">· ' + fmt(dispPrice(item)) + (item.hh_active ? ' <span class="hh-tag">HH</span>' : '') + '</span></h2>' +
       '<p class="muted small">Seat <span id="m-seat-note">' + mSeat + '</span>' + (isDrink(item, catName) ? ' · <span class="drink-tag">BAR</span> fires to bar on send' : '') + '</p>' +
       '<div class="field"><label>Quantity</label><div class="stepper"><button data-q="dec">−</button><span class="val" id="m-qty">' + qty + '</span><button data-q="inc">+</button></div></div>' +
       '<div class="field"><label>Seat</label><div class="stepper"><button data-sb="dec">−</button><span class="val" id="m-seat">' + mSeat + '</span><button data-sb="inc">+</button></div></div>' +
@@ -1917,7 +1933,7 @@ async function renderOrder(app, checkId) {
   function stageItem(item, modifiers, qty, extra) {
     extra = extra || {};
     staged.push({
-      temp_id: uid('st'), menu_item_id: item.id, name: item.name, price_cents: item.price_cents,
+      temp_id: uid('st'), menu_item_id: item.id, name: item.name, price_cents: dispPrice(item),
       seat, qty, modifiers,
       note: extra.note || null,
       allergy: !!extra.allergy,
@@ -2669,7 +2685,7 @@ async function renderOrder(app, checkId) {
     qp.style.display = 'flex';
     qp.innerHTML = '<span class="qp-label">★ Quick pick</span>' + picks.map((p) =>
       '<button class="item-card qp-card" data-qp="' + esc(String(p.item.id)) + '">' +
-      '<span class="nm">' + esc(p.item.name) + '</span><span class="pr">' + fmt(p.item.price_cents) + '</span></button>').join('');
+      '<span class="nm">' + esc(p.item.name) + '</span>' + priceHtml(p.item) + '</button>').join('');
     $$('.qp-card', qp).forEach((b) => b.onclick = () => {
       const p = picks.find((x) => String(x.item.id) === b.dataset.qp);
       if (p) addItemFlow(p.item, p.cat);
@@ -4730,6 +4746,7 @@ async function renderMenuViewer(app) {
     $('#me-list').innerHTML = c.items.map((i) => {
       const dead = !i.active;
       const bits = [fmt(i.price_cents), i.course, kdsLabel(i.station)];
+      if (i.hh_price_cents != null) bits.push('HH ' + fmt(i.hh_price_cents));
       if (i.daypart) bits.push(i.daypart);
       if ((i.modifiers || []).length) bits.push(i.modifiers.length + ' mods');
       if (i.price_note) bits.push(i.price_note);
@@ -4809,6 +4826,7 @@ async function renderMenuViewer(app) {
     const bd = openModal('<h2>' + (it ? 'Edit item' : 'New item') + '</h2>' +
       '<div class="field"><label>Name</label><input id="mi-name" value="' + esc(it ? it.name : '') + '" maxlength="80"></div>' +
       '<div class="frow"><div class="field"><label>Price ($)</label><input id="mi-price" type="number" min="0" step="0.01" inputmode="decimal" value="' + (it ? (it.price_cents / 100).toFixed(2) : '') + '"></div>' +
+      '<div class="field"><label>Happy-hour price ($) <span class="muted small">(blank = none)</span></label><input id="mi-hhprice" type="number" min="0" step="0.01" inputmode="decimal" value="' + (it && it.hh_price_cents != null ? (it.hh_price_cents / 100).toFixed(2) : '') + '"></div>' +
       '<div class="field"><label>Category</label><select id="mi-cat">' + me.cats.map((x) => '<option value="' + x.id + '"' + (String(x.id) === String(it ? it.category_id : me.activeCat) ? ' selected' : '') + '>' + esc(x.name) + '</option>').join('') + '</select></div></div>' +
       '<div class="frow"><div class="field"><label>Station</label><select id="mi-station">' + KDS_STATIONS.map((s) => '<option value="' + s.slug + '"' + (it && it.station === s.slug ? ' selected' : '') + '>' + esc(s.label) + '</option>').join('') + '</select></div>' +
       '<div class="field"><label>Course</label><select id="mi-course">' + ME_COURSES.map((x) => '<option' + (it && it.course === x ? ' selected' : '') + '>' + x + '</option>').join('') + '</select></div>' +
@@ -4912,9 +4930,13 @@ async function renderMenuViewer(app) {
     $('[data-x="cancel"]', bd).onclick = closeModal;
     $('[data-x="save"]', bd).onclick = async () => {
       syncMods();
+      const hhRaw = $('#mi-hhprice', bd).value.trim();
       const body = {
         name: $('#mi-name', bd).value,
         price_cents: Math.round((parseFloat($('#mi-price', bd).value) || 0) * 100),
+        /* Happy-hour price: blank clears it (null); a value sets it. The
+           server validates it is a non-negative integer number of cents. */
+        hh_price_cents: hhRaw === '' ? null : Math.round((parseFloat(hhRaw) || 0) * 100),
         category_id: Number($('#mi-cat', bd).value),
         station: $('#mi-station', bd).value,
         course: $('#mi-course', bd).value,
@@ -4978,22 +5000,23 @@ async function renderMenuViewer(app) {
       '<div class="field" style="flex:1"><label>Start</label><input data-dpf="start" type="time" value="' + esc(w.start) + '"></div>' +
       '<div class="field" style="flex:1"><label>End</label><input data-dpf="end" type="time" value="' + esc(w.end) + '"></div>' +
       '<div class="field" style="flex:2"><label>Also includes</label><input data-dpf="also" value="' + esc((w.also || []).join(', ')) + '" placeholder="HH, BRUNCH"></div>' +
+      '<div class="field"><label class="check-line"><input type="checkbox" data-dpf="pricing"' + (w.pricing ? ' checked' : '') + '> HH pricing</label></div>' +
       '<button class="icon-btn" data-dpdel="' + i + '" title="Remove window" aria-label="Remove window">✕</button></div>').join('') ||
       '<p class="muted small">No windows — the whole menu shows all day.</p>';
     $$('[data-dpdel]', dpRows()).forEach((b) => b.onclick = () => { dpSchedule.splice(Number(b.dataset.dpdel), 1); drawDpRows(); });
   }
   async function loadDp() {
-    try { const r = await api('/api/admin/dayparts'); dpSchedule = (r.schedule || []).map((w) => ({ name: w.name, start: w.start, end: w.end, also: w.also || [] })); }
+    try { const r = await api('/api/admin/dayparts'); dpSchedule = (r.schedule || []).map((w) => ({ name: w.name, start: w.start, end: w.end, also: w.also || [], pricing: !!w.pricing })); }
     catch (e) { handleApiError(e); return; }
     drawDpRows();
   }
   $('#dp-toggle').onclick = () => { const b = $('#dp-body'); b.classList.toggle('hidden'); $('#dp-toggle').textContent = b.classList.contains('hidden') ? 'Show' : 'Hide'; };
-  $('#dp-add').onclick = () => { dpSchedule.push({ name: 'NEW', start: '08:00', end: '22:00', also: [] }); drawDpRows(); };
+  $('#dp-add').onclick = () => { dpSchedule.push({ name: 'NEW', start: '08:00', end: '22:00', also: [], pricing: false }); drawDpRows(); };
   $('#dp-save').onclick = async () => {
     const rows = $$('[data-dpr]', dpRows());
     const schedule = rows.map((r) => {
       const v = (f) => $('[data-dpf="' + f + '"]', r).value.trim();
-      return { name: v('name').toUpperCase(), start: v('start'), end: v('end'), also: v('also').split(',').map((x) => x.trim().toUpperCase()).filter(Boolean) };
+      return { name: v('name').toUpperCase(), start: v('start'), end: v('end'), also: v('also').split(',').map((x) => x.trim().toUpperCase()).filter(Boolean), pricing: ($('[data-dpf="pricing"]', r) || {}).checked === true };
     });
     try {
       await api('/api/admin/dayparts', 'PUT', { schedule });

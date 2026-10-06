@@ -90,6 +90,9 @@
     return e;
   }
   function money(c) { return '$' + (c / 100).toFixed(2); }
+  /* Happy-hour pricing: show (and cart) the effective price the server
+     will charge right now, when the payload carries one. */
+  function priceOf(it) { return it.effective_price_cents != null ? it.effective_price_cents : it.price_cents; }
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -150,7 +153,7 @@
       var b = el('button', 'kx-item',
         '<span class="nm">' + esc(it.name) + '</span>' +
         (it.description ? '<span class="ds">' + esc(it.description) + '</span>' : '') +
-        '<span class="pr">' + money(it.price_cents) + '</span>');
+        '<span class="pr">' + money(priceOf(it)) + '</span>');
       b.addEventListener('click', function () { tapItem(it); });
       box.appendChild(b);
     });
@@ -159,7 +162,7 @@
   /* 3-tap core: no modifiers → instant add (tap 2); modifiers → sheet. */
   function tapItem(it) {
     if (!it.modifiers || !it.modifiers.length) {
-      addToCart(it, 1, [], it.price_cents);
+      addToCart(it, 1, [], priceOf(it));
       return;
     }
     openSheet(itemSheet(it));
@@ -175,7 +178,7 @@
       '<span id="kx-qty">1</span>' +
       '<button class="kx-qtybtn" id="kx-plus">+</button>' +
       '<span style="margin-left:auto;font-size:28px;color:var(--brass);font-weight:800" id="kx-tot">' +
-      money(it.price_cents) + '</span></div>' +
+      money(priceOf(it)) + '</span></div>' +
       '<div id="kx-mods"></div>' +
       '<button id="kx-addbtn">Add to order</button>';
     var modsBox = p.querySelector('#kx-mods');
@@ -191,7 +194,7 @@
       modsBox.appendChild(row);
     });
     function unit() {
-      var t = it.price_cents;
+      var t = priceOf(it);
       Object.keys(picked).forEach(function (k) { t += picked[k].price_delta_cents; });
       return t;
     }

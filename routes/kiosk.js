@@ -105,10 +105,10 @@ function ensureKioskTable(db, SITE_ID) {
 /* One JOIN for categories+items (86'd excluded), one batched query for
    modifiers. `forOrder=true` also drops market-price items (price_cents = 0),
    which a kiosk cannot price without a manager. */
-function buildMenu(db, SITE_ID, forOrder) {
+function buildMenu(db, SITE_ID, forOrder, effPrice) {
   const rows = db.prepare(`
     SELECT c.id AS cat_id, c.name AS cat_name, c.sort AS cat_sort,
-           i.id, i.name, i.description, i.price_cents, i.item_type,
+           i.id, i.name, i.description, i.price_cents, i.hh_price_cents, i.item_type,
            i.station, i.course, i.price_note
       FROM menu_categories c
       JOIN menu_items i ON i.category_id = c.id
@@ -142,6 +142,12 @@ function buildMenu(db, SITE_ID, forOrder) {
       name: r.name,
       description: r.description,
       price_cents: r.price_cents,
+      // Happy-hour pricing: what a kiosk order placed right now would
+      // actually be charged (the resolver is injected by the host; without
+      // it the regular price stands).
+      hh_price_cents: r.hh_price_cents != null ? r.hh_price_cents : null,
+      effective_price_cents: effPrice ? effPrice(r) : r.price_cents,
+      hh_active: effPrice ? effPrice(r) !== r.price_cents : false,
       item_type: r.item_type,
       station: r.station,
       course: r.course,
@@ -162,7 +168,8 @@ function splitBoards(cats, board, boards) {
 
 /* -------------------------------- register -------------------------------- */
 function register(app, ctx) {
-  const { db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated, serverPlus } = ctx;
+  const { db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated, serverPlus, effectivePriceCents } = ctx;
+  const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
   // serverPlus is required: the staff-facing call-flag endpoints below must
   // reject unauthenticated/wrong-role callers server-side.
   if (typeof serverPlus !== 'function') throw new Error('kiosk.register requires ctx.serverPlus');
@@ -170,7 +177,7 @@ function register(app, ctx) {
   /* GET /api/kiosk/menu — orderable menu for the kiosk. 86'd items are
      EXCLUDED (not flagged); market-price items excluded (need a manager). */
   app.get('/api/kiosk/menu', (req, res) => {
-    res.json({ categories: buildMenu(db, SITE_ID, true), generated_at: nowIso() });
+    res.json({ categories: buildMenu(db, SITE_ID, true, effPrice), generated_at: nowIso() });
   });
 
   /* POST /api/kiosk/order {items:[{menu_item_id, qty, modifiers:[{name}]}],
@@ -261,7 +268,7 @@ function register(app, ctx) {
       for (const ln of lines) {
         const r = insItem.run(
           crypto.randomUUID(), checkId, ln.menuItem.id, ln.qty,
-          ln.menuItem.price_cents, JSON.stringify(ln.modifiers), ln.menuItem.course, at, at
+          effPrice ? effPrice(ln.menuItem) : ln.menuItem.price_cents, JSON.stringify(ln.modifiers), ln.menuItem.course, at, at
         );
         const station = ln.menuItem.station || 'expediter';
         if (!byStation.has(station)) byStation.set(station, []);
@@ -348,7 +355,7 @@ function register(app, ctx) {
   /* GET /api/menuboards?board=1&boards=1 — TV menu. 86'd items excluded.
      board/boards splits categories across multiple TVs. */
   app.get('/api/menuboards', (req, res) => {
-    const cats = buildMenu(db, SITE_ID, false);
+    const cats = buildMenu(db, SITE_ID, false, effPrice);
     const board = parseInt(req.query.board, 10) || 1;
     const boards = parseInt(req.query.boards, 10) || 1;
     res.json({

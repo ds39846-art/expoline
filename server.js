@@ -123,6 +123,7 @@ db.exec('PRAGMA busy_timeout=5000;');
   const cols = new Set(db.prepare('PRAGMA table_info(menu_items)').all().map((c) => c.name));
   if (!cols.has('image_url')) db.exec('ALTER TABLE menu_items ADD COLUMN image_url TEXT');
   if (!cols.has('daypart')) db.exec('ALTER TABLE menu_items ADD COLUMN daypart TEXT');
+  if (!cols.has('hh_price_cents')) db.exec('ALTER TABLE menu_items ADD COLUMN hh_price_cents INTEGER');
   db.exec(`CREATE TABLE IF NOT EXISTS menu_audit (
     id INTEGER PRIMARY KEY,
     site_id TEXT,
@@ -851,6 +852,37 @@ function tzDate(iso, tz = SITE_TZ) {
 }
 const todaySite = () => tzDate(nowIso());
 
+/* --------------------- happy-hour (time-based) pricing ---------------------
+ * A menu item may carry an optional hh_price_cents next to its regular
+ * price_cents. The HH price is in effect while the site clock sits inside
+ * a PRICING daypart window. Daypart windows are identified by name across
+ * this codebase (item daypart tags, category parents), so a window counts
+ * as a pricing window when it is flagged pricing:true in dayparts_json
+ * (the seeded HAPPY HOUR window is) or when its name is HAPPY HOUR — the
+ * name rule covers schedules saved before the flag existed. Resolution
+ * happens server-side at line-insert time ONLY: the charged price
+ * snapshots into check_items.unit_price_cents and never moves afterwards,
+ * so a line rung at 5:55pm keeps its HH price after 6:00pm and a line
+ * rung at the regular price is never repriced when HH starts. Market-
+ * price items (price_cents = 0) are NEVER HH-priced: their price is
+ * manager-entered per line, exactly as before. This one resolver feeds
+ * every insert path (POST /items, send-now, waitlist preorders, kiosk,
+ * guest/delivery, and the LAN store via the injected helpers). */
+function hhPricingActive(nowMs = Date.now()) {
+  const cur = parityOrders.currentDaypart(parityOrders.getDayparts(db, SITE_ID), nowMs, SITE_TZ);
+  if (!cur) return false;
+  return cur.pricing === true || String(cur.name || '').trim().toUpperCase() === 'HAPPY HOUR';
+}
+
+function effectivePriceCents(menuItem, active) {
+  if (!menuItem) return 0;
+  if (menuItem.price_cents > 0 && menuItem.hh_price_cents != null) {
+    const on = active === undefined ? hhPricingActive() : active;
+    if (on) return menuItem.hh_price_cents;
+  }
+  return menuItem.price_cents;
+}
+
 function addDays(dateStr, days) {
   const [y, m, d] = dateStr.split('-').map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d));
@@ -1336,7 +1368,7 @@ app.use((req, res, next) => {
    token); hardened by rate limiting + full server-side validation. */
 require('./routes/parity_kds_pay').registerPublic(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse,
-  broadcastTicket, ticketView, broadcastCheckUpdated,
+  broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents,
 });
 
 app.use('/api', authMiddleware);
@@ -1353,7 +1385,7 @@ const lanRuntime = (() => {
     helpers: {
       persistTotals, checkResponse, ticketView, checkLocationLabel,
       broadcastTicket, broadcastCheckUpdated, broadcastMenuUpdated,
-      auditApproval, auditMenu,
+      auditApproval, auditMenu, effectivePriceCents,
       verifyManagerPin, verifyOfflineApproval, consumeOfflineApproval,
       parseJson, crypto,
     },
@@ -1371,6 +1403,7 @@ const lanRuntime = (() => {
    the wall, so role checks work). */
 require('./routes/kiosk').register(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated,
+  effectivePriceCents,
   // Staff-facing call-flag endpoints are gated server-side; the customer
   // kiosk flows (menu/order/call-staff) stay public by design.
   serverPlus,
@@ -1462,11 +1495,12 @@ app.get('/api/menu', (req, res) => {
     'SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id'
   ).all(SITE_ID);
   const itemStmt = db.prepare(
-    'SELECT id, name, description, price_cents, item_type, station, course, price_note, daypart, popular FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
+    'SELECT id, name, description, price_cents, hh_price_cents, item_type, station, course, price_note, daypart, popular FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
   );
   const modStmt = db.prepare(
     'SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id'
   );
+  const hhActive = hhPricingActive();
   res.json(mergeCats(cats.map((c) => ({
     id: c.id,
     name: c.name,
@@ -1477,6 +1511,12 @@ app.get('/api/menu', (req, res) => {
       name: it.name,
       description: it.description,
       price_cents: it.price_cents,
+      // Happy-hour pricing: the manager-set HH price (null = none), the
+      // price a line rung right now would actually be charged, and
+      // whether the HH price is the one in effect for this item.
+      hh_price_cents: it.hh_price_cents != null ? it.hh_price_cents : null,
+      effective_price_cents: effectivePriceCents(it, hhActive),
+      hh_active: hhActive && it.price_cents > 0 && it.hh_price_cents != null,
       item_type: it.item_type,
       station: it.station,
       course: it.course,
@@ -1720,13 +1760,15 @@ function menuCategoryById(id) {
   return db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function menuItemById(id) {
-  return db.prepare('SELECT id, site_id, category_id, name, description, price_cents, item_type, station, course, active, price_note, image_url, daypart FROM menu_items WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+  return db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, price_note, image_url, daypart FROM menu_items WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function auditMenu(req, action, ids, details) {
   db.prepare('INSERT INTO menu_audit (site_id, actor, action, item_id, category_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(SITE_ID, req.user ? req.user.name : '?', action, ids.item_id ?? null, ids.category_id ?? null, JSON.stringify(details || {}), nowIso());
 }
 function validPriceCents(v) { return isInt(v) && v >= 0; }
+/** Happy-hour price: null clears it; otherwise the same rule as a price. */
+function validHhPriceCents(v) { return v === null || validPriceCents(v); }
 function cleanOpt(v) { const s = cleanLabel(v); return s ? s : null; }
 function validCourse(v) { return typeof v === 'string' && COURSES.has(v.trim().toLowerCase()); }
 function validItemType(v) { return typeof v === 'string' && ITEM_TYPES.has(v.trim().toLowerCase()); }
@@ -1748,7 +1790,8 @@ function itemAdminView(it) {
   const mods = db.prepare('SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id').all(it.id);
   return {
     id: it.id, category_id: it.category_id, name: it.name, description: it.description,
-    price_cents: it.price_cents, item_type: it.item_type, station: it.station, course: it.course,
+    price_cents: it.price_cents, hh_price_cents: it.hh_price_cents != null ? it.hh_price_cents : null,
+    item_type: it.item_type, station: it.station, course: it.course,
     active: it.active, price_note: it.price_note, image_url: it.image_url, daypart: it.daypart,
     modifiers: mods,
   };
@@ -1758,7 +1801,7 @@ function itemAdminView(it) {
    /api/menu deliberately hides. */
 app.get('/api/admin/menu', managerOnly(), (req, res) => {
   const cats = db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id').all(SITE_ID);
-  const itemStmt = db.prepare('SELECT id, site_id, category_id, name, description, price_cents, item_type, station, course, active, price_note, image_url, daypart FROM menu_items WHERE category_id = ? ORDER BY id');
+  const itemStmt = db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, price_note, image_url, daypart FROM menu_items WHERE category_id = ? ORDER BY id');
   res.json(cats.map((c) => ({
     id: c.id, name: c.name, parent: c.parent, sort: c.sort,
     items: itemStmt.all(c.id).map(itemAdminView),
@@ -1818,6 +1861,8 @@ app.post('/api/admin/menu/items', managerOnly(), (req, res) => {
   const name = cleanLabel(b.name);
   if (!name) return res.status(400).json({ error: 'Item name is required' });
   if (!validPriceCents(b.price_cents)) return res.status(400).json({ error: 'price_cents must be a whole number of cents ≥ 0' });
+  const hh_price_cents = b.hh_price_cents === undefined ? null : b.hh_price_cents;
+  if (!validHhPriceCents(hh_price_cents)) return res.status(400).json({ error: 'hh_price_cents must be a whole number of cents ≥ 0 or null' });
   const station = canonStation(b.station);
   if (!station) return res.status(400).json({ error: 'station must be one of: bar, expediter, garde_manger, dessert' });
   if (!validCourse(b.course)) return res.status(400).json({ error: 'course must be one of: drink, appetizer, entree, dessert' });
@@ -1827,13 +1872,13 @@ app.post('/api/admin/menu/items', managerOnly(), (req, res) => {
   const modErr = validateModifiers(b.modifiers);
   if (modErr) return res.status(400).json({ error: modErr });
   const r = db.prepare(`INSERT INTO menu_items
-    (site_id, category_id, name, description, price_cents, item_type, station, course, active, price_note, image_url, daypart)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`)
-    .run(SITE_ID, cat.id, name, cleanOpt(b.description), b.price_cents, item_type, station, course,
+    (site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, price_note, image_url, daypart)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`)
+    .run(SITE_ID, cat.id, name, cleanOpt(b.description), b.price_cents, hh_price_cents, item_type, station, course,
       cleanOpt(b.price_note), cleanOpt(b.image_url), cleanOpt(b.daypart));
   const id = r.lastInsertRowid;
   if (b.modifiers) saveModifiers(id, b.modifiers);
-  auditMenu(req, 'item.create', { item_id: id, category_id: cat.id }, { name, price_cents: b.price_cents, station, course });
+  auditMenu(req, 'item.create', { item_id: id, category_id: cat.id }, { name, price_cents: b.price_cents, hh_price_cents, station, course });
   broadcastMenuUpdated();
   res.status(201).json(itemAdminView(menuItemById(id)));
 });
@@ -1846,6 +1891,8 @@ app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
   if (!name) return res.status(400).json({ error: 'Item name is required' });
   const price_cents = b.price_cents === undefined ? it.price_cents : b.price_cents;
   if (!validPriceCents(price_cents)) return res.status(400).json({ error: 'price_cents must be a whole number of cents ≥ 0' });
+  const hh_price_cents = b.hh_price_cents === undefined ? (it.hh_price_cents != null ? it.hh_price_cents : null) : b.hh_price_cents;
+  if (!validHhPriceCents(hh_price_cents)) return res.status(400).json({ error: 'hh_price_cents must be a whole number of cents ≥ 0 or null' });
   const station = b.station === undefined ? it.station : canonStation(b.station);
   if (!station) return res.status(400).json({ error: 'station must be one of: bar, expediter, garde_manger, dessert' });
   const course = b.course === undefined ? it.course : b.course.trim().toLowerCase();
@@ -1857,9 +1904,9 @@ app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
   const modErr = validateModifiers(b.modifiers);
   if (modErr) return res.status(400).json({ error: modErr });
   db.prepare(`UPDATE menu_items SET category_id = ?, name = ?, description = ?, price_cents = ?,
-    item_type = ?, station = ?, course = ?, price_note = ?, image_url = ?, daypart = ? WHERE id = ?`)
+    hh_price_cents = ?, item_type = ?, station = ?, course = ?, price_note = ?, image_url = ?, daypart = ? WHERE id = ?`)
     .run(category_id, name, b.description === undefined ? it.description : cleanOpt(b.description),
-      price_cents, item_type, station, course,
+      price_cents, hh_price_cents, item_type, station, course,
       b.price_note === undefined ? it.price_note : cleanOpt(b.price_note),
       b.image_url === undefined ? it.image_url : cleanOpt(b.image_url),
       b.daypart === undefined ? it.daypart : cleanOpt(b.daypart), it.id);
@@ -1868,10 +1915,10 @@ app.put('/api/admin/menu/items/:id', managerOnly(), (req, res) => {
      name/price edits so a stale LAN editor's write is rejected with the
      current version instead of silently clobbering. Unread in
      single-server mode. */
-  if (LAN_ENABLED && (name !== it.name || price_cents !== it.price_cents)) {
+  if (LAN_ENABLED && (name !== it.name || price_cents !== it.price_cents || hh_price_cents !== (it.hh_price_cents != null ? it.hh_price_cents : null))) {
     db.prepare('UPDATE menu_items SET version = COALESCE(version, 1) + 1 WHERE id = ?').run(it.id);
   }
-  auditMenu(req, 'item.update', { item_id: it.id, category_id }, { name, price_cents, station, course });
+  auditMenu(req, 'item.update', { item_id: it.id, category_id }, { name, price_cents, hh_price_cents, station, course });
   broadcastMenuUpdated();
   res.json(itemAdminView(menuItemById(it.id)));
 });
@@ -2200,6 +2247,13 @@ app.patch('/api/checks/:id', serverPlus(), (req, res) => {
     if (b.tab_name !== null && (typeof b.tab_name !== 'string' || b.tab_name.length > 40)) {
       return res.status(400).json({ error: 'tab_name must be a string of at most 40 characters' });
     }
+    /* A bar tab IS its guest name: the create rule (non-empty, ≤40) is
+       also the rename rule, so a tab can never be blanked into an
+       anonymous check from check settings. Table checks keep the
+       historical optional-label behavior, clearing included. */
+    if (check.channel === 'bar_tab' && (b.tab_name === null || !b.tab_name.trim())) {
+      return res.status(400).json({ error: 'tab_name is required for a bar tab' });
+    }
     patch.tab_name = b.tab_name === null ? null : b.tab_name.trim() || null;
   }
   if (b.guest_count !== undefined) {
@@ -2312,8 +2366,11 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
   }
   // MP (market price) items: price_cents = 0 requires a manager-entered price.
   // Fixed-price items ALWAYS use the menu price — a request-supplied
-  // unit_price_cents for them is ignored, never trusted.
-  let unitPrice = menuItem.price_cents;
+  // unit_price_cents for them is ignored, never trusted. During a pricing
+  // daypart (happy hour) the fixed price resolves through the HH resolver;
+  // MP items never take an HH price (the resolver returns 0 for them and
+  // the manager-entered price below wins).
+  let unitPrice = effectivePriceCents(menuItem);
   if (menuItem.price_cents === 0) {
     if (req.user.role !== 'manager') {
       return res.status(403).json({ error: 'Market-price items must be priced by a manager' });
@@ -3084,6 +3141,9 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
      returns with the same status and body as before, and the check
      is left exactly as it was. */
   const prepared = [];
+  // Happy-hour state is resolved once for the whole batch: every line in
+  // one send-now is priced by the same clock reading.
+  const hhActiveNow = hhPricingActive();
   for (let li = 0; li < items.length; li++) {
     const line = items[li];
     const { menu_item_id, seat, qty = 1, modifiers = [], unit_price_cents, note, allergy, allergy_detail } = line || {};
@@ -3104,7 +3164,7 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
     if (!isInt(qty) || qty < 1) return lineErr(400, 'qty must be a positive integer');
     const rmod = resolveModifiers(menuItem.id, modifiers);
     if (rmod.error) return lineErr(400, rmod.error);
-    let unitPrice = menuItem.price_cents;
+    let unitPrice = effectivePriceCents(menuItem, hhActiveNow);
     if (menuItem.price_cents === 0) {
       if (req.user.role !== 'manager') return lineErr(403, 'Market-price items must be priced by a manager');
       if (unit_price_cents == null) return lineErr(400, 'Market-price item requires unit_price_cents');
@@ -6226,7 +6286,9 @@ function validatePreorder(lines, partySize, actorRole) {
         return { error: `preorder_items[${i}]: each modifier needs {name, price_delta_cents}` };
       }
     }
-    let unitPrice = menuItem.price_cents;
+    // Priced when the pre-order is taken: the HH resolver applies here,
+    // and the stored snapshot is what gets inserted at seating time.
+    let unitPrice = effectivePriceCents(menuItem);
     if (menuItem.price_cents === 0) {
       // Market-price items: a manager must set the price when the pre-order is taken.
       if (actorRole !== 'manager') {
@@ -7426,6 +7488,7 @@ require('./routes/insights').register(app, {
 require('./routes/parity_kds_pay').registerStaff(app, {
   db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
   persistTotals, checkResponse, broadcastCheckUpdated, broadcastTicket, ticketView,
+  effectivePriceCents,
 });
 /* Phase 3A competitor parity: order & check flow (dayparts, timers, guest
    names, fired-item edits, merge, move). */

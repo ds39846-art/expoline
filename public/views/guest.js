@@ -77,6 +77,9 @@ function esc(s) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 function money(c) { return '$' + (c / 100).toFixed(2); }
+/* Happy-hour pricing: display (and cart) the effective price the server
+   will charge right now, when the payload carries one. */
+function priceOf(i) { return i.effective_price_cents != null ? i.effective_price_cents : i.price_cents; }
 function el(html) { var d = document.createElement('div'); d.innerHTML = html; return d.firstChild; }
 
 var S = { menu: null, cat: null, cart: [], check: null, guestToken: null, seat: 1, name: '' };
@@ -149,7 +152,7 @@ function drawItems() {
     return '<div class="gx-item"><div class="nm"><b>' + esc(i.name) + '</b>' +
       (i.description ? '<span>' + esc(i.description) + '</span>' : '') +
       (i.modifiers && i.modifiers.length ? '<span> · ' + i.modifiers.length + ' options</span>' : '') + '</div>' +
-      '<div class="pr">' + money(i.price_cents) + '</div>' +
+      '<div class="pr">' + money(priceOf(i)) + '</div>' +
       '<button class="gx-add" data-add="' + i.id + '">' + (q ? q + ' +' : '+') + '</button></div>';
   }).join('');
   host.querySelectorAll('[data-add]').forEach(function (b) {
@@ -177,7 +180,7 @@ function addToCart(id) {
   var key = id + '|' + S.seat + '|' + chosen.map(function (m) { return m.name; }).join(',');
   var line = S.cart.find(function (l) { return l.key === key; });
   if (line) line.qty++;
-  else S.cart.push({ key: key, id: id, name: item.name, price: item.price_cents, qty: 1, seat: S.seat, modifiers: chosen });
+  else S.cart.push({ key: key, id: id, name: item.name, price: priceOf(item), qty: 1, seat: S.seat, modifiers: chosen });
   drawItems(); drawBar();
 }
 

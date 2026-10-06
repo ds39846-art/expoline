@@ -227,8 +227,10 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
           lineCourse = it.course;
         }
         // Same pricing rule as POST /api/checks/:id/items: fixed-price items
-        // ALWAYS use the menu price; MP (price 0) items need a manager price.
-        let unitPrice = menuItem.price_cents;
+        // ALWAYS use the menu price (happy-hour resolved by the injected
+        // resolver when the brain host provides one); MP (price 0) items
+        // need a manager price.
+        let unitPrice = h.effectivePriceCents ? h.effectivePriceCents(menuItem) : menuItem.price_cents;
         if (menuItem.price_cents === 0) {
           if (!actor || actor.role !== 'manager') return { ok: false, error: 'mp_requires_manager' };
           if (!Number.isInteger(it.unit_price_cents) || it.unit_price_cents < 0) {
@@ -418,7 +420,7 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       if (!viaGossip && (!actor || actor.role !== 'manager')) {
         return { ok: false, error: 'manager_role_required' };
       }
-      const cur = db.prepare('SELECT id, name, price_cents, version FROM menu_items WHERE id = ? AND site_id = ?').get(p.item_id, siteSlug);
+      const cur = db.prepare('SELECT id, name, price_cents, hh_price_cents, version FROM menu_items WHERE id = ? AND site_id = ?').get(p.item_id, siteSlug);
       if (!cur) return { ok: false, error: 'menu_item_not_found', item_id: p.item_id };
       const curVer = cur.version || 1;
       if (p.version !== curVer + 1) {
@@ -426,9 +428,14 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       }
       const name = typeof p.name === 'string' && p.name.trim() ? p.name.trim() : cur.name;
       const price = Number.isInteger(p.price_cents) && p.price_cents >= 0 ? p.price_cents : cur.price_cents;
-      db.prepare('UPDATE menu_items SET name = ?, price_cents = ?, version = ? WHERE id = ?')
-        .run(name, price, p.version, cur.id);
-      h.auditMenu({ user: actor }, 'item.update', { item_id: cur.id }, { name, price_cents: price, via: 'sync_batch', version: p.version });
+      // Happy-hour price rides the same op: null clears it, a valid
+      // non-negative integer sets it, anything else keeps the stored one.
+      const hhPrice = p.hh_price_cents === null ? null
+        : (Number.isInteger(p.hh_price_cents) && p.hh_price_cents >= 0 ? p.hh_price_cents
+          : (cur.hh_price_cents != null ? cur.hh_price_cents : null));
+      db.prepare('UPDATE menu_items SET name = ?, price_cents = ?, hh_price_cents = ?, version = ? WHERE id = ?')
+        .run(name, price, hhPrice, p.version, cur.id);
+      h.auditMenu({ user: actor }, 'item.update', { item_id: cur.id }, { name, price_cents: price, hh_price_cents: hhPrice, via: 'sync_batch', version: p.version });
       h.broadcastMenuUpdated();
       return { ok: true, item_id: cur.id, version: p.version };
     }

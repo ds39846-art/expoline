@@ -24,7 +24,7 @@
 
 const DEFAULT_DAYPARTS = [
   { name: 'LUNCH', start: '11:00', end: '16:00', also: ['BAR', 'KEIKI', 'DESSERTS'] },
-  { name: 'HAPPY HOUR', start: '16:00', end: '18:00', also: ['BAR'] },
+  { name: 'HAPPY HOUR', start: '16:00', end: '18:00', also: ['BAR'], pricing: true },
   { name: 'DINNER', start: '18:00', end: '22:00', also: ['BAR', 'DESSERTS'] },
 ];
 const ALWAYS_VISIBLE_DAYPARTS = new Set(['BAR', 'ALL DAY']);
@@ -254,6 +254,10 @@ function register(app, ctx) {
     const clean = schedule.map((w) => ({
       name: w.name.trim().slice(0, 40), start: w.start, end: w.end,
       also: Array.isArray(w.also) ? w.also.map((a) => String(a).slice(0, 40)).slice(0, 12) : [],
+      // pricing:true marks a happy-hour pricing window (items with an
+      // hh_price_cents charge it while the window is current). Preserved
+      // only when literally true so stored schedules stay clean.
+      ...(w.pricing === true ? { pricing: true } : {}),
     }));
     db.prepare("INSERT INTO site_config (site_id, key, value) VALUES (?, 'dayparts_json', ?) ON CONFLICT(site_id, key) DO UPDATE SET value = excluded.value")
       .run(SITE_ID, JSON.stringify(clean));
