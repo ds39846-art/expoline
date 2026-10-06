@@ -261,6 +261,24 @@ button, input, select, textarea { font-family: var(--sans); font-size: 1rem; col
   color: var(--brass-hi); border: 1px solid var(--brass); border-radius: 4px; padding: 2px 6px;
 }
 .item-card .pr-was { color: var(--text-dim); font-weight: 500; }
+/* Floor 86 (audit gap #8): an out item stays VISIBLE on the staff grid
+   (the floor must see it is out, not wonder where it went) but dimmed
+   and marked; the small 86 chip is the fast availability control. */
+.item-card.is-86 { opacity: .55; border-style: dashed; }
+.e86-tag {
+  align-self: flex-start; font-size: .68rem; font-weight: 800; letter-spacing: .08em;
+  color: #ff9d9d; border: 1px solid #b04444; border-radius: 4px; padding: 2px 6px;
+}
+.e86-left {
+  align-self: flex-start; font-size: .68rem; font-weight: 800; letter-spacing: .08em;
+  color: var(--amber); border: 1px solid var(--amber); border-radius: 4px; padding: 2px 6px;
+}
+.e86-chip {
+  align-self: flex-end; font-size: .66rem; font-weight: 800; letter-spacing: .06em;
+  color: var(--text-dim); border: 1px solid var(--line); border-radius: 999px;
+  padding: 2px 8px; cursor: pointer;
+}
+.e86-chip:hover { color: var(--brass-hi); border-color: var(--brass); }
 .cart-panel { margin-top: 16px; }
 .seat-group { border-top: 1px solid var(--line-soft); padding: 10px 0; }
 .seat-group:first-child { border-top: none; }

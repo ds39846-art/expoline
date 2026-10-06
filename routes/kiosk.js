@@ -112,7 +112,7 @@ function buildMenu(db, SITE_ID, forOrder, effPrice) {
            i.station, i.course, i.price_note
       FROM menu_categories c
       JOIN menu_items i ON i.category_id = c.id
-     WHERE c.site_id = ? AND i.site_id = ? AND i.active = 1
+     WHERE c.site_id = ? AND i.site_id = ? AND i.active = 1 AND COALESCE(i.is_86, 0) = 0
        ${forOrder ? 'AND i.price_cents > 0' : ''}
      ORDER BY c.sort, c.id, i.id
   `).all(SITE_ID, SITE_ID);
@@ -169,6 +169,10 @@ function splitBoards(cats, board, boards) {
 /* -------------------------------- register -------------------------------- */
 function register(app, ctx) {
   const { db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated, serverPlus, effectivePriceCents } = ctx;
+  // Menu-refresh push for countdown flips this surface causes; older
+  // hosts without it simply skip the push (menus still refetch on the
+  // next broadcast from any other path).
+  const pushMenu = typeof ctx.broadcastMenuUpdated === 'function' ? ctx.broadcastMenuUpdated : () => {};
   const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
   // serverPlus is required: the staff-facing call-flag endpoints below must
   // reject unauthenticated/wrong-role callers server-side.
@@ -208,6 +212,13 @@ function register(app, ctx) {
       if (!menuItem) {
         return res.status(400).json({ error: `items[${idx}]: unknown or unavailable menu item` });
       }
+      /* Floor 86 (runtime availability): a sold-out item refuses here
+         too, in this surface's established phrasing; the authoritative
+         re-check + countdown consume run inside the write transaction
+         below (this read can race a floor 86 by design). */
+      if (menuItem.is_86) {
+        return res.status(400).json({ error: `items[${idx}]: "${menuItem.name}" is 86'd right now` });
+      }
       if (!(menuItem.price_cents > 0)) {
         return res.status(400).json({ error: `items[${idx}]: "${menuItem.name}" requires staff pricing` });
       }
@@ -242,17 +253,59 @@ function register(app, ctx) {
     const ids = [...new Set(lines.map((l) => l.menuItem.id))];
     const placeholders = ids.map(() => '?').join(',');
     let checkId;
+    let consumedAny86 = false;
     const tickets = [];
     try {
       db.exec('BEGIN IMMEDIATE');
       const recheck = db.prepare(
-        `SELECT id, active FROM menu_items WHERE id IN (${placeholders})`
+        `SELECT id, active, is_86, remaining, name, category_id FROM menu_items WHERE id IN (${placeholders})`
       ).all(...ids);
       const activeMap = new Map(recheck.map((r) => [r.id, r.active]));
       for (const [idx, ln] of lines.entries()) {
         if (activeMap.get(ln.menuItem.id) !== 1) {
           db.exec('ROLLBACK');
           return res.status(400).json({ error: `items[${idx}]: "${ln.menuItem.name}" is 86'd right now` });
+        }
+      }
+      /* Floor 86 runtime state, re-checked fresh inside the transaction
+         (an item floor-86'd after the validation read refuses here),
+         and the countdown consume: aggregated per item across the
+         whole order, one conditional UPDATE per item — a lost race
+         rolls the order back whole. Reaching zero flips the item to
+         sold out, audited as actor 'system' (the count ran out). */
+      const freshMap = new Map(recheck.map((r) => [r.id, r]));
+      const totals86 = new Map();
+      const firstIdx86 = new Map();
+      lines.forEach((ln, idx) => {
+        totals86.set(ln.menuItem.id, (totals86.get(ln.menuItem.id) || 0) + ln.qty);
+        if (!firstIdx86.has(ln.menuItem.id)) firstIdx86.set(ln.menuItem.id, idx);
+      });
+      for (const [mid, totalQty] of totals86) {
+        const fresh = freshMap.get(mid);
+        const idx = firstIdx86.get(mid);
+        if (fresh.is_86) {
+          db.exec('ROLLBACK');
+          return res.status(400).json({ error: `items[${idx}]: "${fresh.name}" is 86'd right now` });
+        }
+        if (fresh.remaining == null) continue;
+        if (totalQty > fresh.remaining) {
+          db.exec('ROLLBACK');
+          return res.status(400).json({ error: `items[${idx}]: "${fresh.name}" has only ${fresh.remaining} left` });
+        }
+        const dec = db.prepare(
+          'UPDATE menu_items SET remaining = remaining - ? WHERE id = ? AND site_id = ? AND remaining IS NOT NULL AND remaining >= ?'
+        ).run(totalQty, mid, SITE_ID, totalQty);
+        if (dec.changes === 0) {
+          db.exec('ROLLBACK');
+          return res.status(400).json({ error: `items[${idx}]: "${fresh.name}" is 86'd right now` });
+        }
+        consumedAny86 = true;
+        const after = db.prepare('SELECT remaining FROM menu_items WHERE id = ?').get(mid);
+        if (after && after.remaining === 0) {
+          db.prepare('UPDATE menu_items SET is_86 = 1 WHERE id = ?').run(mid);
+          db.prepare('INSERT INTO menu_audit (site_id, actor, action, item_id, category_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+            .run(SITE_ID, 'system', 'item.86_auto', mid, fresh.category_id != null ? fresh.category_id : null,
+              JSON.stringify({ name: fresh.name, via: 'countdown' }), nowIso());
         }
       }
       const kioskTable = ensureKioskTable(db, SITE_ID);
@@ -309,6 +362,7 @@ function register(app, ctx) {
       if (typeof ctx.broadcastTicket === 'function') ctx.broadcastTicket(t);
     }
     broadcastCheckUpdated(checkId);
+    if (consumedAny86) pushMenu();
     res.status(201).json({ check: checkResponse(checkId), tickets });
   });
 

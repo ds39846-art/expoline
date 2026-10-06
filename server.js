@@ -127,6 +127,12 @@ db.exec('PRAGMA busy_timeout=5000;');
   if (!cols.has('image_url')) db.exec('ALTER TABLE menu_items ADD COLUMN image_url TEXT');
   if (!cols.has('daypart')) db.exec('ALTER TABLE menu_items ADD COLUMN daypart TEXT');
   if (!cols.has('hh_price_cents')) db.exec('ALTER TABLE menu_items ADD COLUMN hh_price_cents INTEGER');
+  /* Floor 86 (audit gap #8): runtime availability, separate from the
+     manager's structural `active`. is_86 = sold out right now (flipped
+     from the floor mid-service); remaining = optional countdown of how
+     many more may be rung before the item auto-86s at zero. */
+  if (!cols.has('is_86')) db.exec('ALTER TABLE menu_items ADD COLUMN is_86 INTEGER DEFAULT 0');
+  if (!cols.has('remaining')) db.exec('ALTER TABLE menu_items ADD COLUMN remaining INTEGER');
   db.exec(`CREATE TABLE IF NOT EXISTS menu_audit (
     id INTEGER PRIMARY KEY,
     site_id TEXT,
@@ -995,6 +1001,67 @@ function effectivePriceCents(menuItem, active) {
   return menuItem.price_cents;
 }
 
+/* ------------------------- floor 86 (audit gap #8) -------------------------
+ * Runtime availability, separate from the manager's structural `active`
+ * flag (the menu editor's one-tap 86 flips `active`; that stays). A menu
+ * item is orderable only when active = 1 AND is_86 = 0. Floor staff
+ * (server / kitchen / manager) flip is_86 mid-service via
+ * POST /api/menu/items/:id/86 — the kitchen calls the last ribeye and
+ * the next server cannot sell it thirty seconds later.
+ *
+ * The optional countdown (`remaining`) is a SALES cap in item units:
+ * how many more of the item may be rung. It is consumed at RING time
+ * (when a line enters a check), not at fire time — ingredient depletion
+ * stays at fire time because it tracks food actually made, but the 86
+ * count is a promise about what may still be SOLD: if it waited for
+ * fire, two servers could each hold the last two portions and both
+ * fire, overselling the exact thing 86 exists to prevent. Consuming is
+ * one conditional UPDATE (remaining >= qty) inside the caller's write
+ * transaction wherever the path has one, so two rings racing the last
+ * portion produce exactly one success. When the count reaches zero the
+ * item flips to is_86 = 1 and the flip is audited with actor 'system'
+ * (no human flipped it — the count ran out during someone else's ring).
+ * Lines already on checks are never touched: 86 stops NEW rings only.
+ * The state persists until a human restores it — EOD close-out does
+ * NOT clear it (no surprise mid-service restores; un-86 is a decision).
+ * Read-only refusal text for one prospective ring of `qty` units, or
+ * null when the ring may proceed. Pure check — consumes nothing. */
+function eightySixRefusal(mi, qty) {
+  if (!mi) return null;
+  if (mi.is_86) return `86: "${mi.name}" is sold out`;
+  if (mi.remaining != null && qty > mi.remaining) {
+    return `86: "${mi.name}" has only ${mi.remaining} left`;
+  }
+  return null;
+}
+
+/* Consume `qty` units of the item countdown after a successful ring.
+ * Call inside the path's write transaction where one exists. Returns
+ * { consumed, flipped } on success or { error } when the conditional
+ * UPDATE lost a race (the count moved between the caller's read and
+ * this write) — the caller rolls back and answers with the error. */
+function consumeEightySixCountdown(mi, qty) {
+  if (!mi || mi.remaining == null) return { consumed: false, flipped: false };
+  const r = db.prepare(
+    'UPDATE menu_items SET remaining = remaining - ? WHERE id = ? AND site_id = ? AND remaining IS NOT NULL AND remaining >= ?'
+  ).run(qty, mi.id, SITE_ID, qty);
+  if (r.changes === 0) {
+    const fresh = db.prepare('SELECT name, is_86, remaining FROM menu_items WHERE id = ? AND site_id = ?')
+      .get(mi.id, SITE_ID);
+    if (fresh && fresh.is_86) return { error: `86: "${fresh.name}" is sold out` };
+    return { error: `86: "${mi.name}" has only ${fresh && fresh.remaining != null ? fresh.remaining : 0} left` };
+  }
+  const after = db.prepare('SELECT remaining FROM menu_items WHERE id = ?').get(mi.id);
+  if (after && after.remaining === 0) {
+    db.prepare('UPDATE menu_items SET is_86 = 1 WHERE id = ?').run(mi.id);
+    db.prepare('INSERT INTO menu_audit (site_id, actor, action, item_id, category_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(SITE_ID, 'system', 'item.86_auto', mi.id, mi.category_id != null ? mi.category_id : null,
+        JSON.stringify({ name: mi.name, via: 'countdown' }), nowIso());
+    return { consumed: true, flipped: true };
+  }
+  return { consumed: true, flipped: false };
+}
+
 function addDays(dateStr, days) {
   const [y, m, d] = dateStr.split('-').map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d));
@@ -1480,7 +1547,7 @@ app.use((req, res, next) => {
    token); hardened by rate limiting + full server-side validation. */
 parityKdsPay.registerPublic(app, {
   db, SITE_ID, nowIso, crypto, persistTotals, checkResponse,
-  broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents,
+  broadcastTicket, ticketView, broadcastCheckUpdated, broadcastMenuUpdated, effectivePriceCents,
   dayClosedToday,
 });
 
@@ -1515,7 +1582,7 @@ const lanRuntime = (() => {
    call-flag endpoints are gated by ctx.serverPlus (req.user is populated by
    the wall, so role checks work). */
 require('./routes/kiosk').register(app, {
-  db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated,
+  db, SITE_ID, nowIso, crypto, persistTotals, checkResponse, broadcastCheckUpdated, broadcastMenuUpdated,
   effectivePriceCents,
   // Staff-facing call-flag endpoints are gated server-side; the customer
   // kiosk flows (menu/order/call-staff) stay public by design.
@@ -1608,7 +1675,7 @@ app.get('/api/menu', (req, res) => {
     'SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id'
   ).all(SITE_ID);
   const itemStmt = db.prepare(
-    'SELECT id, name, description, price_cents, hh_price_cents, item_type, station, course, price_note, daypart, popular FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
+    'SELECT id, name, description, price_cents, hh_price_cents, item_type, station, course, price_note, daypart, popular, is_86, remaining FROM menu_items WHERE category_id = ? AND active = 1 ORDER BY id'
   );
   const modStmt = db.prepare(
     'SELECT id, name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id'
@@ -1630,6 +1697,12 @@ app.get('/api/menu', (req, res) => {
       hh_price_cents: it.hh_price_cents != null ? it.hh_price_cents : null,
       effective_price_cents: effectivePriceCents(it, hhActive),
       hh_active: hhActive && it.price_cents > 0 && it.hh_price_cents != null,
+      // Floor 86: staff keep SEEING a sold-out item (visible-but-disabled
+      // with an 86 marker beats wondering where it went); guests and the
+      // kiosk never see it (their menus filter is_86 out server-side).
+      // remaining = portions still ringable under a countdown, else null.
+      is_86: it.is_86 ? true : false,
+      remaining: it.remaining != null ? it.remaining : null,
       item_type: it.item_type,
       station: it.station,
       course: it.course,
@@ -1873,7 +1946,7 @@ function menuCategoryById(id) {
   return db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function menuItemById(id) {
-  return db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, price_note, image_url, daypart FROM menu_items WHERE id = ? AND site_id = ?').get(id, SITE_ID);
+  return db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, is_86, remaining, price_note, image_url, daypart FROM menu_items WHERE id = ? AND site_id = ?').get(id, SITE_ID);
 }
 function auditMenu(req, action, ids, details) {
   db.prepare('INSERT INTO menu_audit (site_id, actor, action, item_id, category_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
@@ -1905,7 +1978,11 @@ function itemAdminView(it) {
     id: it.id, category_id: it.category_id, name: it.name, description: it.description,
     price_cents: it.price_cents, hh_price_cents: it.hh_price_cents != null ? it.hh_price_cents : null,
     item_type: it.item_type, station: it.station, course: it.course,
-    active: it.active, price_note: it.price_note, image_url: it.image_url, daypart: it.daypart,
+    active: it.active,
+    /* Floor 86 state rides the admin view too, so the editor shows what
+       the floor did mid-service (the editor toggle flips `active`). */
+    is_86: it.is_86 ? true : false, remaining: it.remaining != null ? it.remaining : null,
+    price_note: it.price_note, image_url: it.image_url, daypart: it.daypart,
     modifiers: mods,
   };
 }
@@ -1914,7 +1991,7 @@ function itemAdminView(it) {
    /api/menu deliberately hides. */
 app.get('/api/admin/menu', managerOnly(), (req, res) => {
   const cats = db.prepare('SELECT id, name, parent, sort FROM menu_categories WHERE site_id = ? ORDER BY sort, id').all(SITE_ID);
-  const itemStmt = db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, price_note, image_url, daypart FROM menu_items WHERE category_id = ? ORDER BY id');
+  const itemStmt = db.prepare('SELECT id, site_id, category_id, name, description, price_cents, hh_price_cents, item_type, station, course, active, is_86, remaining, price_note, image_url, daypart FROM menu_items WHERE category_id = ? ORDER BY id');
   res.json(cats.map((c) => ({
     id: c.id, name: c.name, parent: c.parent, sort: c.sort,
     items: itemStmt.all(c.id).map(itemAdminView),
@@ -2060,6 +2137,60 @@ app.post('/api/admin/menu/86/:id', managerOnly(), (req, res) => {
   auditMenu(req, active ? 'item.un86' : 'item.86', { item_id: it.id, category_id: it.category_id }, { name: it.name, active });
   broadcastMenuUpdated();
   res.json({ id: it.id, name: it.name, active, eightysixed: active === 0 });
+});
+
+/* Floor 86 (audit gap #8): the mid-service availability switch, open to
+   every staff role — the kitchen calls it, a server at the pass calls
+   it, nobody waits for a manager with the settings password while three
+   more tickets print. This flips the RUNTIME state (is_86 / remaining),
+   never `active`: the manager's structural on/off above is untouched,
+   and an item is orderable only when active = 1 AND is_86 = 0.
+   Body: { action: 'out' | 'restore', remaining?: integer >= 1 }.
+   'out' with no remaining = sold out now. 'out' with remaining = a
+   countdown: that many more may be rung, then the item auto-86s.
+   'restore' clears both. Repeating the current state is a 200 no-op
+   (noop: true, no audit row) — a double-tap on the floor is not two
+   events. The state persists until a human restores it; EOD close-out
+   deliberately does not clear it. */
+app.post('/api/menu/items/:id/86', requireRole('server', 'kitchen', 'manager'), (req, res) => {
+  const it = menuItemById(req.params.id);
+  if (!it) return res.status(404).json({ error: 'Menu item not found' });
+  const b = req.body || {};
+  if (b.action !== 'out' && b.action !== 'restore') {
+    return res.status(400).json({ error: 'action must be "out" or "restore"' });
+  }
+  let remaining = null;
+  if (b.remaining !== undefined && b.remaining !== null) {
+    if (b.action === 'restore') {
+      return res.status(400).json({ error: 'remaining only applies when marking an item out' });
+    }
+    if (!isInt(b.remaining) || b.remaining < 1) {
+      return res.status(400).json({ error: 'remaining must be a whole number of at least 1 — send action "out" with no remaining to mark the item sold out' });
+    }
+    remaining = b.remaining;
+  }
+  const curOut = it.is_86 ? 1 : 0;
+  const curRem = it.remaining != null ? it.remaining : null;
+  let newOut, newRem;
+  if (b.action === 'restore') { newOut = 0; newRem = null; }
+  else if (remaining != null) { newOut = 0; newRem = remaining; }
+  else { newOut = 1; newRem = null; }
+  if (newOut === curOut && newRem === curRem) {
+    return res.json({ id: it.id, name: it.name, is_86: !!curOut, remaining: curRem, noop: true });
+  }
+  db.prepare('UPDATE menu_items SET is_86 = ?, remaining = ? WHERE id = ?').run(newOut, newRem, it.id);
+  /* LAN BRAIN: version-guard parity with the menu editor PUT — a floor
+     86 changes what synced editors may assume, so it bumps the item
+     version the same way a name/price edit does. */
+  if (LAN_ENABLED) {
+    db.prepare('UPDATE menu_items SET version = COALESCE(version, 1) + 1 WHERE id = ?').run(it.id);
+  }
+  const act = b.action === 'restore' ? 'item.floor_un86'
+    : (remaining != null ? 'item.floor86_limit' : 'item.floor86');
+  auditMenu(req, act, { item_id: it.id, category_id: it.category_id },
+    { name: it.name, via: 'floor', is_86: !!newOut, remaining: newRem });
+  broadcastMenuUpdated();
+  res.json({ id: it.id, name: it.name, is_86: !!newOut, remaining: newRem });
 });
 
 /* Phase 3A (NG-D): popular / quick-pick flag — the order screen's quick-pick
@@ -2453,6 +2584,13 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
     return res.status(400).json({ error: `seat must be an integer between 1 and ${check.guest_count}` });
   }
   if (!isInt(qty) || qty < 1 || qty > 999) return res.status(400).json({ error: 'qty must be a positive integer (max 999)' });
+  /* Floor 86: a runtime-sold-out item refuses up front, naming itself;
+     a countdown item refuses a ring larger than what is left. The
+     authoritative consume happens inside the write transaction below
+     (this read can race another ring by design — the conditional
+     UPDATE there is the one that decides). */
+  const refusal86 = eightySixRefusal(menuItem, qty);
+  if (refusal86) return res.status(400).json({ error: refusal86 });
   if (!Array.isArray(modifiers)) return res.status(400).json({ error: 'modifiers must be an array' });
   // Phase 3A (P0-6): group-aware modifier validation — required/min/max
   // enforced, 86'd options rejected, prices taken from the menu option.
@@ -2528,15 +2666,33 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
   // active=1 read and this INSERT; BEGIN IMMEDIATE serializes us against
   // that toggle so an 86'd item can never slip onto a check.
   let item;
+  let consumed86 = false;
   try {
     db.exec('BEGIN IMMEDIATE');
-    const fresh = db.prepare('SELECT active FROM menu_items WHERE id = ? AND site_id = ?')
+    const fresh = db.prepare('SELECT active, is_86, remaining, name, category_id FROM menu_items WHERE id = ? AND site_id = ?')
       .get(menuItem.id, SITE_ID);
     if (!fresh || fresh.active !== 1) {
       db.exec('ROLLBACK');
       if (idem) idemClear('check_items', idem);
       return res.status(400).json({ error: 'That item was just 86\'d — please reorder' });
     }
+    /* Same in-transaction re-check for the runtime floor 86, plus the
+       countdown consume: the conditional UPDATE inside
+       consumeEightySixCountdown is what makes two rings racing the
+       last portion produce exactly one success. */
+    if (fresh.is_86) {
+      db.exec('ROLLBACK');
+      if (idem) idemClear('check_items', idem);
+      return res.status(400).json({ error: `86: "${fresh.name}" is sold out` });
+    }
+    const cr = consumeEightySixCountdown(
+      { id: menuItem.id, name: fresh.name, category_id: fresh.category_id, remaining: fresh.remaining }, qty);
+    if (cr.error) {
+      db.exec('ROLLBACK');
+      if (idem) idemClear('check_items', idem);
+      return res.status(400).json({ error: cr.error });
+    }
+    consumed86 = cr.consumed;
     const r = db.prepare(
       `INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at,
          note, allergy, allergy_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`
@@ -2553,6 +2709,9 @@ app.post('/api/checks/:id/items', serverPlus(), (req, res) => {
   const out = itemView(item);
   if (idem) idemStore('check_items', idem, 201, out);
   broadcastCheckUpdated(check.id);
+  /* A consumed countdown changes every device's menu ("2 left" ticks
+     down, an auto-86 flips the tile) — push the refresh after commit. */
+  if (consumed86) broadcastMenuUpdated();
   res.status(201).json(out);
 });
 
@@ -3596,6 +3755,11 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
   // Happy-hour state is resolved once for the whole batch: every line in
   // one send-now is priced by the same clock reading.
   const hhActiveNow = hhPricingActive();
+  /* Floor 86: the batch total per item is tracked across lines so two
+     lines of the same item cannot jointly overrun a countdown; phase 2
+     consumes the aggregated totals inside its transaction. */
+  const batch86Qty = new Map();
+  let consumedAny86 = false;
   for (let li = 0; li < items.length; li++) {
     const line = items[li];
     const { menu_item_id, seat, qty = 1, modifiers = [], unit_price_cents, note, allergy, allergy_detail } = line || {};
@@ -3614,6 +3778,12 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
       return lineErr(400, `seat must be an integer between 1 and ${check.guest_count}`);
     }
     if (!isInt(qty) || qty < 1) return lineErr(400, 'qty must be a positive integer');
+    if (menuItem.is_86) return lineErr(400, `86: "${menuItem.name}" is sold out`);
+    const want86 = (batch86Qty.get(menuItem.id) || 0) + qty;
+    batch86Qty.set(menuItem.id, want86);
+    if (menuItem.remaining != null && want86 > menuItem.remaining) {
+      return lineErr(400, `86: "${menuItem.name}" has only ${menuItem.remaining} left`);
+    }
     const rmod = resolveModifiers(menuItem.id, modifiers);
     if (rmod.error) return lineErr(400, rmod.error);
     let unitPrice = effectivePriceCents(menuItem, hhActiveNow);
@@ -3675,7 +3845,25 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
      inline fire path previously never called depleteInventoryForItems
      at all: send-now sales silently left ingredient on_hand untouched.)
      Ticket broadcasts go out after commit, like /send. */
-  const fired = withTransaction(() => {
+  let fired;
+  try {
+    fired = withTransaction(() => {
+    /* Floor 86 countdown consume, aggregated per item, inside the same
+       transaction as the inserts: losing a race throws and the whole
+       batch rolls back (the validate-all-first contract); the catch
+       below re-answers in the per-line error shape. */
+    for (const [mid, totalQty] of batch86Qty) {
+      const mi = prepared.find((p) => p.menuItem.id === mid).menuItem;
+      if (mi.remaining == null) continue;
+      const cr = consumeEightySixCountdown(mi, totalQty);
+      if (cr.error) {
+        const e = new Error(cr.error);
+        e.status = 400;
+        e.body = { error: cr.error, line_index: prepared.findIndex((p) => p.menuItem.id === mid), item_name: mi.name };
+        throw e;
+      }
+      if (cr.consumed) consumedAny86 = true;
+    }
     const insertedIds = [];
     for (const p of prepared) {
       const r = insertLine.run(crypto.randomUUID(), check.id, p.menuItem.id, p.seat, p.qty, p.unitPrice,
@@ -3705,10 +3893,15 @@ app.post('/api/checks/:id/send-now', serverPlus(), (req, res) => {
       created.push(ticketView(db.prepare('SELECT * FROM kds_tickets WHERE id = ?').get(r.lastInsertRowid)));
     }
     return { insertedIds, tickets: created, sentCount: held.length };
-  });
+    });
+  } catch (e) {
+    if (e && e.body) return res.status(e.status || 400).json(e.body);
+    throw e;
+  }
   for (const ticket of fired.tickets) broadcastTicket(ticket);
   persistTotals(check.id);
   broadcastCheckUpdated(check.id);
+  if (consumedAny86) broadcastMenuUpdated();
   const outItems = fired.insertedIds.map((id) => itemView(db.prepare('SELECT ci.*, mi.name FROM check_items ci LEFT JOIN menu_items mi ON mi.id = ci.menu_item_id WHERE ci.id = ?').get(id)));
   res.status(201).json({ sent: fired.sentCount, tickets: fired.tickets, items: outItems });
 });
@@ -7561,6 +7754,7 @@ function validatePreorder(lines, partySize, actorRole) {
   if (!Array.isArray(lines)) return { error: 'preorder_items must be an array' };
   if (lines.length > 40) return { error: 'preorder_items is limited to 40 lines' };
   const items = [];
+  const preorder86Qty = new Map();
   for (const [i, ln] of lines.entries()) {
     const menuItem = ln && ln.menu_item_id != null
       ? db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ? AND active = 1').get(ln.menu_item_id, SITE_ID)
@@ -7568,6 +7762,16 @@ function validatePreorder(lines, partySize, actorRole) {
     if (!menuItem) return { error: `preorder_items[${i}]: valid active menu_item_id is required` };
     const qty = ln.qty == null ? 1 : ln.qty;
     if (!isInt(qty) || qty < 1 || qty > 20) return { error: `preorder_items[${i}]: qty must be 1–20` };
+    /* Floor 86: a preorder is a promise — an item that is out now, or
+       whose countdown cannot cover the promised count, cannot be
+       promised. The count itself is consumed at seating, when the
+       lines actually land on the check. */
+    if (menuItem.is_86) return { error: `preorder_items[${i}]: "${menuItem.name}" is 86'd — sold out` };
+    const want86pre = (preorder86Qty.get(menuItem.id) || 0) + qty;
+    preorder86Qty.set(menuItem.id, want86pre);
+    if (menuItem.remaining != null && want86pre > menuItem.remaining) {
+      return { error: `preorder_items[${i}]: "${menuItem.name}" has only ${menuItem.remaining} left` };
+    }
     const seat = ln.seat == null ? 1 : ln.seat;
     if (!isInt(seat) || seat < 1 || seat > partySize) return { error: `preorder_items[${i}]: seat must be 1–${partySize}` };
     const mods = ln.modifiers == null ? [] : ln.modifiers;
@@ -7682,17 +7886,28 @@ app.post('/api/waitlist/:id/seat', serverPlus(), (req, res) => {
     "INSERT INTO check_items (uuid, check_id, menu_item_id, seat, qty, unit_price_cents, modifiers_json, course, state, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)"
   );
   const skipped = [];
+  let seatConsumed86 = false;
   withTransaction(() => {
     for (const ln of preorder) {
       const mi = db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ? AND active = 1').get(ln.menu_item_id, SITE_ID);
       if (!mi) { skipped.push(ln.name || ('item ' + ln.menu_item_id)); continue; } // 86'd while they waited
+      if (mi.is_86) { skipped.push(ln.name || ('item ' + ln.menu_item_id)); continue; } // floor-86'd while they waited
       const seat = Math.min(Math.max(1, ln.seat | 0), w.party_size);
       const qty = Math.min(Math.max(1, ln.qty | 0), 20);
+      /* The lines land on a check here — that is their ring, so this
+         is where a countdown is consumed. A count that ran out while
+         they waited skips the line like an 86 does (reported above). */
+      if (mi.remaining != null) {
+        const cr = consumeEightySixCountdown(mi, qty);
+        if (cr.error) { skipped.push(ln.name || ('item ' + ln.menu_item_id)); continue; }
+        if (cr.consumed) seatConsumed86 = true;
+      }
       const unit = ln.unit_price_cents != null ? ln.unit_price_cents : mi.price_cents;
       insPre.run(crypto.randomUUID(), opened.check.id, mi.id, seat, qty, unit,
         JSON.stringify(Array.isArray(ln.modifiers) ? ln.modifiers : []), mi.course, nowIso());
     }
   });
+  if (seatConsumed86) broadcastMenuUpdated();
   if (preorder.length) persistTotals(opened.check.id);
   db.prepare("UPDATE waitlist SET status = 'seated' WHERE id = ?").run(w.id);
   auditApproval(req, 'waitlist_seat', { check_id: opened.check.id }, { waitlist_id: w.id, preorder_attached: preorder.length - skipped.length, preorder_skipped: skipped });
@@ -8139,9 +8354,11 @@ app.get('/api/login-summary', (req, res) => {
      WHERE site_id = ? AND (active_from IS NULL OR active_from <= ?) AND (active_to IS NULL OR active_to >= ?)`
   ).all(SITE_ID, now, now).sort((a, b) => (prio[a.priority] - prio[b.priority]) || (a.created_at < b.created_at ? 1 : -1));
   const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-  // Currently 86'd = inactive menu items (the 86 toggle flips active; un-86 restores it).
+  // Currently 86'd = structurally off (active = 0, the manager toggle)
+  // OR floor-86'd mid-service (is_86 = 1, the runtime switch) — the
+  // login list answers "what can we not sell right now", so both count.
   const eightysix = db.prepare(
-    `SELECT name FROM menu_items WHERE site_id = ? AND active = 0 ORDER BY name LIMIT 20`
+    `SELECT name FROM menu_items WHERE site_id = ? AND (active = 0 OR is_86 = 1) ORDER BY name LIMIT 20`
   ).all(SITE_ID).map((r) => r.name);
   const today = todaySite();
   const resv = db.prepare(
@@ -8641,6 +8858,7 @@ const API_DOCS = [
   { method: 'POST', path: '/api/auth/login', auth: 'none', summary: 'PIN login → Bearer <redacted>', params: 'pin' },
   { method: 'GET', path: '/api/config', auth: 'any staff', summary: 'Site config (tax, surcharge, service charge)', params: '—' },
   { method: 'GET', path: '/api/menu', auth: 'any staff', summary: 'Full menu with categories, items, modifiers', params: '—' },
+  { method: 'POST', path: '/api/menu/items/:id/86', auth: 'server / kitchen / manager', summary: 'Floor 86: flip runtime availability mid-service (action out/restore, optional remaining countdown) — separate from the manager active toggle (NEW gap #8)', params: '{action, remaining?}' },
   { method: 'GET', path: '/api/zones', auth: 'any staff', summary: 'Floor zones with tables', params: '—' },
   { method: 'POST', path: '/api/checks', auth: 'server+', summary: 'Open a check on a table — or a bar tab (channel bar_tab) when table_id is omitted and tab_name names the guest', params: 'table_id?, guest_count, tab_name?' },
   { method: 'GET', path: '/api/checks/open', auth: 'server+', summary: 'List open checks', params: '—' },
@@ -8795,7 +9013,7 @@ require('./routes/insights').register(app, {
    delivery aggregation, cash-collect requests, guest-split reverse, table QR. */
 parityKdsPay.registerStaff(app, {
   db, SITE_ID, managerOnly, serverPlus, kitchenPlus, nowIso, crypto, tzDate,
-  persistTotals, checkResponse, broadcastCheckUpdated, broadcastTicket, ticketView,
+  persistTotals, checkResponse, broadcastCheckUpdated, broadcastMenuUpdated, broadcastTicket, ticketView,
   effectivePriceCents, dayClosedToday, isDayClosed,
 });
 /* Phase 3A competitor parity: order & check flow (dayparts, timers, guest

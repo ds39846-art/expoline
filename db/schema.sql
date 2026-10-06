@@ -54,6 +54,8 @@ CREATE TABLE menu_items (
   station TEXT CHECK(station IN ('bar','expediter','garde_manger','dessert')),
   course TEXT CHECK(course IN ('drink','appetizer','entree','dessert')),
   active INTEGER DEFAULT 1,
+  is_86 INTEGER DEFAULT 0,
+  remaining INTEGER,
   price_note TEXT,
   image_url TEXT,
   daypart TEXT

@@ -77,6 +77,10 @@ function migrate(db) {
   const cols = new Set(db.prepare('PRAGMA table_info(menu_items)').all().map((c) => c.name));
   if (!cols.has('version')) db.exec('ALTER TABLE menu_items ADD COLUMN version INTEGER DEFAULT 1');
   db.prepare('UPDATE menu_items SET version = 1 WHERE version IS NULL').run();
+  // Floor 86 (audit gap #8): runtime availability columns, mirroring the
+  // mainline boot migration — the brain enforces the same 86 state.
+  if (!cols.has('is_86')) db.exec('ALTER TABLE menu_items ADD COLUMN is_86 INTEGER DEFAULT 0');
+  if (!cols.has('remaining')) db.exec('ALTER TABLE menu_items ADD COLUMN remaining INTEGER');
 }
 
 function getKv(db, key, dflt) {
@@ -128,6 +132,32 @@ function resolveItem(db, siteSlug, ref) {
  * the brain; re-running them here would fail on redacted payloads).
  * Returns a JSON-serializable result; throws on unexpected failures
  * (receiveBatch converts to {ok:false, error}). */
+/* Floor 86 countdown consume for the LAN store (audit gap #8): one
+ * conditional UPDATE decrements only when the count covers the ring;
+ * reaching zero flips is_86 and writes the auto-86 audit row as actor
+ * 'system' — the count ran out, no human flipped it. Runs inside the
+ * caller's op transaction, so a later refusal in the same op rolls the
+ * decrement back with everything else. */
+function consumeCountdownLan(db, siteSlug, mi, qty, h) {
+  const r = db.prepare(
+    'UPDATE menu_items SET remaining = remaining - ? WHERE id = ? AND site_id = ? AND remaining IS NOT NULL AND remaining >= ?'
+  ).run(qty, mi.id, siteSlug, qty);
+  if (r.changes === 0) {
+    const fresh = db.prepare('SELECT is_86, remaining FROM menu_items WHERE id = ? AND site_id = ?').get(mi.id, siteSlug);
+    if (fresh && fresh.is_86) return { error: 'item_86d' };
+    return { error: 'item_86_low' };
+  }
+  const after = db.prepare('SELECT remaining FROM menu_items WHERE id = ?').get(mi.id);
+  if (after && after.remaining === 0) {
+    db.prepare('UPDATE menu_items SET is_86 = 1 WHERE id = ?').run(mi.id);
+    if (h && typeof h.auditMenu === 'function') {
+      h.auditMenu({ user: { name: 'system' } }, 'item.86_auto',
+        { item_id: mi.id, category_id: mi.category_id }, { name: mi.name, via: 'countdown' });
+    }
+  }
+  return { consumed: true };
+}
+
 function applyOp(db, h, siteSlug, actor, op, opts) {
   const viaGossip = !!(opts && opts.viaGossip);
   const p = typeof op.payload === 'string' ? JSON.parse(op.payload) : (op.payload || {});
@@ -193,10 +223,24 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
           ? db.prepare('SELECT * FROM menu_items WHERE id = ? AND site_id = ? AND active = 1').get(it.menu_item_id, siteSlug)
           : null;
         if (!menuItem) return { ok: false, error: 'invalid_menu_item', menu_item_id: it.menu_item_id };
+        /* Floor 86 (audit gap #8): the brain enforces the same runtime
+           availability as the mainline — a sold-out item refuses with
+           item_86d; the countdown consume below runs per line inside
+           this op's transaction, so a refusal rolls the whole op back. */
+        if (menuItem.is_86) return { ok: false, error: 'item_86d', item_name: menuItem.name, menu_item_id: it.menu_item_id };
         if (!Number.isInteger(it.seat) || it.seat < 1 || it.seat > chk.guest_count) {
           return { ok: false, error: 'invalid_seat', seat: it.seat };
         }
         if (!Number.isInteger(it.qty) || it.qty < 1) return { ok: false, error: 'invalid_qty' };
+        /* Floor 86 countdown consume at ring time (line insert), the
+           same point as every mainline path. The conditional UPDATE
+           decides races; insufficient stock refuses as item_86_low and
+           the op transaction rolls back every line of this op. */
+        if (menuItem.remaining != null) {
+          const cr = consumeCountdownLan(db, siteSlug, menuItem, it.qty, h);
+          if (cr.error) return { ok: false, error: cr.error, item_name: menuItem.name, menu_item_id: it.menu_item_id };
+          if (cr.consumed) h.broadcastMenuUpdated();
+        }
         /* Per-line special request, allergy flag, and ring-time
            course — mainline POST /items parity. The old insert never
            wrote these columns and forced the menu course, so a line
@@ -426,7 +470,7 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       if (!viaGossip && (!actor || actor.role !== 'manager')) {
         return { ok: false, error: 'manager_role_required' };
       }
-      const cur = db.prepare('SELECT id, name, price_cents, hh_price_cents, version FROM menu_items WHERE id = ? AND site_id = ?').get(p.item_id, siteSlug);
+      const cur = db.prepare('SELECT id, name, price_cents, hh_price_cents, is_86, remaining, version FROM menu_items WHERE id = ? AND site_id = ?').get(p.item_id, siteSlug);
       if (!cur) return { ok: false, error: 'menu_item_not_found', item_id: p.item_id };
       const curVer = cur.version || 1;
       if (p.version !== curVer + 1) {
@@ -439,11 +483,25 @@ function applyOp(db, h, siteSlug, actor, op, opts) {
       const hhPrice = p.hh_price_cents === null ? null
         : (Number.isInteger(p.hh_price_cents) && p.hh_price_cents >= 0 ? p.hh_price_cents
           : (cur.hh_price_cents != null ? cur.hh_price_cents : null));
-      db.prepare('UPDATE menu_items SET name = ?, price_cents = ?, hh_price_cents = ?, version = ? WHERE id = ?')
-        .run(name, price, hhPrice, p.version, cur.id);
-      h.auditMenu({ user: actor }, 'item.update', { item_id: cur.id }, { name, price_cents: price, hh_price_cents: hhPrice, via: 'sync_batch', version: p.version });
+      /* Floor 86 state rides the same op under the same guard (audit
+         gap #8): an explicit 0/1 sets is_86, an explicit null or
+         non-negative integer sets remaining, anything else keeps the
+         stored value — old editors never wipe an 86 they do not know
+         about. Invariants mirror the REST model: a count of zero means
+         out; marking out clears the count; a positive count means the
+         item is available. */
+      let is86 = (p.is_86 === 0 || p.is_86 === 1) ? p.is_86 : (cur.is_86 ? 1 : 0);
+      let rem86 = p.remaining === null ? null
+        : (Number.isInteger(p.remaining) && p.remaining >= 0 ? p.remaining
+          : (cur.remaining != null ? cur.remaining : null));
+      if (rem86 === 0) is86 = 1;
+      else if (is86 === 1) rem86 = null;
+      if (rem86 != null && rem86 > 0) is86 = 0;
+      db.prepare('UPDATE menu_items SET name = ?, price_cents = ?, hh_price_cents = ?, is_86 = ?, remaining = ?, version = ? WHERE id = ?')
+        .run(name, price, hhPrice, is86, rem86, p.version, cur.id);
+      h.auditMenu({ user: actor }, 'item.update', { item_id: cur.id }, { name, price_cents: price, hh_price_cents: hhPrice, is_86: !!is86, remaining: rem86, via: 'sync_batch', version: p.version });
       h.broadcastMenuUpdated();
-      return { ok: true, item_id: cur.id, version: p.version };
+      return { ok: true, item_id: cur.id, version: p.version, is_86: !!is86, remaining: rem86 };
     }
 
     default:

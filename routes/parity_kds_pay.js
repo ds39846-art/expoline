@@ -248,6 +248,9 @@ function moneyInt(v) { return isInt(v) && v >= 0; }
 /* ============================ PUBLIC: guest QR ============================ */
 function registerPublic(app, ctx) {
   const { db, SITE_ID, nowIso, crypto, persistTotals, broadcastTicket, ticketView, broadcastCheckUpdated, effectivePriceCents, dayClosedToday } = ctx;
+  // Menu-refresh push for countdown flips this surface causes; older
+  // hosts without it simply skip the push.
+  const pushMenu = typeof ctx.broadcastMenuUpdated === 'function' ? ctx.broadcastMenuUpdated : () => {};
   // Happy-hour resolver injected by the host; without it lines price at
   // the regular menu price, exactly as before.
   const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
@@ -269,6 +272,10 @@ function registerPublic(app, ctx) {
       if (!it || !isInt(it.menu_item_id)) return { error: `items[${idx}].menu_item_id must be an integer` };
       const mi = itemStmt.get(it.menu_item_id, SITE_ID);
       if (!mi) return { error: `items[${idx}]: unknown or unavailable menu item` };
+      /* Floor 86 (runtime availability): sold-out items refuse here in
+         the public surface's phrasing; the countdown consume runs in
+         the order handler before any insert. */
+      if (mi.is_86) return { error: `items[${idx}]: "${mi.name}" is 86'd right now` };
       if (!(mi.price_cents > 0)) return { error: `items[${idx}]: "${mi.name}" requires staff pricing` };
       const qty = it.qty === undefined ? 1 : it.qty;
       if (!isInt(qty) || qty < 1 || qty > 12) return { error: `items[${idx}].qty must be 1–12` };
@@ -325,7 +332,7 @@ function registerPublic(app, ctx) {
       'SELECT id, name FROM menu_categories WHERE site_id = ? ORDER BY id'
     ).all(SITE_ID);
     const itemStmt = db.prepare(
-      'SELECT id, name, description, price_cents, hh_price_cents, item_type, course FROM menu_items WHERE category_id = ? AND site_id = ? AND active = 1 ORDER BY id'
+      'SELECT id, name, description, price_cents, hh_price_cents, item_type, course FROM menu_items WHERE category_id = ? AND site_id = ? AND active = 1 AND COALESCE(is_86, 0) = 0 ORDER BY id'
     );
     const modStmt = db.prepare('SELECT name, price_delta_cents FROM menu_modifiers WHERE item_id = ? ORDER BY id');
     res.json({
@@ -357,6 +364,10 @@ function registerPublic(app, ctx) {
     }
     const priced = priceLines(items);
     if (priced.error) return res.status(400).json({ error: priced.error });
+    /* Floor 86 countdown: consume before the first insert (with exact
+       add-back on failure) so a guest order can never oversell a count. */
+    const c86 = consumeEightySixForLines(db, SITE_ID, priced.lines, nowIso);
+    if (c86.error) return res.status(400).json({ error: c86.error });
     const guestName = cleanOpt(b.guest_name);
 
     const at = nowIso();
@@ -394,6 +405,7 @@ function registerPublic(app, ctx) {
     }
     const totals = persistTotals(checkId);
     broadcastCheckUpdated(checkId);
+    if (c86.consumed) pushMenu();
     const check = db.prepare('SELECT uuid FROM checks WHERE id = ?').get(checkId);
     res.status(201).json({ check_id: checkId, guest_token: check.uuid, totals, tickets: tickets.map((t) => t.id) });
   });
@@ -683,6 +695,8 @@ function registerStaff(app, ctx) {
   // behavior is exactly as before.
   const todayClosed = typeof dayClosedToday === 'function' ? dayClosedToday : () => false;
   const dayIsClosed = typeof isDayClosed === 'function' ? isDayClosed : () => false;
+  // Menu-refresh push for countdown flips this surface causes.
+  const pushMenu = typeof ctx.broadcastMenuUpdated === 'function' ? ctx.broadcastMenuUpdated : () => {};
   const effPrice = typeof effectivePriceCents === 'function' ? effectivePriceCents : null;
   /* Business-date bucketing matches Finance payouts: the SITE-LOCAL date of
    * a timestamp (server.js tzDate), never the raw UTC date inside the stored
@@ -835,6 +849,9 @@ function registerStaff(app, ctx) {
     // Reuse the guest pricer — server-side validation + re-pricing.
     const priced = priceGuestLines(db, SITE_ID, items, effPrice);
     if (priced.error) return res.status(400).json({ error: priced.error });
+    /* Floor 86 countdown consume, same guarded step as guest orders. */
+    const c86 = consumeEightySixForLines(db, SITE_ID, priced.lines, nowIso);
+    if (c86.error) return res.status(400).json({ error: c86.error });
 
     const at = nowIso();
     const checkId = db.prepare(
@@ -870,6 +887,7 @@ function registerStaff(app, ctx) {
     }
     const totals = persistTotals(checkId);
     broadcastCheckUpdated(checkId);
+    if (c86.consumed) pushMenu();
     res.status(201).json({ check_id: checkId, channel: 'delivery', source, totals, tickets: tickets.map((t) => t.id) });
   });
 
@@ -995,6 +1013,57 @@ function registerStaff(app, ctx) {
   });
 }
 
+/* Floor 86 countdown consume for priced line sets (guest QR orders +
+ * delivery orders). Those handlers write without a surrounding
+ * transaction, so the consume runs as its own guarded step BEFORE any
+ * insert: quantities are aggregated per item, each decrement is one
+ * conditional UPDATE (remaining >= qty), and if any item cannot be
+ * covered, every decrement already taken is added back exactly — no
+ * partial consumption is ever left behind. (Handlers here are
+ * synchronous, so check-then-consume cannot interleave with another
+ * request; the conditional UPDATE is the same guard the transactional
+ * paths use.) Only after every decrement lands do zero-count items
+ * flip to sold out, audited as actor 'system' — the count ran out.
+ * Returns { error } or { consumed } (consumed = a countdown moved). */
+function consumeEightySixForLines(db, siteId, lines, nowIso) {
+  const totals = new Map();
+  for (const ln of lines) {
+    totals.set(ln.mi.id, (totals.get(ln.mi.id) || 0) + ln.qty);
+  }
+  const decStmt = db.prepare(
+    'UPDATE menu_items SET remaining = remaining - ? WHERE id = ? AND site_id = ? AND remaining IS NOT NULL AND remaining >= ?');
+  const taken = [];
+  for (const [mid, totalQty] of totals) {
+    const mi = lines.find((l) => l.mi.id === mid).mi;
+    if (mi.remaining == null) continue;
+    const fresh = db.prepare('SELECT name, is_86, remaining FROM menu_items WHERE id = ? AND site_id = ?').get(mid, siteId);
+    if (!fresh || fresh.is_86) {
+      for (const t of taken) db.prepare('UPDATE menu_items SET remaining = remaining + ? WHERE id = ?').run(t.qty, t.id);
+      return { error: `"${mi.name}" is 86'd right now` };
+    }
+    if (totalQty > fresh.remaining) {
+      for (const t of taken) db.prepare('UPDATE menu_items SET remaining = remaining + ? WHERE id = ?').run(t.qty, t.id);
+      return { error: `"${mi.name}" has only ${fresh.remaining} left` };
+    }
+    const dec = decStmt.run(totalQty, mid, siteId, totalQty);
+    if (dec.changes === 0) {
+      for (const t of taken) db.prepare('UPDATE menu_items SET remaining = remaining + ? WHERE id = ?').run(t.qty, t.id);
+      return { error: `"${mi.name}" is 86'd right now` };
+    }
+    taken.push({ id: mid, qty: totalQty, name: mi.name, category_id: mi.category_id });
+  }
+  for (const t of taken) {
+    const after = db.prepare('SELECT remaining FROM menu_items WHERE id = ?').get(t.id);
+    if (after && after.remaining === 0) {
+      db.prepare('UPDATE menu_items SET is_86 = 1 WHERE id = ?').run(t.id);
+      db.prepare('INSERT INTO menu_audit (site_id, actor, action, item_id, category_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(siteId, 'system', 'item.86_auto', t.id, t.category_id != null ? t.category_id : null,
+          JSON.stringify({ name: t.name, via: 'countdown' }), nowIso());
+    }
+  }
+  return { consumed: taken.length > 0 };
+}
+
 /* Shared guest/delivery line pricer (server-side validation + re-pricing).
  * effPrice, when the host injects it, is the happy-hour resolver: a line
  * is priced at what the resolver returns for its menu item right now. */
@@ -1006,6 +1075,8 @@ function priceGuestLines(db, siteId, items, effPrice) {
     if (!it || !isInt(it.menu_item_id)) return { error: `items[${idx}].menu_item_id must be an integer` };
     const mi = itemStmt.get(it.menu_item_id, siteId);
     if (!mi) return { error: `items[${idx}]: unknown or unavailable menu item` };
+    /* Floor 86 (runtime availability), same refusal as the guest pricer. */
+    if (mi.is_86) return { error: `items[${idx}]: "${mi.name}" is 86'd right now` };
     if (!(mi.price_cents > 0)) return { error: `items[${idx}]: "${mi.name}" requires staff pricing` };
     const qty = it.qty === undefined ? 1 : it.qty;
     if (!isInt(qty) || qty < 1 || qty > 12) return { error: `items[${idx}].qty must be 1–12` };

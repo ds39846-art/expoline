@@ -246,8 +246,11 @@ function buildDigest(ctx) {
     basis: { this_week_cents: d1, last_week_cents: d0 },
   });
   // 86 activity today (site-timezone day, like every other figure here).
+  // Counts the manager toggle (item.86), floor 86s (item.floor86), and
+  // countdown auto-86s (item.86_auto) — all three mean an item stopped
+  // being sellable today.
   let n86 = 0;
-  for (const r of db.prepare("SELECT created_at FROM menu_audit WHERE site_id = ? AND action = 'item.86'").all(SITE_ID)) {
+  for (const r of db.prepare("SELECT created_at FROM menu_audit WHERE site_id = ? AND action IN ('item.86', 'item.floor86', 'item.86_auto')").all(SITE_ID)) {
     if (tzDate(r.created_at) === today) n86++;
   }
   if (n86 > 0) alerts.push({
@@ -389,9 +392,10 @@ function askQuestion(ctx, question) {
     const fmtH = (h) => { const n = Number(h) % 24; const ap = n < 12 ? 'AM' : 'PM'; const hh = n % 12 === 0 ? 12 : n % 12; return hh + ' ' + ap; };
     return say(`Busiest hour today: ${fmtH(hours[0][0])} with ${money(hours[0][1])} in sales.`, hours.slice(0, 3).map(([h, c]) => ({ label: fmtH(h), value: money(c) })), { date: today, by_hour: Object.fromEntries(hours) });
   }
-  // 12. 86'd right now.
+  // 12. 86'd right now — structurally off (active = 0) or floor-86'd
+  // mid-service (is_86 = 1); both mean "cannot be sold right now".
   if (/\b86\b|\bsold out\b|\bout of\b/.test(q)) {
-    const rows = db.prepare('SELECT name FROM menu_items WHERE site_id = ? AND active = 0 ORDER BY name').all(SITE_ID);
+    const rows = db.prepare('SELECT name FROM menu_items WHERE site_id = ? AND (active = 0 OR is_86 = 1) ORDER BY name').all(SITE_ID);
     if (!rows.length) return say('Nothing is 86\u2019d right now — the full menu is orderable.', [], {});
     return say(`${rows.length} item${rows.length > 1 ? 's' : ''} 86\u2019d right now: ${rows.map((r) => r.name).join(', ')}.`,
       rows.map((r) => ({ label: r.name, value: '86\u2019d' })), { count: rows.length });

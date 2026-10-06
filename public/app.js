@@ -21,6 +21,16 @@ const dispPrice = (item) => (item && item.effective_price_cents != null ? item.e
 const priceHtml = (item) => (item && item.hh_active
   ? '<span class="pr"><s class="pr-was">' + fmt(item.price_cents) + '</s> ' + fmt(item.effective_price_cents) + '</span><span class="hh-tag">HH</span>'
   : '<span class="pr">' + fmt(item ? item.price_cents : 0) + '</span>');
+/* Floor 86 (audit gap #8): tile-state helpers for the runtime
+   availability the server sends on every menu item. An item is out
+   when is_86 is set; a remaining count without is_86 means limited —
+   that many more can be rung before the item 86s itself. */
+const itemIs86 = (item) => !!(item && item.is_86);
+const itemRemaining = (item) => (item && item.remaining != null ? item.remaining : null);
+/* Tile badge HTML: an 86 tag when out, an N-left tag while counting. */
+const eightySixBadge = (item) => (itemIs86(item)
+  ? '<span class="e86-tag">86</span>'
+  : (itemRemaining(item) != null ? '<span class="e86-left">' + itemRemaining(item) + ' left</span>' : ''));
 /* Location label for a check: a bar tab reads TAB · <name> (the same
    prefixed form the server stamps on KDS tickets); a table check reads
    its table label. Returns null when neither exists. */
@@ -691,6 +701,12 @@ async function getMenu() {
       effective_price_cents: i.effective_price_cents != null ? i.effective_price_cents
         : (i.price_cents != null ? i.price_cents : Math.round((Number(i.price) || 0) * 100)),
       hh_active: !!i.hh_active,
+      /* Floor 86 rides through (audit gap #8): the order screen renders
+         the tile state from is_86 / remaining on these mapped items —
+         the same fixed-field trap that dropped modifier_groups before
+         would silently make every out item look available. */
+      is_86: !!i.is_86,
+      remaining: i.remaining != null ? i.remaining : null,
       station: i.station || i.kds_station || null,
       daypart: i.daypart || null,
     })),
@@ -1689,6 +1705,55 @@ async function renderOrder(app, checkId) {
       '<button class="tab' + (c.id === activeCat ? ' active' : '') + '" data-c="' + esc(String(c.id)) + '">' + esc(c.name) + '</button>').join('');
     $$('.tab', catTabs).forEach((b) => b.onclick = () => { activeCat = b.dataset.c; drawCats(); drawItems(); });
   };
+  /* Floor 86 sheet (audit gap #8): the fast availability control on
+     the item tile itself — the small 86 chip on a tile, or tapping an
+     item that is already out, opens it. It shows the current state and
+     only the actions that make sense for it: mark out, set a countdown
+     (only a few left), or restore. The POST goes to the floor endpoint
+     (server / kitchen / manager); the response redraws THIS device at
+     once and the server menu broadcast refreshes every other device.
+     The state persists until someone restores it — closing the day
+     does not bring an item back. */
+  function openEightySixSheet(item) {
+    const outNow = itemIs86(item);
+    const remNow = itemRemaining(item);
+    const stateLine = outNow ? 'Out — 86’d right now. New rings are refused on every screen until it is restored.'
+      : (remNow != null ? 'Limited — ' + remNow + ' left. Every ring counts down; at zero the item 86s itself.'
+        : 'Available — selling normally.');
+    openModal(
+      '<h2>86 · ' + esc(item.name) + '</h2>' +
+      '<p class="muted">' + stateLine + '</p>' +
+      '<div class="field"><label for="e86-count">Only a few left — how many can still be sold?</label>' +
+      '<input id="e86-count" inputmode="numeric" pattern="[0-9]*" placeholder="e.g. 3"></div>' +
+      '<div class="modal-actions">' +
+      (outNow ? '' : '<button class="btn danger" id="e86-out">86 it — sold out</button>') +
+      '<button class="btn" id="e86-limit">Set count</button>' +
+      (outNow || remNow != null ? '<button class="btn" id="e86-restore">Restore — available again</button>' : '') +
+      '<button class="btn ghost" id="e86-close">Close</button></div>'
+    );
+    const post86 = async (body, okMsg) => {
+      try {
+        const r = await api('/api/menu/items/' + item.id + '/86', 'POST', body);
+        item.is_86 = !!r.is_86;
+        item.remaining = r.remaining != null ? r.remaining : null;
+        closeModal();
+        drawItems();
+        drawQuickPick();
+        toast(okMsg + (r.noop ? ' (already set)' : ''));
+      } catch (e) { toast((e && e.message) || 'Could not update the 86 state'); }
+    };
+    const outBtn = $('#e86-out');
+    if (outBtn) outBtn.onclick = () => post86({ action: 'out' }, '86’d: ' + item.name);
+    const resBtn = $('#e86-restore');
+    if (resBtn) resBtn.onclick = () => post86({ action: 'restore' }, 'Restored: ' + item.name);
+    $('#e86-limit').onclick = () => {
+      const v = parseInt(($('#e86-count').value || '').trim(), 10);
+      if (!Number.isInteger(v) || v < 1) { toast('Type how many are left (1 or more)'); return; }
+      post86({ action: 'out', remaining: v }, item.name + ' — ' + v + ' left');
+    };
+    $('#e86-close').onclick = closeModal;
+  }
+
   const drawItems = () => {
     const q = (searchInput && searchInput.value || '').trim().toLowerCase();
     /* Search mode: flat results across all categories. */
@@ -1700,14 +1765,22 @@ async function renderOrder(app, checkId) {
       if (!hits.length) { itemGrid.innerHTML = '<div class="empty">No items match “' + esc(searchInput.value.trim()) + '”.</div>'; return; }
       itemGrid.innerHTML = hits.map(({ item: i, catName }) => {
         const drink = isDrink(i, catName);
-        return '<button class="item-card" data-i="' + esc(String(i.id)) + '" data-cat="' + esc(catName) + '">' +
-          (drink ? '<span class="drink-tag">BAR</span>' : '') +
+        return '<button class="item-card' + (itemIs86(i) ? ' is-86' : '') + '" data-i="' + esc(String(i.id)) + '" data-cat="' + esc(catName) + '">' +
+          (drink ? '<span class="drink-tag">BAR</span>' : '') + eightySixBadge(i) +
           '<span class="nm">' + esc(i.name) + '</span>' + priceHtml(i) +
+          '<span class="e86-chip" data-e86="' + esc(String(i.id)) + '" title="86 / availability">86</span>' +
           '<span class="cat-lbl">' + esc(catName) + '</span></button>';
       }).join('');
       $$('.item-card', itemGrid).forEach((b) => b.onclick = () => {
         const item = hits.find(({ item: x }) => String(x.id) === b.dataset.i).item;
-        addItemFlow(item, b.dataset.cat);
+        /* An out tile opens the 86 sheet (restore lives there), never
+           the ring flow; the chip opens it for available items too. */
+        if (itemIs86(item)) openEightySixSheet(item); else addItemFlow(item, b.dataset.cat);
+      });
+      $$('.e86-chip', itemGrid).forEach((c) => c.onclick = (ev) => {
+        ev.stopPropagation();
+        const hit = hits.find(({ item: x }) => String(x.id) === c.dataset.e86);
+        if (hit) openEightySixSheet(hit.item);
       });
       return;
     }
@@ -1715,13 +1788,19 @@ async function renderOrder(app, checkId) {
     if (!cat) { itemGrid.innerHTML = '<div class="empty">No menu loaded.</div>'; return; }
     itemGrid.innerHTML = cat.items.map((i) => {
       const drink = isDrink(i, cat.name);
-      return '<button class="item-card" data-i="' + esc(String(i.id)) + '">' +
-        (drink ? '<span class="drink-tag">BAR</span>' : '') +
-        '<span class="nm">' + esc(i.name) + '</span>' + priceHtml(i) + '</button>';
+      return '<button class="item-card' + (itemIs86(i) ? ' is-86' : '') + '" data-i="' + esc(String(i.id)) + '">' +
+        (drink ? '<span class="drink-tag">BAR</span>' : '') + eightySixBadge(i) +
+        '<span class="nm">' + esc(i.name) + '</span>' + priceHtml(i) +
+        '<span class="e86-chip" data-e86="' + esc(String(i.id)) + '" title="86 / availability">86</span></button>';
     }).join('');
     $$('.item-card', itemGrid).forEach((b) => b.onclick = () => {
       const item = cat.items.find((x) => String(x.id) === b.dataset.i);
-      addItemFlow(item, cat.name);
+      if (itemIs86(item)) openEightySixSheet(item); else addItemFlow(item, cat.name);
+    });
+    $$('.e86-chip', itemGrid).forEach((c) => c.onclick = (ev) => {
+      ev.stopPropagation();
+      const item = cat.items.find((x) => String(x.id) === c.dataset.e86);
+      if (item) openEightySixSheet(item);
     });
   };
 
@@ -1745,6 +1824,13 @@ async function renderOrder(app, checkId) {
      rebuild it. The editor this opens is the full one — everything on the
      line is changeable before the line ever reaches the kitchen. */
   function addItemFlow(item, catName, preset) {
+    /* Floor 86: an out item never stages a NEW line. Tiles already
+       route out items to the 86 sheet, but this flow is also reached
+       from search and quick-pick — refuse here too, so no path can
+       stage a line the server would reject at HOLD. Edit mode (a
+       preset from a staged line) is exempt: that line already exists
+       and is being modified, not newly rung. */
+    if (!preset && itemIs86(item)) { toast('86: "' + item.name + '" is sold out'); return; }
     const groups = Array.isArray(item.modifier_groups) && item.modifier_groups.length
       ? item.modifier_groups : null;
     const flatMods = groups ? [] : itemModifiers(item);
@@ -2952,11 +3038,11 @@ async function renderOrder(app, checkId) {
     if (!picks.length) { qp.style.display = 'none'; qp.innerHTML = ''; return; }
     qp.style.display = 'flex';
     qp.innerHTML = '<span class="qp-label">★ Quick pick</span>' + picks.map((p) =>
-      '<button class="item-card qp-card" data-qp="' + esc(String(p.item.id)) + '">' +
-      '<span class="nm">' + esc(p.item.name) + '</span>' + priceHtml(p.item) + '</button>').join('');
+      '<button class="item-card qp-card' + (itemIs86(p.item) ? ' is-86' : '') + '" data-qp="' + esc(String(p.item.id)) + '">' +
+      '<span class="nm">' + esc(p.item.name) + '</span>' + eightySixBadge(p.item) + priceHtml(p.item) + '</button>').join('');
     $$('.qp-card', qp).forEach((b) => b.onclick = () => {
       const p = picks.find((x) => String(x.item.id) === b.dataset.qp);
-      if (p) addItemFlow(p.item, p.cat);
+      if (p) { if (itemIs86(p.item)) openEightySixSheet(p.item); else addItemFlow(p.item, p.cat); }
     });
   };
   drawQuickPick();
